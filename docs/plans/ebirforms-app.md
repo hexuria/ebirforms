@@ -1,8 +1,8 @@
 # eBIRForms desktop app: living plan
 
 This plan changes as we build. Each phase ends with a verification gate; the
-next phase starts only after the gate passes. Progress is tracked in the
-"Living plan" GitHub issue; update this file and the issue checkboxes in the
+next phase starts only after the gate passes. Progress is tracked in
+[issue #1](https://github.com/hexuria/ebirforms/issues/1); update this file and its checkboxes in the
 same PR as the work.
 
 ## Goal
