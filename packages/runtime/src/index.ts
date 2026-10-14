@@ -1,5 +1,5 @@
-import { readFileSync, realpathSync } from 'node:fs'
-import { isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { existsSync, readFileSync, realpathSync } from 'node:fs'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { Window } from 'happy-dom'
 import { extractGuards } from './validation.js'
@@ -47,8 +47,23 @@ interface OpenOfficialFormOptions {
   now?: Date
 }
 
-const repositoryRoot = resolve(import.meta.dir, '../../..')
-const defaultPackageDir = join(repositoryRoot, 'vendor', 'buwiz-validation', 'package')
+/**
+ * Where vendor/ lives: EBIRFORMS_VENDOR_DIR, else beside a compiled binary
+ * (dist/vendor, or Contents/Resources/vendor in a macOS .app), else the
+ * repository checkout. A compiled binary's import.meta.dir is inside its
+ * virtual file system, so walking up from it finds nothing.
+ * Same rule as packages/forms/src/index.ts; keep the two in step.
+ */
+function vendorRoot(): string {
+  if (process.env.EBIRFORMS_VENDOR_DIR) return resolve(process.env.EBIRFORMS_VENDOR_DIR)
+  const exeDir = dirname(process.execPath)
+  for (const candidate of [join(exeDir, 'vendor'), join(exeDir, '..', 'Resources', 'vendor')]) {
+    if (existsSync(join(candidate, 'buwiz-validation'))) return candidate
+  }
+  return join(resolve(import.meta.dir, '../../..'), 'vendor')
+}
+const repositoryVendor = vendorRoot()
+const defaultPackageDir = join(repositoryVendor, 'buwiz-validation', 'package')
 
 export async function openOfficialForm(
   code: string,

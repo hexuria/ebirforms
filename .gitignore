@@ -4,3 +4,4 @@ dist/
 app-data/
 .app-data/
 data/
+apps/desktop/src/.release-entry.ts
