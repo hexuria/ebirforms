@@ -102,5 +102,13 @@
     "frm1601c:txtCurrentPage",
     "frm1601c:txtMaxPage",
     "frm1601c:txtLineBus"
+  ],
+  "knownDifferences": [
+    {
+      "key": "frm1601c:txtAddress2",
+      "kind": "merged",
+      "reason": "saveXML appends txtAddress2 to the txtAddress record instead of emitting a separate record.",
+      "evidence": "vendor/buwiz-validation/package/forms/BIR-Form1601Cv2018.hta:2225-2229"
+    }
   ]
 }

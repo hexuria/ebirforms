@@ -170,7 +170,19 @@ export async function openOfficialForm(
     if (typeof w.jQuery?.ready === 'function') {
       w.jQuery.ready()
     }
-    await new Promise((resolveReady) => globalThis.setTimeout(resolveReady, 1200))
+    let waitTimer: ReturnType<typeof globalThis.setTimeout> | undefined
+    try {
+      await Promise.race([
+        window.happyDOM.waitUntilComplete(),
+        new Promise<void>((resolveWait) => {
+          waitTimer = globalThis.setTimeout(resolveWait, 3000)
+        }),
+      ])
+    } finally {
+      if (waitTimer !== undefined) {
+        globalThis.clearTimeout(waitTimer)
+      }
+    }
 
     const mainForm = window.document.getElementById('frmMain') as HTMLFormElement | null
     if (!mainForm) {

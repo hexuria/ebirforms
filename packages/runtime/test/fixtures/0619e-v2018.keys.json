@@ -60,5 +60,13 @@
     "ebirOnlineUsername",
     "ebirOnlineSecret",
     "driveSelectTPExport"
+  ],
+  "knownDifferences": [
+    {
+      "key": "frm0619E:txtAddress2",
+      "kind": "merged",
+      "reason": "saveXML appends txtAddress2 to the txtAddress record instead of emitting a separate record.",
+      "evidence": "vendor/buwiz-validation/package/forms/BIR-Form0619E.hta:1696-1700"
+    }
   ]
 }

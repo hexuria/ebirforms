@@ -100,5 +100,20 @@
     "txtEmail",
     "driveSelectTPExport",
     "frm2551Qv2018:txtRDOCode"
+  ],
+  "knownDifferences": [
+    {
+      "key": "txtEmail",
+      "kind": "absent",
+      "reason": "The second txtEmail input is inside an HTML comment and is absent from the active form DOM.",
+      "evidence": "vendor/buwiz-validation/package/forms/BIR-Form2551Qv2018.hta:2647-2651"
+    },
+    {
+      "key": "frm2551Qv2018:txtRDOCode",
+      "kind": "moved",
+      "officialIndex": 15,
+      "reason": "The rules extractor appends the dynamically built select, while saveXML emits it at its position in frmMain.",
+      "evidence": "vendor/buwiz-validation/package/forms/BIR-Form2551Qv2018.hta:4850-4859, 2861-2867, 3655-3663"
+    }
   ]
 }
