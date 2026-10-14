@@ -621,7 +621,7 @@ function Dropdown({ value, options, onChange, placeholder = 'Choose…', disable
         <anchored side="bottom" align="start" gap={4} fit="switch" snapMargin={8} occlude>
           <div
             onMouseDownOutside={() => setOpen(false)}
-            style={{ display: 'flex', flexDirection: 'column', minWidth: Math.max(width ?? 180, 160), maxHeight: 280, overflow: 'scroll', padding: 4, borderRadius: 12, borderWidth: 1, borderColor: t.border, backgroundColor: t.raised, boxShadow: { offsetX: 0, offsetY: 8, blurRadius: 24, spreadRadius: 0, color: t === themes.dark ? 'rgba(0,0,0,0.5)' : 'rgba(20,20,30,0.12)' } }}
+            style={{ display: 'flex', flexDirection: 'column', minWidth: Math.max(width ?? 180, 160), maxHeight: 280, overflowX: 'hidden', overflowY: 'scroll', padding: 4, borderRadius: 12, borderWidth: 1, borderColor: t.border, backgroundColor: t.raised, boxShadow: { offsetX: 0, offsetY: 8, blurRadius: 24, spreadRadius: 0, color: t === themes.dark ? 'rgba(0,0,0,0.5)' : 'rgba(20,20,30,0.12)' } }}
           >
             {options.map((option) => {
               const chosen = option.value === value
@@ -1737,7 +1737,7 @@ function App() {
           </div>
           <IBtn testId="sidebar-new" icon="plus" onClick={once(() => setOverlay({ kind: 'startReturn' }))} />
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 2, paddingTop: 12, flexGrow: 1, minHeight: 0, overflow: 'scroll' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 2, paddingTop: 12, flexGrow: 1, minHeight: 0, overflowX: 'hidden', overflowY: 'scroll' }}>
           <NavRow testId="nav-home" icon="home" label="Home" current={page === 'home'} onClick={once(() => goto('home'))} />
           <NavRow testId="nav-library" icon="file" label="Form library" current={page === 'library'} onClick={once(() => goto('library'))} />
           <NavRow testId="nav-calendar" icon="calendar" label="Calendar" current={page === 'calendar'} onClick={once(() => goto('calendar'))} />
@@ -1829,7 +1829,7 @@ function App() {
               Mark all read
             </Btn>
           </div>
-          <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minHeight: 0, overflow: 'scroll', paddingLeft: 12, paddingRight: 12, paddingBottom: 12 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minHeight: 0, overflowX: 'hidden', overflowY: 'scroll', paddingLeft: 12, paddingRight: 12, paddingBottom: 12 }}>
             {notifications.length === 0 && <text style={{ color: t.fg3, fontSize: F_META, padding: 12 }}>Nothing to review.</text>}
             {notifications.map((item) => {
               const icon: IconName =
@@ -1929,7 +1929,7 @@ function App() {
       </div>
     )
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', width: 320, minWidth: 320, backgroundColor: t.bg, overflow: 'scroll', paddingTop: 4, paddingLeft: 12, paddingRight: 12, paddingBottom: 12 }}>
+      <div style={{ display: 'flex', flexDirection: 'column', width: 320, minWidth: 320, backgroundColor: t.bg, overflowX: 'hidden', overflowY: 'scroll', paddingTop: 4, paddingLeft: 12, paddingRight: 12, paddingBottom: 12 }}>
         {hero}
         {!panelEdit && factRows.length > 0 && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginLeft: 8, marginRight: 8, marginBottom: 4, paddingTop: 12, paddingBottom: 12, borderTopWidth: 1, borderBottomWidth: 1, borderColor: t.border }}>
@@ -3290,7 +3290,7 @@ function App() {
             {taxpayer && branch ? `${taxpayer.name} · ${formatTin(taxpayer.tin9, branch.code)} ${branch.name}` : 'Choose a taxpayer first.'}
           </text>
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', maxHeight: 360, overflow: 'scroll', padding: 12 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', maxHeight: 360, overflowX: 'hidden', overflowY: 'scroll', padding: 12 }}>
           {forms.length === 0 && <text style={{ color: t.fg3, fontSize: F_BODY, padding: 14 }}>No forms on this year's list yet. Add them under Forms or open one from the Form library.</text>}
           {forms.map((entry) => {
             const key = familyKey(entry.formCode)
@@ -3403,7 +3403,7 @@ function App() {
           />
           <Kbd>Esc</Kbd>
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', overflow: 'scroll', maxHeight: 420, padding: 12 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', overflowX: 'hidden', overflowY: 'scroll', maxHeight: 420, padding: 12 }}>
           {items.length === 0 && <text style={{ color: t.fg3, fontSize: F_BODY, paddingTop: 40, paddingBottom: 40, textAlign: 'center' }}>No matches. Try a form code like 2550Q.</text>}
           {groups.map((group) => (
             <div key={group} style={{ display: 'flex', flexDirection: 'column' }}>
@@ -3492,7 +3492,7 @@ function App() {
             borderColor: t.border,
           }}
         >
-          <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minHeight: 0, paddingTop: 28, paddingBottom: 56, paddingLeft: sidePad, paddingRight: sidePad, overflow: 'scroll' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minHeight: 0, paddingTop: 28, paddingBottom: 56, paddingLeft: sidePad, paddingRight: sidePad, overflowX: 'hidden', overflowY: 'scroll' }}>
             {/* A definite width matters: an auto-width column made Taffy re-measure every text
                 each frame (Profile 250ms frames → 30ms with a pixel width). */}
             <div style={{ display: 'flex', flexDirection: 'column', flexShrink: 0, width: contentWidth }}>

@@ -8,10 +8,10 @@ import { resolve } from 'node:path'
 import { mkdirSync, mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { launch } from '@gpuix/native/automation'
+import { launchApp, restoreWorkspace } from './launch.ts'
 const OUT = resolve(process.argv[2] ?? 'parity-out/e2e')
 mkdirSync(OUT, { recursive: true })
-const app = await launch({ command: 'bun', args: ['src/app.tsx'], cwd: resolve(import.meta.dir, '..'), env: { EBIRFORMS_AUTOMATION: 'stdio', NODE_ENV: 'production', EBIRFORMS_DATA_DIR: mkdtempSync(join(tmpdir(), 'ebf-empty-')) } })
+const app = await launchApp({ NODE_ENV: 'production', EBIRFORMS_DATA_DIR: mkdtempSync(join(tmpdir(), 'ebf-empty-')) })
 const w = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const has = async (id: string) => (await app.getByTestId(id).count()) > 0
 const shot = (n: string) => app.screenshot({ path: join(OUT, n + '.png') })
@@ -55,3 +55,4 @@ await app.mouse.click(await app.getByTestId('save-taxpayer').center()).catch(() 
 await w(300)
 check('save with unchanged TIN keeps taxpayer', (await app.getByTestId('titlebar-pill').textContent()).includes('123-456-788'))
 await app.close()
+restoreWorkspace()

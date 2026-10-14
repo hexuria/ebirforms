@@ -1,12 +1,11 @@
 /** bun parity/frames-probe.ts <out> : p90 frame times per page while scrolling (needs EBIRFORMS_FRAMES hook). */
-import { resolve } from 'node:path'
 import { appendFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { launch } from '@gpuix/native/automation'
+import { launchApp, restoreWorkspace } from './launch.ts'
 const OUT = process.argv[2]
 rmSync(OUT, { force: true })
-const app = await launch({ command: 'bun', args: ['src/app.tsx'], cwd: resolve(import.meta.dir, '..'), env: { EBIRFORMS_AUTOMATION: 'stdio', EBIRFORMS_FRAMES: OUT, NODE_ENV: 'production', EBIRFORMS_DATA_DIR: mkdtempSync(join(tmpdir(), 'ebf-')), EBIRFORMS_SEED: 'demo' } })
+const app = await launchApp({ EBIRFORMS_FRAMES: OUT, NODE_ENV: 'production', EBIRFORMS_DATA_DIR: mkdtempSync(join(tmpdir(), 'ebf-')), EBIRFORMS_SEED: 'demo' })
 const w = (ms: number) => new Promise((r) => setTimeout(r, ms))
 await app.getByTestId('nav-home').waitFor({ timeoutMs: 20000 })
 async function measure(label: string) {
@@ -22,6 +21,7 @@ if (scenes.includes('profile')) { await app.getByTestId('titlebar-pill').click()
 if (scenes.includes('forms')) { await app.getByTestId('tab-forms').click(); await measure('forms tab') }
 if (scenes.includes('library')) { await app.getByTestId('nav-library').click(); await measure('library') }
 await app.close()
+restoreWorkspace()
 let label: string | null = null
 const best: Record<string, number[]> = {}
 for (const line of readFileSync(OUT, 'utf8').split('\n')) {
