@@ -29,7 +29,7 @@ Bun workspace, TypeScript everywhere, one process.
 apps/desktop        GPUIX React UI
 packages/core       SQLite (bun:sqlite) store, domain model, env config, logger, job queue
 packages/forms      form catalog + per-form field model generated from the official HTAs
-packages/runtime     official HTA runtime: happy-dom sandbox running BIR's own JS (compute, validate, saveXML)
+packages/runtime    official HTA runtime: happy-dom sandbox running BIR's own JS (compute, validate, saveXML)
 packages/print      fill frozen HTML, render pages, print
 packages/submit     XML serializer, LZ + AES payload, dispatcher, SFTP upload
 vendor/             submodules (official package, frozen HTML)
