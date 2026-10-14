@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { render } from '@gpuix/react'
 import {
@@ -19,7 +20,7 @@ import {
   type Profile,
   type TaxpayerTree,
 } from '@ebirforms/core'
-import { loadCatalog, type CatalogEntry } from '@ebirforms/forms'
+import { loadCatalog, type CatalogEntry, type ReturnFrequency } from '@ebirforms/forms'
 import { openOfficialForm } from '@ebirforms/runtime'
 import type { FieldSnapshot, FormInstance, ValidationIssue } from '@ebirforms/runtime'
 import {
@@ -28,38 +29,98 @@ import {
   SelectItem,
   SelectTrigger,
   SelectValue,
+  useGpuixRequired,
 } from '@gpuix/react'
-import { buildEditorModel, buildPrefillValues, type PrefillFormCode } from './editor-model.js'
+import {
+  autoFieldIds,
+  buildEditorModel,
+  buildPrefillValues,
+  mergeDraftPrefill,
+  type PrefillFormCode,
+} from './editor-model.js'
+import { themes, type ThemeMode, type ThemeTokens } from './theme.js'
 
-const store = openStore(join(dataDir(), 'ebirforms.sqlite'))
+const appDir = dataDir()
+mkdirSync(appDir, { recursive: true })
+const store = openStore(join(appDir, 'ebirforms.sqlite'))
 const logger: Logger = store.logger
 const queue = new JobQueue(store)
 const catalog = loadCatalog()
+const themePath = join(appDir, 'theme.json')
+const fontPath = join(import.meta.dir, '../assets/fonts/BricolageGrotesque-Variable.ttf')
 
-const sections = [
-  { id: 'profiles', title: 'Profiles' },
-  { id: 'library', title: 'Library' },
-  { id: 'jobs', title: 'Jobs' },
-  { id: 'logs', title: 'Logs' },
-] as const
+function readTheme(): ThemeMode {
+  try {
+    if (existsSync(themePath)) {
+      const parsed = JSON.parse(readFileSync(themePath, 'utf8')) as { mode?: ThemeMode }
+      if (parsed.mode === 'light' || parsed.mode === 'dark') return parsed.mode
+    }
+  } catch {
+    return 'light'
+  }
+  return 'light'
+}
 
-type SectionId = (typeof sections)[number]['id'] | 'editor'
-type ProfileForm = {
-  tin: string
-  branch: string
-  year: string
-  registeredName: string
+function FontRegistration() {
+  const renderer = useGpuixRequired()
+  useEffect(() => {
+    try {
+      const registerFont = (
+        renderer as typeof renderer & { registerFont?: (font: Uint8Array) => void }
+      ).registerFont
+      if (registerFont) {
+        registerFont.call(renderer, readFileSync(fontPath))
+      } else {
+        logger.log('info', 'font', 'GPUIX renderer has no registerFont API; using system fonts')
+      }
+    } catch (error) {
+      logger.log('warn', 'font', 'Bricolage Grotesque could not be registered', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }, [renderer])
+  return null
+}
+
+type NavPage = 'taxpayer' | 'tasks' | 'logs' | 'calendar' | 'settings' | 'form'
+type TaxpayerTab = 'details' | 'forms' | 'templates'
+type LogFilter = LogLevel | 'all'
+type DraftStatus = Draft['status']
+type FactsForm = {
+  name: string
   rdo: string
-  address: string
   zip: string
+  address: string
   phone: string
   email: string
 }
-type ProfileFieldName = keyof ProfileForm
-type ProfileErrors = Partial<Record<ProfileFieldName, string>>
-type LogFilter = LogLevel | 'all'
+type NewTaxpayerForm = FactsForm & {
+  tin1: string
+  tin2: string
+  tin3: string
+  type: 'individual' | 'non-individual'
+  birthDate: string
+}
+type NewBranchForm = FactsForm & { code: string; name: string }
+type PeriodChoice = { period: string; label: string }
 
-const initialProfiles = store.listTaxpayers()
+const blankFacts: FactsForm = {
+  name: '',
+  rdo: '',
+  zip: '',
+  address: '',
+  phone: '',
+  email: '',
+}
+const blankTaxpayer: NewTaxpayerForm = {
+  ...blankFacts,
+  tin1: '',
+  tin2: '',
+  tin3: '',
+  type: 'individual',
+  birthDate: '',
+}
+const blankBranch: NewBranchForm = { ...blankFacts, code: '', name: '' }
 
 function allProfiles(taxpayers: TaxpayerTree[]): Profile[] {
   return taxpayers.flatMap((taxpayer) =>
@@ -67,322 +128,419 @@ function allProfiles(taxpayers: TaxpayerTree[]): Profile[] {
   )
 }
 
-function tinBaseLabel(tin9: string): string {
-  return `${tin9.slice(0, 3)}-${tin9.slice(3, 6)}-${tin9.slice(6)}`
+function branchId(tin9: string, code: string): string {
+  return `${tin9}${code}`
 }
 
-function ActionButton({
+function Button({
   children,
   onClick,
-  testId,
   disabled = false,
+  quiet = false,
+  testId,
 }: {
   children: string
   onClick: () => void
-  testId: string
   disabled?: boolean
+  quiet?: boolean
+  testId?: string
 }) {
+  const t = useTheme()
   return (
     <div
       testId={testId}
-      onClick={() => {
-        if (!disabled) {
-          onClick()
-        }
-      }}
-      style={{
-        alignSelf: 'start',
-        padding: 10,
-        borderRadius: 6,
-        cursor: disabled ? 'default' : 'pointer',
-        opacity: disabled ? 0.45 : 1,
-        backgroundColor: '#3b82f6',
-        hover: { backgroundColor: '#2563eb' },
-      }}
-    >
-      <text style={{ color: '#ffffff', fontSize: 13 }}>{children}</text>
-    </div>
-  )
-}
-
-function ProfileField({
-  label,
-  field,
-  value,
-  error,
-  placeholder,
-  onChange,
-}: {
-  label: string
-  field: ProfileFieldName
-  value: string
-  error: string
-  placeholder?: string
-  onChange: (field: ProfileFieldName, value: string) => void
-}) {
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-      <text style={{ color: '#c8d0dc', fontSize: 13 }}>{label}</text>
-      <input
-        testId={`profile-${field}`}
-        value={value}
-        placeholder={placeholder}
-        onChange={(event) => onChange(field, event.value ?? '')}
-        style={{
-          height: 34,
-          padding: 8,
-          color: '#f4f5f7',
-          backgroundColor: '#10141a',
-          borderWidth: 1,
-          borderColor: '#3b414d',
-          borderRadius: 5,
-        }}
-      />
-      <div
-        testId={`profile-${field}-validation`}
-        style={{ height: 18, minHeight: 18 }}
-      >
-        <text style={{ color: error ? '#f87171' : '#aab2bf', fontSize: 12 }}>{error}</text>
-      </div>
-    </div>
-  )
-}
-
-function CheckboxRow({
-  entry,
-  checked,
-  disabled = false,
-  testId,
-  onClick,
-}: {
-  entry: CatalogEntry
-  checked: boolean
-  disabled?: boolean
-  testId: string
-  onClick: () => void
-}) {
-  return (
-    <div
-      testId={testId}
-      onClick={() => {
-        if (!disabled) {
-          onClick()
-        }
-      }}
+      onClick={() => !disabled && onClick()}
       style={{
         display: 'flex',
         alignItems: 'center',
-        gap: 10,
-        padding: 4,
-        minWidth: 0,
+        justifyContent: 'center',
+        padding: 10,
+        minHeight: 36,
+        borderRadius: 7,
         cursor: disabled ? 'default' : 'pointer',
-        backgroundColor: '#202631',
-        hover: { backgroundColor: disabled ? '#202631' : '#2b3340' },
+        opacity: disabled ? 0.46 : 1,
+        backgroundColor: quiet ? t.secondary : t.primary,
+        hover: { opacity: disabled ? 0.46 : 0.86 },
       }}
     >
-      <div
-        testId={`${testId}-indicator`}
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          width: 18,
-          minWidth: 18,
-          height: 18,
-          flexShrink: 0,
-          borderWidth: 1,
-          borderColor: checked ? '#60a5fa' : '#707987',
-          borderRadius: 3,
-          backgroundColor: checked ? '#2563eb' : '#14171d',
-        }}
-      >
-        <text style={{ color: '#ffffff', fontSize: 13 }}>{checked ? '✓' : ''}</text>
-      </div>
-      <text
-        style={{
-          color: '#e3e6eb',
-          fontSize: 13,
-          flexGrow: 1,
-          minWidth: 0,
-          whiteSpace: 'nowrap',
-          textOverflow: 'ellipsis',
-        }}
-      >
-        {entry.label}
-      </text>
-      <text
-        style={{
-          color: '#9ca7b7',
-          fontSize: 12,
-          width: 120,
-          minWidth: 120,
-          flexShrink: 0,
-          textAlign: 'right',
-          whiteSpace: 'nowrap',
-        }}
-      >
-        {entry.code}
+      <text style={{ color: quiet ? t.fg : t.primaryFg, fontSize: 13, fontWeight: 600 }}>
+        {children}
       </text>
     </div>
   )
 }
 
-function App() {
-  const [selectedSection, setSelectedSection] = useState<SectionId>('profiles')
-  const [profiles, setProfiles] = useState(initialProfiles)
-  const [selectedProfileId, setSelectedProfileId] = useState(
-    allProfiles(initialProfiles)[0]?.id,
+let activeTheme: ThemeTokens = themes.light
+function useTheme(): ThemeTokens {
+  return activeTheme
+}
+
+function Field({
+  label,
+  value,
+  onChange,
+  error = '',
+  placeholder,
+  disabled = false,
+  auto = false,
+  testId,
+}: {
+  label: string
+  value: string
+  onChange?: (value: string) => void
+  error?: string
+  placeholder?: string
+  disabled?: boolean
+  auto?: boolean
+  testId?: string
+}) {
+  const t = useTheme()
+  return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 5, minWidth: 0, flexGrow: 1, flexBasis: 180 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <text style={{ color: t.fg, fontSize: 12, fontWeight: 600 }}>{label}</text>
+        {auto && (
+          <text style={{ color: t.mutedFg, fontSize: 10 }}>AUTO</text>
+        )}
+      </div>
+      <input
+        testId={testId}
+        value={value}
+        placeholder={placeholder}
+        readOnly={disabled}
+        onChange={(event) => onChange?.(event.value ?? '')}
+        style={{
+          height: 36,
+          minHeight: 36,
+          padding: 9,
+          color: disabled ? t.mutedFg : t.fg,
+          backgroundColor: disabled ? t.muted : t.bg,
+          borderWidth: 1,
+          borderColor: t.input,
+          borderRadius: 6,
+        }}
+      />
+      <div testId={testId ? `${testId}-validation` : undefined} style={{ height: 18, minHeight: 18 }}>
+        <text style={{ color: error ? t.danger : t.mutedFg, fontSize: 11 }}>{error}</text>
+      </div>
+    </div>
   )
-  const [profileForm, setProfileForm] = useState<ProfileForm>({
-    tin: '',
-    branch: '00000',
-    year: '',
-    registeredName: '',
-    rdo: '',
-    address: '',
-    zip: '',
-    phone: '',
-    email: '',
+}
+
+function Panel({
+  title,
+  subtitle,
+  children,
+}: {
+  title: string
+  subtitle?: string
+  children?: ReactNode
+}) {
+  const t = useTheme()
+  return (
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 14,
+        padding: 18,
+        borderWidth: 1,
+        borderColor: t.border,
+        borderRadius: 10,
+        backgroundColor: t.chrome,
+      }}
+    >
+      <div>
+        <text style={{ color: t.fg, fontSize: 15, fontWeight: 700 }}>{title}</text>
+        {subtitle && <text style={{ color: t.mutedFg, fontSize: 12 }}>{subtitle}</text>}
+      </div>
+      {children}
+    </div>
+  )
+}
+
+function periodChoices(year: number, frequency: ReturnFrequency): PeriodChoice[] {
+  if (frequency === 'monthly') {
+    return Array.from({ length: 12 }, (_, index) => {
+      const month = String(index + 1).padStart(2, '0')
+      return {
+        period: `${year}-${month}`,
+        label: new Date(Date.UTC(2020, index, 1)).toLocaleString('en', { month: 'short' }),
+      }
+    })
+  }
+  if (frequency === 'quarterly') {
+    return [1, 2, 3, 4].map((quarter) => ({
+      period: `${year}-Q${quarter}`,
+      label: `Q${quarter}`,
+    }))
+  }
+  return [{ period: String(year), label: `${year} annual return` }]
+}
+
+function App() {
+  const [themeMode, setThemeMode] = useState<ThemeMode>(readTheme)
+  activeTheme = themes[themeMode]
+  const t = activeTheme
+  const [page, setPage] = useState<NavPage>('taxpayer')
+  const [tab, setTab] = useState<TaxpayerTab>('details')
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [tree, setTree] = useState<TaxpayerTree[]>(() => store.listTaxpayers())
+  const [selectedTin, setSelectedTin] = useState<string | undefined>(() => store.listTaxpayers()[0]?.tin9)
+  const [selectedBranchId, setSelectedBranchId] = useState<string | undefined>(() => {
+    const first = store.listTaxpayers()[0]
+    return first?.branches[0] ? branchId(first.tin9, first.branches[0].code) : undefined
   })
-  const [profileErrors, setProfileErrors] = useState<ProfileErrors>({})
-  const [profileStatus, setProfileStatus] = useState('')
-  const [library, setLibrary] = useState<LibraryEntry[]>(() => {
-    const profileId = allProfiles(initialProfiles)[0]?.id
-    return profileId ? store.listLibrary(profileId) : []
-  })
+  const [selectedProfileId, setSelectedProfileId] = useState<string | undefined>(() =>
+    allProfiles(store.listTaxpayers())[0]?.id,
+  )
+  const [taxpayerSearch, setTaxpayerSearch] = useState('')
+  const [newTaxpayer, setNewTaxpayer] = useState(blankTaxpayer)
+  const [newTaxpayerErrors, setNewTaxpayerErrors] = useState<Record<string, string>>({})
+  const [showNewTaxpayer, setShowNewTaxpayer] = useState(false)
+  const [showNewBranch, setShowNewBranch] = useState(false)
+  const [showPrintTip, setShowPrintTip] = useState(false)
+  const [newBranch, setNewBranch] = useState(blankBranch)
+  const [branchError, setBranchError] = useState('')
+  const [taxpayerEdit, setTaxpayerEdit] = useState({ name: '', type: 'individual', birthDate: '' })
+  const [branchEdit, setBranchEdit] = useState<NewBranchForm>(blankBranch)
+  const [yearInput, setYearInput] = useState(String(new Date().getFullYear()))
+  const [statusMessage, setStatusMessage] = useState('')
   const [search, setSearch] = useState('')
   const [pendingCodes, setPendingCodes] = useState<string[]>([])
-  const [jobs, setJobs] = useState<Job[]>(() => queue.list())
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const [preset, setPreset] = useState('Employer')
+  const [queueJobs, setQueueJobs] = useState<Job[]>(() => queue.list())
   const [logs, setLogs] = useState<LogEntry[]>(() => logger.getEntries())
   const [logFilter, setLogFilter] = useState<LogFilter>('all')
-  const [editorEntry, setEditorEntry] = useState<LibraryEntry | null>(null)
-  const [editorDraft, setEditorDraft] = useState<Draft | null>(null)
-  const [editorInstance, setEditorInstance] = useState<FormInstance | null>(null)
-  const [editorSnapshot, setEditorSnapshot] = useState<FieldSnapshot[]>([])
-  const [editorIssues, setEditorIssues] = useState<ValidationIssue[]>([])
-  const [editorInputValues, setEditorInputValues] = useState<
-    Record<string, string | boolean>
-  >({})
-  const [editorLoading, setEditorLoading] = useState(false)
+  const [formEntry, setFormEntry] = useState<LibraryEntry | null>(null)
+  const [draft, setDraft] = useState<Draft | null>(null)
+  const [formInstance, setFormInstance] = useState<FormInstance | null>(null)
+  const [fieldSnapshot, setFieldSnapshot] = useState<FieldSnapshot[]>([])
+  const [issues, setIssues] = useState<ValidationIssue[]>([])
+  const [editorValues, setEditorValues] = useState<Record<string, string | boolean>>({})
+  const [formLoading, setFormLoading] = useState(false)
 
-  useEffect(() => queue.onChange(setJobs), [])
-  useEffect(
-    () =>
-      logger.subscribe((entry) =>
-        setLogs((current) => [...current.slice(-999), entry]),
-      ),
-    [],
+  const taxpayer = tree.find((item) => item.tin9 === selectedTin)
+  const branch = taxpayer?.branches.find((item) => branchId(taxpayer.tin9, item.code) === selectedBranchId)
+  const selectedProfile =
+    branch?.years.find((item) => item.id === selectedProfileId) ?? branch?.years.at(-1)
+  const selectedLibrary = selectedProfile ? store.listLibrary(selectedProfile.id) : []
+  const filteredTaxpayers = tree.filter(
+    (item) =>
+      !taxpayerSearch ||
+      formatTin(item.tin9).toLowerCase().includes(taxpayerSearch.toLowerCase()) ||
+      item.name.toLowerCase().includes(taxpayerSearch.toLowerCase()),
   )
-
-  const filteredCatalog = useMemo(() => {
-    const query = search.trim().toLowerCase()
-    return catalog.filter(
-      (entry) =>
-        !query ||
-        entry.code.toLowerCase().includes(query) ||
-        entry.label.toLowerCase().includes(query),
-    )
-  }, [search])
-  const selectedProfile = allProfiles(profiles).find(
-    (profile) => profile.id === selectedProfileId,
+  const filteredCatalog = catalog.filter(
+    (entry) =>
+      !search ||
+      entry.code.toLowerCase().includes(search.trim().toLowerCase()) ||
+      entry.label.toLowerCase().includes(search.trim().toLowerCase()),
   )
+  const editorModel = buildEditorModel(fieldSnapshot, issues, formEntry ? autoFieldIds(formEntry.formCode as PrefillFormCode) : new Set())
+  const shownLogs = logFilter === 'all' ? logs : logs.filter((entry) => entry.level === logFilter)
 
-  function selectProfile(profile: Profile) {
+  useEffect(() => queue.onChange(setQueueJobs), [])
+  useEffect(() => logger.subscribe((entry) => setLogs((current) => [...current.slice(-999), entry])), [])
+  useEffect(() => {
+    writeFileSync(themePath, JSON.stringify({ mode: themeMode }))
+  }, [themeMode])
+  useEffect(() => {
+    if (taxpayer) {
+      setTaxpayerEdit({ name: taxpayer.name, type: taxpayer.type, birthDate: taxpayer.birthDate ?? '' })
+    }
+    if (branch) {
+      setBranchEdit({
+        name: branch.name,
+        code: branch.code,
+        rdo: branch.overrides.rdo ?? '',
+        zip: branch.overrides.zip ?? '',
+        address: branch.overrides.address ?? '',
+        phone: branch.overrides.phone ?? '',
+        email: branch.overrides.email ?? '',
+      })
+    }
+  }, [taxpayer?.tin9, branch?.code])
+
+  function refreshTree(nextTin?: string, nextBranchId?: string, nextProfileId?: string) {
+    const nextTree = store.listTaxpayers()
+    setTree(nextTree)
+    if (nextTin) setSelectedTin(nextTin)
+    if (nextBranchId) setSelectedBranchId(nextBranchId)
+    if (nextProfileId) setSelectedProfileId(nextProfileId)
+  }
+
+  function chooseBranch(tin9: string, code: string) {
+    const id = branchId(tin9, code)
+    const item = tree.find((entry) => entry.tin9 === tin9)?.branches.find((entry) => entry.code === code)
+    setSelectedTin(tin9)
+    setSelectedBranchId(id)
+    setSelectedProfileId(item?.years.at(-1)?.id)
+    setPage('taxpayer')
+  }
+
+  function chooseProfile(profile: Profile) {
+    setSelectedTin(profile.tin9)
+    setSelectedBranchId(branchId(profile.tin9, profile.branch))
     setSelectedProfileId(profile.id)
-    setLibrary(store.listLibrary(profile.id))
-    setPendingCodes([])
+    setPage('taxpayer')
+    setTab('forms')
   }
 
-  function updateProfileField(field: ProfileFieldName, value: string) {
-    setProfileForm((current) => ({ ...current, [field]: value }))
-    setProfileErrors((current) => ({ ...current, [field]: '' }))
-    setProfileStatus('')
-  }
-
-  function saveProfile() {
-    const errors: ProfileErrors = {}
-    let parsedTin: ReturnType<typeof parseTin> | undefined
+  function saveNewTaxpayer() {
+    const tin = `${newTaxpayer.tin1}-${newTaxpayer.tin2}-${newTaxpayer.tin3}`
+    const errors: Record<string, string> = {}
     try {
-      parsedTin = parseTin(profileForm.tin)
+      parseTin(tin)
     } catch (error) {
       errors.tin = error instanceof Error ? error.message : String(error)
     }
-    if (!/^\d{5}$/.test(profileForm.branch)) {
-      errors.branch = 'Branch code must contain exactly 5 digits.'
-    }
-    if (!/^\d{4}$/.test(profileForm.year) || !Number.isInteger(Number(profileForm.year))) {
-      errors.year = 'Enter a 4-digit tax year.'
-    }
-    if (Object.values(errors).some(Boolean)) {
-      setProfileErrors(errors)
-      setProfileStatus('')
-      logger.log('warn', 'profiles', 'Profile validation failed', {
-        fields: Object.keys(errors),
-      })
+    if (!newTaxpayer.name.trim()) errors.name = 'Enter a taxpayer name.'
+    if (Object.keys(errors).length) {
+      setNewTaxpayerErrors(errors)
       return
     }
-
-    const branch =
-      parsedTin && parsedTin.branch !== '00000' && profileForm.branch === '00000'
-        ? parsedTin.branch
-        : profileForm.branch
     try {
-      const profile = store.createProfile({
-        tin: profileForm.tin,
-        branch,
-        year: Number(profileForm.year),
-        registeredName: profileForm.registeredName,
-        rdo: profileForm.rdo,
-        address: profileForm.address,
-        zip: profileForm.zip,
-        phone: profileForm.phone,
-        email: profileForm.email,
+      const created = store.createTaxpayer({
+        tin,
+        name: newTaxpayer.name,
+        type: newTaxpayer.type,
+        birthDate: newTaxpayer.birthDate || null,
+        rdo: newTaxpayer.rdo || undefined,
+        zip: newTaxpayer.zip || undefined,
+        address: newTaxpayer.address || undefined,
+        phone: newTaxpayer.phone || undefined,
+        email: newTaxpayer.email || undefined,
       })
-      const nextProfiles = store.listTaxpayers()
-      setProfiles(nextProfiles)
-      selectProfile(profile)
-      setProfileErrors({})
-      setProfileStatus(`Saved ${formatTin(profile.tin9, profile.branch)} · ${profile.year}`)
+      refreshTree(created.tin9, branchId(created.tin9, '00000'))
+      setShowNewTaxpayer(false)
+      setNewTaxpayer(blankTaxpayer)
+      setNewTaxpayerErrors({})
+      setStatusMessage('Taxpayer added.')
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      setProfileErrors((current) => ({ ...current, year: message }))
-      setProfileStatus('')
+      setNewTaxpayerErrors({ tin: error instanceof Error ? error.message : String(error) })
     }
   }
 
-  function togglePendingCode(code: string) {
-    if (library.some((entry) => entry.formCode === code)) {
+  function saveTaxpayerDetails() {
+    if (!taxpayer) return
+    store.updateTaxpayer(taxpayer.tin9, {
+      name: taxpayerEdit.name,
+      type: taxpayerEdit.type as 'individual' | 'non-individual',
+      birthDate: taxpayerEdit.birthDate || null,
+    })
+    refreshTree(taxpayer.tin9)
+    setStatusMessage('Taxpayer details saved.')
+  }
+
+  function saveBranchDetails() {
+    if (!branch) return
+    const id = branchId(taxpayer!.tin9, branch.code)
+    store.updateBranch(id, {
+      name: branchEdit.name,
+      rdo: branchEdit.rdo || null,
+      zip: branchEdit.zip || null,
+      address: branchEdit.address || null,
+      phone: branchEdit.phone || null,
+      email: branchEdit.email || null,
+    })
+    refreshTree(taxpayer!.tin9, id)
+    setStatusMessage('Branch details saved.')
+  }
+
+  function addBranch() {
+    if (!taxpayer) return
+    if (!/^\d{5}$/.test(newBranch.code) || newBranch.code === '00000') {
+      setBranchError('Enter a five-digit branch code other than 00000.')
       return
     }
+    try {
+      const created = store.createBranch({
+        tin9: taxpayer.tin9,
+        code: newBranch.code,
+        name: newBranch.name || `Branch ${newBranch.code}`,
+        rdo: newBranch.rdo || null,
+        zip: newBranch.zip || null,
+        address: newBranch.address || null,
+        phone: newBranch.phone || null,
+        email: newBranch.email || null,
+      })
+      refreshTree(taxpayer.tin9, created.id)
+      setShowNewBranch(false)
+      setNewBranch(blankBranch)
+      setBranchError('')
+    } catch (error) {
+      setBranchError(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  function addYear() {
+    if (!taxpayer || !branch || !/^\d{4}$/.test(yearInput)) return
+    try {
+      const profile = store.createProfile({
+        tin: taxpayer.tin9,
+        branch: branch.code,
+        year: Number(yearInput),
+      })
+      refreshTree(taxpayer.tin9, branchId(taxpayer.tin9, branch.code), profile.id)
+      setStatusMessage(`${profile.year} added.`)
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  function toggleCode(code: string) {
+    if (selectedLibrary.some((entry) => entry.formCode === code)) return
     setPendingCodes((current) =>
       current.includes(code) ? current.filter((item) => item !== code) : [...current, code],
     )
   }
 
   function addSelectedForms() {
-    if (!selectedProfileId || pendingCodes.length === 0) {
-      return
-    }
-    store.addForms(selectedProfileId, pendingCodes)
-    setLibrary(store.listLibrary(selectedProfileId))
+    if (!selectedProfile || !pendingCodes.length) return
+    store.addForms(selectedProfile.id, pendingCodes)
     setPendingCodes([])
+    setPickerOpen(false)
   }
 
-  function removeLibraryForm(code: string) {
-    if (!selectedProfileId) {
-      return
+  async function openForm(entry: LibraryEntry, period: string) {
+    if (!selectedProfile || !['1601Cv2018', '2551Qv2018', '0619E'].includes(entry.formCode)) return
+    const code = entry.formCode as PrefillFormCode
+    const previous = store.listDrafts(selectedProfile.id, code).find((item) => item.period === period)
+    const opened = store.openDraft(selectedProfile.id, code, period)
+    setFormEntry(entry)
+    setDraft(opened)
+    setPage('form')
+    setFormLoading(true)
+    setFormInstance(null)
+    setFieldSnapshot([])
+    setIssues([])
+    let form: FormInstance | undefined
+    try {
+      form = await openOfficialForm(code)
+      const prefillValues = buildPrefillValues(code, selectedProfile, form.fields(), period)
+      const initialValues = mergeDraftPrefill(opened.values, prefillValues)
+      for (const [id, value] of Object.entries(initialValues)) form.set(id, value)
+      const nextDraft = previous
+        ? opened
+        : store.saveDraft(opened.id, valuesFromForm(form))
+      setDraft(nextDraft)
+      setFormInstance(form)
+      refreshEditor(form)
+    } catch (error) {
+      await form?.close()
+      setIssues([{ message: error instanceof Error ? error.message : String(error), fieldId: null, source: 'official' }])
+    } finally {
+      setFormLoading(false)
     }
-    store.removeForm(selectedProfileId, code)
-    setLibrary(store.listLibrary(selectedProfileId))
   }
 
   function valuesFromForm(form: FormInstance): DraftValues {
     return Object.fromEntries(
       form.fields().map((field) => [
         field.id,
-        field.type === 'checkbox' || field.type === 'radio'
-          ? Boolean(field.checked)
-          : field.value,
+        field.type === 'checkbox' || field.type === 'radio' ? Boolean(field.checked) : field.value,
       ]),
     )
   }
@@ -390,952 +548,573 @@ function App() {
   function refreshEditor(form: FormInstance) {
     const snapshot = form.fields()
     const result = form.validate(logger)
-    setEditorSnapshot(snapshot)
-    setEditorIssues(result.issues)
-    setEditorInputValues(
+    setFieldSnapshot(snapshot)
+    setIssues(result.issues)
+    setEditorValues(
       Object.fromEntries(
         snapshot.map((field) => [
           field.id,
-          field.type === 'checkbox' || field.type === 'radio'
-            ? Boolean(field.checked)
-            : field.value,
+          field.type === 'checkbox' || field.type === 'radio' ? Boolean(field.checked) : field.value,
         ]),
       ),
     )
     return result
   }
 
-  async function openDraft(entry: LibraryEntry) {
-    if (!selectedProfile) {
-      return
-    }
-    const supported = ['1601Cv2018', '2551Qv2018', '0619E']
-    if (!supported.includes(entry.formCode)) {
-      logger.log('warn', 'editor', 'Form is not supported by the editor yet', {
-        formCode: entry.formCode,
-      })
-      return
-    }
-    const drafts = store.listDrafts(selectedProfile.id, entry.formCode)
-    let draft =
-      drafts[0] ??
-      store.createDraft(selectedProfile.id, entry.formCode)
-    setEditorEntry(entry)
-    setEditorDraft(draft)
-    setEditorInstance(null)
-    setEditorSnapshot([])
-    setEditorIssues([])
-    setEditorLoading(true)
-    setSelectedSection('editor')
-    logger.log('info', 'editor', 'Opening draft', {
-      draftId: draft.id,
-      formCode: entry.formCode,
-      resumed: drafts.length > 0,
-    })
-    let form: FormInstance | undefined
-    try {
-      form = await openOfficialForm(entry.formCode as PrefillFormCode)
-      const values = drafts.length
-        ? draft.values
-        : buildPrefillValues(entry.formCode as PrefillFormCode, selectedProfile, form.fields())
-      for (const [id, value] of Object.entries(values)) {
-        form.set(id, value)
-      }
-      if (drafts.length === 0) {
-        draft = store.saveDraft(draft.id, valuesFromForm(form))
-        setEditorDraft(draft)
-      }
-      setEditorInstance(form)
-      refreshEditor(form)
-    } catch (error) {
-      await form?.close()
-      const message = error instanceof Error ? error.message : String(error)
-      logger.log('error', 'editor', 'Failed to open draft', {
-        draftId: draft.id,
-        error: message,
-      })
-      setEditorIssues([{ message, fieldId: null, source: 'official' }])
-    } finally {
-      setEditorLoading(false)
-    }
+  function editField(field: FieldSnapshot, value: string | boolean) {
+    if (!formInstance || !formEntry || autoFieldIds(formEntry.formCode as PrefillFormCode).has(field.id) || field.disabled) return
+    formInstance.set(field.id, value)
+    refreshEditor(formInstance)
   }
 
-  function commitEditorField(id: string, value: string | boolean) {
-    if (!editorInstance) {
-      return
+  function saveDraft() {
+    if (!formInstance || !draft) return
+    setDraft(store.saveDraft(draft.id, valuesFromForm(formInstance)))
+  }
+
+  function updateDraftStatus(status: DraftStatus) {
+    if (!draft) return
+    setDraft(store.setDraftStatus(draft.id, status))
+  }
+
+  async function closeForm() {
+    await formInstance?.close()
+    setFormInstance(null)
+    setFormEntry(null)
+    setDraft(null)
+    setPage('taxpayer')
+    setTab('forms')
+  }
+
+  const supportedPresets: Record<string, string[]> = {
+    Employer: ['1601Cv2018', '0619E', '1604C'],
+    'Non-VAT business': ['2551Qv2018', '0619E', '1701Q'],
+    'VAT business': ['2550Q', '0619E', '1701Q'],
+  }
+  const availablePresetCodes = new Set(catalog.map((entry) => entry.code))
+  const visibleCatalog = search
+    ? filteredCatalog
+    : catalog.filter(
+        (entry) =>
+          availablePresetCodes.has(entry.code) &&
+          (preset === 'Employer'
+            ? ['1601Cv2018', '0619E', '1604C'].includes(entry.code)
+            : preset === 'Non-VAT business'
+              ? ['2551Qv2018', '0619E', '1701Q'].includes(entry.code)
+              : ['2550Q', '0619E', '1701Q'].includes(entry.code)),
+      )
+
+  function pickerRow(entry: CatalogEntry) {
+    const isInLibrary = selectedLibrary.some((item) => item.formCode === entry.code)
+    const checked = isInLibrary || pendingCodes.includes(entry.code)
+    return (
+      <div
+        key={entry.code}
+        testId={`picker-${entry.code}`}
+        onClick={() => toggleCode(entry.code)}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 10,
+          minHeight: 38,
+          padding: 7,
+          borderBottomWidth: 1,
+          borderColor: t.border,
+          cursor: isInLibrary ? 'default' : 'pointer',
+          backgroundColor: t.chrome,
+        }}
+      >
+        <div style={{
+          width: 18, minWidth: 18, height: 18, flexShrink: 0,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          borderWidth: 1, borderColor: checked ? t.primary : t.border,
+          borderRadius: 4, backgroundColor: checked ? t.primary : t.bg,
+        }}>
+          <text style={{ color: t.primaryFg, fontSize: 12 }}>{checked ? '✓' : ''}</text>
+        </div>
+        <text style={{
+          flexGrow: 1, minWidth: 0, color: t.fg, fontSize: 12,
+          whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden',
+        }}>{entry.label}</text>
+        {isInLibrary && <text style={{ color: t.mutedFg, fontSize: 10 }}>IN LIBRARY</text>}
+        <text style={{ width: 112, minWidth: 112, textAlign: 'right', color: t.mutedFg, fontSize: 11 }}>
+          {entry.code}
+        </text>
+      </div>
+    )
+  }
+
+  function statusColor(status: DraftStatus) {
+    return status === 'confirmed' || status === 'paid'
+      ? t.success
+      : status === 'submitted'
+        ? t.warning
+        : status === 'queued'
+          ? t.primary
+          : t.mutedFg
+  }
+
+  function statusFor(entry: LibraryEntry, period: string) {
+    return selectedProfile
+      ? store.listDrafts(selectedProfile.id, entry.formCode).find((item) => item.period === period)?.status
+      : undefined
+  }
+
+  function periodCard(entry: LibraryEntry) {
+    const form = catalog.find((item) => item.code === entry.formCode)
+    if (!form || !selectedProfile) return null
+    const choices = periodChoices(selectedProfile.year, form.frequency)
+    return (
+      <div key={entry.formCode} style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 16, borderWidth: 1, borderColor: t.border, borderRadius: 10, backgroundColor: t.chrome }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+          <text style={{ color: t.fg, fontSize: 13, fontWeight: 700, width: 112, minWidth: 112 }}>{entry.formCode}</text>
+          <text style={{ color: t.mutedFg, fontSize: 11, flexGrow: 1, minWidth: 0, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{form.label}</text>
+          <text style={{ color: t.mutedFg, fontSize: 10 }}>{form.frequency}</text>
+        </div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+          {choices.map((choice) => {
+            const status = statusFor(entry, choice.period)
+            return (
+              <div
+                key={choice.period}
+                testId={`period-${entry.formCode}-${choice.period}`}
+                onClick={() => void openForm(entry, choice.period)}
+                style={{
+                  display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'center',
+                  padding: 10, width: form.frequency === 'monthly' ? '15%' : '23%',
+                  minWidth: form.frequency === 'monthly' ? 62 : 86,
+                  borderWidth: 1, borderColor: t.border, borderRadius: 7,
+                  cursor: 'pointer', backgroundColor: t.bg,
+                }}
+              >
+                <text style={{ color: t.fg, fontSize: 12 }}>{choice.label}</text>
+                <text style={{ color: status ? statusColor(status) : t.mutedFg, fontSize: 9 }}>
+                  {status ?? 'OPEN'}
+                </text>
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    )
+  }
+
+  function detailsContent() {
+    if (showNewTaxpayer) {
+      const setNew = (field: keyof NewTaxpayerForm, value: string) =>
+        setNewTaxpayer((current) => ({ ...current, [field]: value }))
+      return (
+        <Panel title="New taxpayer" subtitle="Add a taxpayer and its head office facts.">
+          <div style={{ display: 'flex', gap: 8 }}>
+            {(['tin1', 'tin2', 'tin3'] as const).map((part, index) => (
+              <Field
+                key={part}
+                label={`TIN ${index + 1}`}
+                value={newTaxpayer[part]}
+                placeholder={['123', '456', '788'][index]}
+                onChange={(value) => setNew(part, value.replace(/\D/g, '').slice(0, 3))}
+                error={index === 0 ? newTaxpayerErrors.tin ?? '' : ''}
+                testId={`new-taxpayer-${part}`}
+              />
+            ))}
+          </div>
+          <div style={{ display: 'flex', gap: 12 }}>
+            {(['individual', 'non-individual'] as const).map((type) => (
+              <div key={type} onClick={() => setNewTaxpayer((current) => ({ ...current, type }))} style={{ display: 'flex', gap: 6 }}>
+                <text style={{ color: t.fg }}>{newTaxpayer.type === type ? '◉' : '○'} {type}</text>
+              </div>
+            ))}
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12 }}>
+            <Field label="Taxpayer name" value={newTaxpayer.name} onChange={(value) => setNew('name', value)} error={newTaxpayerErrors.name ?? ''} />
+            <Field label="Birth date" value={newTaxpayer.birthDate} onChange={(value) => setNew('birthDate', value)} />
+            <Field label="Head office RDO" value={newTaxpayer.rdo} onChange={(value) => setNew('rdo', value)} />
+            <Field label="ZIP" value={newTaxpayer.zip} onChange={(value) => setNew('zip', value)} />
+            <Field label="Address" value={newTaxpayer.address} onChange={(value) => setNew('address', value)} />
+            <Field label="Telephone" value={newTaxpayer.phone} onChange={(value) => setNew('phone', value)} />
+            <Field label="Email" value={newTaxpayer.email} onChange={(value) => setNew('email', value)} />
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <Button testId="new-taxpayer-save" onClick={saveNewTaxpayer}>Add taxpayer</Button>
+            <Button quiet onClick={() => setShowNewTaxpayer(false)}>Cancel</Button>
+          </div>
+        </Panel>
+      )
     }
-    editorInstance.set(id, value)
-    const result = refreshEditor(editorInstance)
-    logger.log('debug', 'editor', 'Field updated', {
-      draftId: editorDraft?.id,
-      fieldId: id,
-      issueCount: result.issues.length,
-    })
-  }
-
-  function saveEditorDraft() {
-    if (!editorInstance || !editorDraft) {
-      return
+    if (!taxpayer || !branch) {
+      return (
+        <Panel title="Add a taxpayer" subtitle="Taxpayer and branch facts are shared by their tax-year profiles.">
+          <Button onClick={() => setShowNewTaxpayer(true)}>New taxpayer</Button>
+        </Panel>
+      )
     }
-    const draft = store.saveDraft(editorDraft.id, valuesFromForm(editorInstance))
-    setEditorDraft(draft)
-    logger.log('info', 'editor', 'Draft saved', {
-      draftId: draft.id,
-      formCode: draft.formCode,
-    })
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+        <Panel title="Taxpayer details" subtitle="Shared identity across all branches and years.">
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
+            <Field label="TIN" value={formatTin(taxpayer.tin9)} disabled auto />
+            <Field label="Name" value={taxpayerEdit.name} onChange={(value) => setTaxpayerEdit((current) => ({ ...current, name: value }))} />
+            <Field label="Birth date" value={taxpayerEdit.birthDate} onChange={(value) => setTaxpayerEdit((current) => ({ ...current, birthDate: value }))} />
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            {(['individual', 'non-individual'] as const).map((type) => (
+              <div key={type} onClick={() => setTaxpayerEdit((current) => ({ ...current, type }))} style={{ padding: 8, borderRadius: 6, backgroundColor: taxpayerEdit.type === type ? t.secondary : t.bg }}>
+                <text style={{ color: t.fg, fontSize: 12 }}>{taxpayerEdit.type === type ? '●' : '○'} {type}</text>
+              </div>
+            ))}
+            <Button onClick={saveTaxpayerDetails}>Save taxpayer</Button>
+          </div>
+        </Panel>
+        <Panel title={`${branch.name} · ${branch.code}`} subtitle="Blank branch facts inherit from head office.">
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
+                <Field label="Branch name" value={branchEdit.name} onChange={(value) => setBranchEdit((current) => ({ ...current, name: value }))} />
+            {(['rdo', 'zip', 'address', 'phone', 'email'] as const).map((field) => (
+              <Field
+                key={field}
+                label={field.toUpperCase()}
+                value={branchEdit[field]}
+                onChange={(value) => setBranchEdit((current) => ({ ...current, [field]: value }))}
+                auto={branch.code !== '00000' && branch.facts.inherited[field]}
+                placeholder={branch.code !== '00000' && branch.facts.inherited[field] ? `Inherited: ${branch.facts[field] ?? '—'}` : ''}
+              />
+            ))}
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <Button onClick={saveBranchDetails}>Save branch</Button>
+            <Button quiet onClick={() => setShowNewBranch((current) => !current)}>Add branch</Button>
+          </div>
+          {showNewBranch && (
+            <Panel title="New branch">
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
+                <Field label="Branch code" value={newBranch.code} onChange={(value) => setNewBranch((current) => ({ ...current, code: value.replace(/\D/g, '').slice(0, 5) }))} error={branchError} />
+                <Field label="Branch name" value={newBranch.name} onChange={(value) => setNewBranch((current) => ({ ...current, name: value }))} />
+                {(['rdo', 'zip', 'address', 'phone', 'email'] as const).map((field) => (
+                  <Field key={field} label={field.toUpperCase()} value={newBranch[field]} onChange={(value) => setNewBranch((current) => ({ ...current, [field]: value }))} />
+                ))}
+              </div>
+              <Button onClick={addBranch}>Create branch</Button>
+            </Panel>
+          )}
+        </Panel>
+        <Panel title="Tax years" subtitle="Each year has its own selected forms and period drafts.">
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+            {branch.years.map((profile) => (
+              <div key={profile.id} onClick={() => setSelectedProfileId(profile.id)} style={{ padding: 10, borderWidth: 1, borderColor: selectedProfile?.id === profile.id ? t.primary : t.border, borderRadius: 7 }}>
+                <text style={{ color: t.fg }}>{profile.year}</text>
+              </div>
+            ))}
+            <input testId="new-year-input" value={yearInput} onChange={(event) => setYearInput(event.value ?? '')} style={{ width: 84, height: 34, padding: 7, color: t.fg, backgroundColor: t.bg, borderWidth: 1, borderColor: t.input, borderRadius: 6 }} />
+            <Button onClick={addYear}>Add year</Button>
+          </div>
+        </Panel>
+        {statusMessage && <text style={{ color: t.success, fontSize: 12 }}>{statusMessage}</text>}
+      </div>
+    )
   }
 
-  function validateEditor() {
-    if (editorInstance) {
-      const result = refreshEditor(editorInstance)
-      logger.log('info', 'editor', 'Draft validated', {
-        draftId: editorDraft?.id,
-        issueCount: result.issues.length,
-      })
-    }
-  }
-
-  async function closeEditor() {
-    await editorInstance?.close()
-    logger.log('info', 'editor', 'Editor closed', { draftId: editorDraft?.id })
-    setEditorInstance(null)
-    setEditorEntry(null)
-    setEditorDraft(null)
-    setEditorSnapshot([])
-    setEditorIssues([])
-    setEditorInputValues({})
-    setSelectedSection('library')
-  }
-
-  const editorModel = buildEditorModel(editorSnapshot, editorIssues)
-  const displayedLogs =
-    logFilter === 'all' ? logs : logs.filter((entry) => entry.level === logFilter)
-
-  return (
-    <div
-      style={{
-        display: 'flex',
-        flexDirection: 'column',
-        height: '100%',
-        backgroundColor: '#14171d',
-      }}
-    >
-      <div style={{ display: 'flex', flexGrow: 1, minHeight: 0 }}>
-        <div
-          style={{
-            display: 'flex',
-            flexDirection: 'column',
-            gap: 8,
-            width: 220,
-            padding: 20,
-            backgroundColor: '#1b1f27',
-          }}
-        >
-          <text style={{ color: '#f4f5f7', fontSize: 20, padding: 8 }}>eBIRForms</text>
-          {sections.map((section) => (
-            <div
-              key={section.id}
-              testId={`nav-${section.id}`}
-              onClick={() => setSelectedSection(section.id)}
-              style={{
-                padding: 12,
-                borderRadius: 6,
-                cursor: 'pointer',
-                backgroundColor:
-                  selectedSection === section.id ? '#303744' : '#1b1f27',
-                hover: { backgroundColor: '#303744' },
-              }}
-            >
-              <text style={{ color: '#e3e6eb' }}>{section.title}</text>
+  function taxpayerPage() {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 16, flexGrow: 1, minHeight: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div>
+            <text style={{ color: t.fg, fontSize: 25, fontWeight: 700 }}>{taxpayer?.name || 'Taxpayers'}</text>
+            <text style={{ color: t.mutedFg, fontSize: 12 }}>{taxpayer ? `${formatTin(taxpayer.tin9)}  /  ${branch?.name ?? ''}` : 'Taxpayer, branch, and return workspace'}</text>
+          </div>
+          <Button testId="add-taxpayer" onClick={() => { setShowNewTaxpayer(true); setTab('details') }}>+ Add taxpayer</Button>
+        </div>
+        <div style={{ display: 'flex', gap: 6, borderBottomWidth: 1, borderColor: t.border }}>
+          {(['details', 'forms', 'templates'] as const).map((item) => (
+            <div key={item} testId={`tab-${item}`} onClick={() => setTab(item)} style={{ padding: 12, borderBottomWidth: tab === item ? 2 : 0, borderColor: t.primary }}>
+              <text style={{ color: tab === item ? t.fg : t.mutedFg, fontSize: 13, fontWeight: tab === item ? 700 : 500 }}>{item === 'forms' ? 'Forms' : item[0].toUpperCase() + item.slice(1)}</text>
             </div>
           ))}
         </div>
-        <div
-          style={{
-            display: 'flex',
-            flexDirection: 'column',
-            flexGrow: 1,
-            minWidth: 0,
-            gap: 16,
-            padding: 28,
-          }}
-        >
-          {selectedSection === 'profiles' && (
-            <>
-              <text style={{ color: '#f4f5f7', fontSize: 28 }}>Profiles</text>
-              <div style={{ display: 'flex', flexGrow: 1, gap: 24, minHeight: 0 }}>
-                <div
-                  style={{
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: 12,
-                    width: 300,
-                    minHeight: 0,
-                  }}
-                >
-                  <text style={{ color: '#d6dbe4', fontSize: 16 }}>Taxpayer profiles</text>
-                  <div
-                    testId="profile-tree"
-                    style={{
-                      display: 'flex',
-                      flexDirection: 'column',
-                      gap: 12,
-                      flexGrow: 1,
-                      overflow: 'scroll',
-                    }}
-                  >
-                    {profiles.length === 0 && (
-                      <text style={{ color: '#9ca7b7', fontSize: 13 }}>
-                        No taxpayer profiles yet.
-                      </text>
-                    )}
-                    {profiles.map((taxpayer) => (
-                      <div
-                        key={taxpayer.tin9}
-                        style={{
-                          display: 'flex',
-                          flexDirection: 'column',
-                          gap: 8,
-                          padding: 12,
-                          borderRadius: 8,
-                          backgroundColor: '#1b1f27',
-                        }}
-                      >
-                        <text style={{ color: '#f4f5f7', fontSize: 14 }}>
-                          {tinBaseLabel(taxpayer.tin9)}
-                        </text>
-                        {taxpayer.branches.map((branch) => (
-                          <div
-                            key={`${taxpayer.tin9}-${branch.code}`}
-                            style={{
-                              display: 'flex',
-                              flexDirection: 'column',
-                              gap: 5,
-                              paddingLeft: 10,
-                            }}
-                          >
-                            <text style={{ color: '#9ca7b7', fontSize: 12 }}>
-                              Branch {branch.code}
-                            </text>
-                            {branch.years.map((profile) => (
-                              <div
-                                key={profile.id}
-                                testId={`profile-item-${profile.year}-${profile.branch}`}
-                                onClick={() => selectProfile(profile)}
-                                style={{
-                                  padding: 7,
-                                  borderRadius: 5,
-                                  cursor: 'pointer',
-                                  backgroundColor:
-                                    selectedProfileId === profile.id ? '#303744' : '#202631',
-                                }}
-                              >
-                                <text style={{ color: '#e3e6eb', fontSize: 12 }}>
-                                  {profile.registeredName
-                                    ? `${profile.year} · ${profile.registeredName}`
-                                    : String(profile.year)}
-                                </text>
-                              </div>
-                            ))}
+        <div style={{ flexGrow: 1, minHeight: 0, overflow: 'scroll' }}>
+          {tab === 'details' && detailsContent()}
+          {tab === 'templates' && (
+            <Panel title="Templates" subtitle="P4b">
+              <text style={{ color: t.mutedFg, fontSize: 13 }}>Guided templates and filing workflows are planned for P4b.</text>
+            </Panel>
+          )}
+          {tab === 'forms' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+              {!selectedProfile && <Panel title="Select a tax year"><text style={{ color: t.mutedFg }}>Add or select a year for this branch.</text></Panel>}
+              {selectedProfile && (
+                <>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <text style={{ color: t.mutedFg, fontSize: 12 }}>Tax year</text>
+                      <Select value={String(selectedProfile.year)} onValueChange={(value) => {
+                        const profile = branch?.years.find((item) => String(item.year) === value)
+                        if (profile) setSelectedProfileId(profile.id)
+                      }}>
+                        <SelectTrigger style={{ width: 110, height: 34 }}><SelectValue /></SelectTrigger>
+                        <SelectContent>{branch?.years.map((profile) => <SelectItem key={profile.id} value={String(profile.year)}>{profile.year}</SelectItem>)}</SelectContent>
+                      </Select>
+                    </div>
+                    <Button testId="choose-forms" onClick={() => setPickerOpen((current) => !current)}>{pickerOpen ? 'Close picker' : 'Choose forms'}</Button>
+                  </div>
+                  {pickerOpen && (
+                    <Panel title="Choose forms" subtitle="Pick the returns used for this branch and tax year.">
+                      <div style={{ display: 'flex', gap: 6 }}>
+                        {Object.keys(supportedPresets).map((name) => (
+                          <div key={name} onClick={() => setPreset(name)} style={{ padding: 8, backgroundColor: preset === name ? t.secondary : t.bg, borderRadius: 6 }}>
+                            <text style={{ color: t.fg, fontSize: 11 }}>{name}</text>
                           </div>
                         ))}
                       </div>
-                    ))}
-                  </div>
-                </div>
-                <div
-                  style={{
-                    display: 'flex',
-                    flexDirection: 'column',
-                    flexGrow: 1,
-                    gap: 12,
-                    padding: 20,
-                    borderRadius: 10,
-                    backgroundColor: '#1b1f27',
-                  }}
-                >
-                  <text style={{ color: '#f4f5f7', fontSize: 18 }}>New profile</text>
-                  <ProfileField
-                    label="TIN"
-                    field="tin"
-                    value={profileForm.tin}
-                    error={profileErrors.tin ?? ''}
-                    placeholder="123-456-788"
-                    onChange={updateProfileField}
-                  />
-                  <ProfileField
-                    label="Branch"
-                    field="branch"
-                    value={profileForm.branch}
-                    error={profileErrors.branch ?? ''}
-                    onChange={updateProfileField}
-                  />
-                  <ProfileField
-                    label="Year"
-                    field="year"
-                    value={profileForm.year}
-                    error={profileErrors.year ?? ''}
-                    placeholder="2025"
-                    onChange={updateProfileField}
-                  />
-                  <ProfileField
-                    label="Registered name"
-                    field="registeredName"
-                    value={profileForm.registeredName}
-                    error={profileErrors.registeredName ?? ''}
-                    onChange={updateProfileField}
-                  />
-                  <ProfileField
-                    label="RDO"
-                    field="rdo"
-                    value={profileForm.rdo}
-                    error={profileErrors.rdo ?? ''}
-                    placeholder="e.g. 039"
-                    onChange={updateProfileField}
-                  />
-                  <ProfileField
-                    label="Address"
-                    field="address"
-                    value={profileForm.address}
-                    error={profileErrors.address ?? ''}
-                    onChange={updateProfileField}
-                  />
-                  <ProfileField
-                    label="ZIP"
-                    field="zip"
-                    value={profileForm.zip}
-                    error={profileErrors.zip ?? ''}
-                    onChange={updateProfileField}
-                  />
-                  <ProfileField
-                    label="Telephone"
-                    field="phone"
-                    value={profileForm.phone}
-                    error={profileErrors.phone ?? ''}
-                    onChange={updateProfileField}
-                  />
-                  <ProfileField
-                    label="Email"
-                    field="email"
-                    value={profileForm.email}
-                    error={profileErrors.email ?? ''}
-                    onChange={updateProfileField}
-                  />
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                    <ActionButton testId="profile-save" onClick={saveProfile}>
-                      Save
-                    </ActionButton>
-                    <text testId="profile-status" style={{ color: '#aab2bf', fontSize: 12 }}>
-                      {profileStatus}
-                    </text>
-                  </div>
-                </div>
-              </div>
-            </>
-          )}
-          {selectedSection === 'library' && (
-            <>
-              <text style={{ color: '#f4f5f7', fontSize: 28 }}>Library</text>
-              <text style={{ color: '#9ca7b7', fontSize: 13 }}>
-                {selectedProfile
-                  ? `${formatTin(selectedProfile.tin9, selectedProfile.branch)} · ${selectedProfile.year}`
-                  : 'Select a profile to manage its forms.'}
-              </text>
-              {selectedProfile && (
-                <div style={{ display: 'flex', flexGrow: 1, gap: 20, minHeight: 0 }}>
-                  <div
-                    style={{
-                      display: 'flex',
-                      flexDirection: 'column',
-                      flexGrow: 1,
-                      gap: 10,
-                      minWidth: 0,
-                    }}
-                  >
-                    <text style={{ color: '#d6dbe4', fontSize: 17 }}>Form picker</text>
-                    <input
-                      testId="library-search"
-                      value={search}
-                      placeholder="Search forms by code or name"
-                      onChange={(event) => setSearch(event.value ?? '')}
-                      style={{
-                        height: 34,
-                        padding: 8,
-                        flexShrink: 0,
-                        color: '#f4f5f7',
-                        backgroundColor: '#10141a',
-                        borderWidth: 1,
-                        borderColor: '#3b414d',
-                        borderRadius: 5,
-                      }}
-                    />
-                    {pendingCodes.length > 0 && (
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-                        <text style={{ color: '#9ca7b7', fontSize: 12 }}>Selected to add</text>
-                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                          {pendingCodes.map((code) => {
-                            const entry = catalog.find((item) => item.code === code)
-                            return entry ? (
-                              <CheckboxRow
-                                key={code}
-                                entry={entry}
-                                checked
-                                testId={`picker-selected-${code}`}
-                                onClick={() => togglePendingCode(code)}
-                              />
-                            ) : null
-                          })}
-                        </div>
+                      <input testId="catalog-search" value={search} placeholder="Search by form name or code" onChange={(event) => setSearch(event.value ?? '')} style={{ height: 36, minHeight: 36, padding: 9, color: t.fg, backgroundColor: t.bg, borderWidth: 1, borderColor: t.input, borderRadius: 6 }} />
+                      <div style={{ maxHeight: 300, overflow: 'scroll', borderWidth: 1, borderColor: t.border, borderRadius: 8 }}>
+                        {(search ? filteredCatalog : visibleCatalog).filter((entry) => search || availablePresetCodes.has(entry.code)).map(pickerRow)}
                       </div>
-                    )}
-                    <div
-                      testId="catalog-picker"
-                      style={{
-                        display: 'flex',
-                        flexDirection: 'column',
-                        gap: 2,
-                        flexGrow: 1,
-                        minHeight: 0,
-                        overflow: 'scroll',
-                        backgroundColor: '#1b1f27',
-                        borderRadius: 8,
-                        padding: 8,
-                      }}
-                    >
-                      {filteredCatalog.map((entry) => {
-                        const inLibrary = library.some(
-                          (item) => item.formCode === entry.code,
-                        )
-                        return (
-                          <CheckboxRow
-                            key={entry.code}
-                            entry={entry}
-                            checked={inLibrary || pendingCodes.includes(entry.code)}
-                            disabled={inLibrary}
-                            testId={`picker-option-${entry.code}`}
-                            onClick={() => togglePendingCode(entry.code)}
-                          />
-                        )
-                      })}
-                      {filteredCatalog.length === 0 && (
-                        <text style={{ color: '#9ca7b7', fontSize: 13, padding: 10 }}>
-                          No forms match this search.
-                        </text>
-                      )}
-                    </div>
-                    <ActionButton
-                      testId="library-add-selected"
-                      onClick={addSelectedForms}
-                      disabled={pendingCodes.length === 0}
-                    >
-                      Add selected
-                    </ActionButton>
-                  </div>
-                  <div
-                    style={{
-                      display: 'flex',
-                      flexDirection: 'column',
-                      gap: 10,
-                      width: 300,
-                      minWidth: 300,
-                      flexShrink: 0,
-                      minHeight: 0,
-                    }}
-                  >
-                    <text style={{ color: '#d6dbe4', fontSize: 17 }}>Selected library</text>
-                    <div
-                      testId="library-list"
-                      style={{
-                        display: 'flex',
-                        flexDirection: 'column',
-                        gap: 8,
-                        flexGrow: 1,
-                        overflow: 'scroll',
-                      }}
-                    >
-                      {library.length === 0 && (
-                        <text style={{ color: '#9ca7b7', fontSize: 13 }}>
-                          No forms added for this profile.
-                        </text>
-                      )}
-                      {library.map((entry) => {
-                        const draftCount = selectedProfileId
-                          ? store.listDrafts(selectedProfileId, entry.formCode).length
-                          : 0
-                        return (
-                          <div
-                            key={entry.formCode}
-                            testId={`library-form-${entry.formCode}`}
-                            style={{
-                              display: 'flex',
-                              alignItems: 'center',
-                              gap: 8,
-                              padding: 10,
-                              borderRadius: 7,
-                              backgroundColor: '#1b1f27',
-                            }}
-                          >
-                            <text
-                              style={{
-                                color: '#e3e6eb',
-                                fontSize: 13,
-                                flexGrow: 1,
-                                minWidth: 0,
-                                whiteSpace: 'nowrap',
-                                textOverflow: 'ellipsis',
-                              }}
-                            >
-                              {entry.label}
-                            </text>
-                            <text
-                              style={{
-                                color: '#9ca7b7',
-                                fontSize: 11,
-                                width: 100,
-                                minWidth: 100,
-                                flexShrink: 0,
-                                textAlign: 'right',
-                                whiteSpace: 'nowrap',
-                              }}
-                            >
-                              {entry.formCode}
-                            </text>
-                            <text style={{ color: '#9ca7b7', fontSize: 11 }}>
-                              {`${draftCount} drafts`}
-                            </text>
-                            <ActionButton
-                              testId={`library-open-${entry.formCode}`}
-                              onClick={() => {
-                                void openDraft(entry)
-                              }}
-                            >
-                              Open
-                            </ActionButton>
-                            <div
-                              testId={`library-remove-${entry.formCode}`}
-                              onClick={() => removeLibraryForm(entry.formCode)}
-                              style={{
-                                padding: 6,
-                                borderRadius: 4,
-                                cursor: 'pointer',
-                                backgroundColor: '#303744',
-                              }}
-                            >
-                              <text style={{ color: '#fca5a5', fontSize: 11 }}>Remove</text>
-                            </div>
-                          </div>
-                        )
-                      })}
-                    </div>
-                  </div>
-                </div>
-              )}
-            </>
-          )}
-          {selectedSection === 'editor' && (
-            <>
-              <div
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                  gap: 16,
-                }}
-              >
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 5, minWidth: 0 }}>
-                  <text style={{ color: '#f4f5f7', fontSize: 26 }}>
-                    {`BIR Form ${editorEntry?.formCode ?? ''}`}
-                  </text>
-                  <text style={{ color: '#9ca7b7', fontSize: 13 }}>
-                    {selectedProfile
-                      ? `${formatTin(selectedProfile.tin9, selectedProfile.branch)} · ${selectedProfile.year}`
-                      : ''}
-                  </text>
-                </div>
-                <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
-                  <ActionButton testId="editor-save" onClick={saveEditorDraft}>
-                    Save draft
-                  </ActionButton>
-                  <ActionButton testId="editor-validate" onClick={validateEditor}>
-                    Validate
-                  </ActionButton>
-                  <ActionButton
-                    testId="editor-back"
-                    onClick={() => {
-                      void closeEditor()
-                    }}
-                  >
-                    Back
-                  </ActionButton>
-                </div>
-              </div>
-              {editorLoading ? (
-                <text style={{ color: '#c8d0dc', fontSize: 14 }}>Opening official form…</text>
-              ) : (
-                <>
-                  <div
-                    testId="editor-error-banner"
-                    style={{
-                      height: 30,
-                      minHeight: 30,
-                      paddingLeft: 10,
-                      backgroundColor: editorModel.bannerErrorText ? '#451f27' : '#1b1f27',
-                      borderRadius: 5,
-                    }}
-                  >
-                    <text style={{ color: '#fca5a5', fontSize: 12 }}>
-                      {editorModel.bannerErrorText}
-                    </text>
-                  </div>
-                  <div
-                    testId="editor-fields"
-                    style={{
-                      display: 'flex',
-                      flexDirection: 'column',
-                      flexGrow: 1,
-                      minHeight: 0,
-                      gap: 12,
-                      overflow: 'scroll',
-                    }}
-                  >
-                    {editorModel.sections.map((section, sectionIndex) => (
-                      <div
-                        key={`${section.item ?? 'other'}-${sectionIndex}`}
-                        style={{
-                          display: 'flex',
-                          flexDirection: 'column',
-                          gap: 8,
-                          padding: 12,
-                          borderRadius: 8,
-                          backgroundColor: '#1b1f27',
-                        }}
-                      >
-                        <text style={{ color: '#93c5fd', fontSize: 14 }}>
-                          {section.item ? `Item ${section.item}` : 'Other fields'}
-                        </text>
-                        {section.rows.map((row) => {
-                          const field = row.fields[0]
-                          const value = editorInputValues[field.id] ?? field.value
-                          const commit = (next: string | boolean) =>
-                            commitEditorField(field.id, next)
-                          return (
-                            <div
-                              key={row.id}
-                              testId={`editor-row-${row.id}`}
-                              style={{ display: 'flex', flexDirection: 'column', gap: 4 }}
-                            >
-                              <div
-                                style={{
-                                  display: 'flex',
-                                  alignItems: 'center',
-                                  gap: 14,
-                                  minWidth: 0,
-                                }}
-                              >
-                                <text
-                                  style={{
-                                    color: '#d6dbe4',
-                                    fontSize: 12,
-                                    width: 290,
-                                    minWidth: 190,
-                                    flexShrink: 0,
-                                  }}
-                                >
-                                  {row.label}
-                                </text>
-                                <div style={{ flexGrow: 1, minWidth: 0 }}>
-                                  {row.type === 'select-one' ? (
-                                    <Select
-                                      value={String(value)}
-                                      items={(field.options ?? []).map((option) => ({
-                                        value: option.value,
-                                        label: option.label || option.value,
-                                      }))}
-                                      onValueChange={(next: string) => commit(next)}
-                                      disabled={field.disabled}
-                                      style={{ width: '100%', minWidth: 0 }}
-                                    >
-                                      <SelectTrigger
-                                        style={{
-                                          display: 'flex',
-                                          alignItems: 'center',
-                                          width: '100%',
-                                          height: 34,
-                                          padding: 8,
-                                          color: '#f4f5f7',
-                                          backgroundColor: '#10141a',
-                                          borderWidth: 1,
-                                          borderColor: '#3b414d',
-                                          borderRadius: 5,
-                                        }}
-                                      >
-                                        <SelectValue placeholder="Select an option" />
-                                      </SelectTrigger>
-                                      <SelectContent
-                                        style={{
-                                          width: 580,
-                                          maxHeight: 240,
-                                          overflowY: 'scroll',
-                                          padding: 4,
-                                          backgroundColor: '#10141a',
-                                          borderWidth: 1,
-                                          borderColor: '#3b414d',
-                                          borderRadius: 5,
-                                        }}
-                                      >
-                                        {(field.options ?? []).map((option) => (
-                                          <SelectItem
-                                            key={option.value}
-                                            value={option.value}
-                                            style={(state) => ({
-                                              padding: 8,
-                                              color: '#f4f5f7',
-                                              backgroundColor: state.highlighted
-                                                ? '#303744'
-                                                : state.selected
-                                                  ? '#232b38'
-                                                  : '#171c24',
-                                            })}
-                                          >
-                                            {option.label || option.value}
-                                          </SelectItem>
-                                        ))}
-                                      </SelectContent>
-                                    </Select>
-                                  ) : row.type === 'radio' ? (
-                                    <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-                                      {row.fields.map((radio) => (
-                                        <div
-                                          key={radio.id}
-                                          testId={`editor-radio-${radio.id}`}
-                                          onClick={() => {
-                                            if (radio.disabled) {
-                                              return
-                                            }
-                                            for (const option of row.fields) {
-                                              editorInstance?.set(
-                                                option.id,
-                                                option.id === radio.id,
-                                              )
-                                            }
-                                            refreshEditor(editorInstance!)
-                                          }}
-                                          style={{
-                                            display: 'flex',
-                                            alignItems: 'center',
-                                            gap: 6,
-                                            cursor: radio.disabled ? 'default' : 'pointer',
-                                            opacity: radio.disabled ? 0.55 : 1,
-                                          }}
-                                        >
-                                          <div
-                                            style={{
-                                              display: 'flex',
-                                              alignItems: 'center',
-                                              justifyContent: 'center',
-                                              width: 18,
-                                              minWidth: 18,
-                                              height: 18,
-                                              borderWidth: 1,
-                                              borderColor: '#708090',
-                                              borderRadius: 9,
-                                            }}
-                                          >
-                                            <text style={{ color: '#60a5fa', fontSize: 13 }}>
-                                              {radio.checked ? '●' : ''}
-                                            </text>
-                                          </div>
-                                          <text style={{ color: '#e3e6eb', fontSize: 12 }}>
-                                            {radio.label || radio.value}
-                                          </text>
-                                        </div>
-                                      ))}
-                                    </div>
-                                  ) : row.type === 'checkbox' ? (
-                                    <div
-                                      testId={`editor-checkbox-${field.id}`}
-                                      onClick={() => commit(!field.checked)}
-                                      style={{
-                                        display: 'flex',
-                                        alignItems: 'center',
-                                        gap: 7,
-                                        cursor: field.disabled ? 'default' : 'pointer',
-                                        opacity: field.disabled ? 0.55 : 1,
-                                      }}
-                                    >
-                                      <text style={{ color: '#60a5fa', fontSize: 16 }}>
-                                        {field.checked ? '☑' : '☐'}
-                                      </text>
-                                      <text style={{ color: '#e3e6eb', fontSize: 12 }}>
-                                        {field.label}
-                                      </text>
-                                    </div>
-                                  ) : (
-                                    <input
-                                      testId={`editor-input-${field.id}`}
-                                      value={String(value)}
-                                      readOnly={field.disabled}
-                                      onChange={(event) =>
-                                        setEditorInputValues((current) => ({
-                                          ...current,
-                                          [field.id]: event.value ?? '',
-                                        }))
-                                      }
-                                      onBlur={(event) =>
-                                        commit(
-                                          event.value ??
-                                            editorInputValues[field.id]?.toString() ??
-                                            field.value,
-                                        )
-                                      }
-                                      onKeyDown={(event) => {
-                                        if (event.key === 'Enter') {
-                                          commit(
-                                            editorInputValues[field.id]?.toString() ?? field.value,
-                                          )
-                                        }
-                                      }}
-                                      style={{
-                                        height: 34,
-                                        padding: 8,
-                                        color: field.disabled ? '#9ca7b7' : '#f4f5f7',
-                                        backgroundColor: '#10141a',
-                                        borderWidth: 1,
-                                        borderColor: '#3b414d',
-                                        borderRadius: 5,
-                                      }}
-                                    />
-                                  )}
-                                </div>
-                              </div>
-                              <div
-                                testId={`editor-error-${row.id}`}
-                                style={{ height: 18, minHeight: 18 }}
-                              >
-                                <text style={{ color: '#f87171', fontSize: 11 }}>
-                                  {row.errorText}
-                                </text>
-                              </div>
-                            </div>
-                          )
-                        })}
-                      </div>
-                    ))}
-                  </div>
-                </>
-              )}
-            </>
-          )}
-          {selectedSection === 'jobs' && (
-            <>
-              <text style={{ color: '#f4f5f7', fontSize: 28 }}>Jobs</text>
-              <div
-                testId="jobs-list"
-                style={{ display: 'flex', flexDirection: 'column', gap: 8, overflow: 'scroll' }}
-              >
-                {jobs.length === 0 && (
-                  <text style={{ color: '#9ca7b7', fontSize: 13 }}>No jobs yet.</text>
-                )}
-                {jobs.map((job) => (
-                  <div
-                    key={job.id}
-                    testId={`job-${job.id}`}
-                    style={{
-                      display: 'flex',
-                      flexDirection: 'column',
-                      gap: 5,
-                      padding: 12,
-                      borderRadius: 8,
-                      backgroundColor: '#1b1f27',
-                    }}
-                  >
-                    <text style={{ color: '#e3e6eb', fontSize: 14 }}>
-                      {`${job.kind} · ${job.state}`}
-                    </text>
-                    <text style={{ color: '#9ca7b7', fontSize: 12 }}>
-                      Attempts: {job.attempts}/{job.maxAttempts}
-                    </text>
-                    <text style={{ color: '#fca5a5', fontSize: 12 }}>
-                      {job.lastError ?? ''}
-                    </text>
-                  </div>
-                ))}
-              </div>
-            </>
-          )}
-          {selectedSection === 'logs' && (
-            <>
-              <text style={{ color: '#f4f5f7', fontSize: 28 }}>Logs</text>
-              <div style={{ display: 'flex', gap: 8 }}>
-                {(['all', 'debug', 'info', 'warn', 'error'] as const).map((level) => (
-                  <div
-                    key={level}
-                    testId={`log-filter-${level}`}
-                    onClick={() => setLogFilter(level)}
-                    style={{
-                      padding: 8,
-                      borderRadius: 5,
-                      cursor: 'pointer',
-                      backgroundColor: logFilter === level ? '#303744' : '#1b1f27',
-                    }}
-                  >
-                    <text style={{ color: '#e3e6eb', fontSize: 12 }}>{level}</text>
-                  </div>
-                ))}
-              </div>
-              <div
-                testId="logs-list"
-                style={{
-                  display: 'flex',
-                  flexDirection: 'column',
-                  gap: 7,
-                  flexGrow: 1,
-                  minHeight: 0,
-                  overflow: 'scroll',
-                }}
-              >
-                {displayedLogs.length === 0 && (
-                  <text style={{ color: '#9ca7b7', fontSize: 13 }}>No log entries.</text>
-                )}
-                {displayedLogs
-                  .slice(-50)
-                  .reverse()
-                  .map((entry, index) => (
-                    <div
-                      key={`${entry.ts}-${index}`}
-                      testId={`log-entry-${index}`}
-                      style={{
-                        display: 'flex',
-                        flexDirection: 'column',
-                        gap: 4,
-                        padding: 10,
-                        borderRadius: 7,
-                        backgroundColor: '#1b1f27',
-                      }}
-                    >
-                      <text style={{ color: '#e3e6eb', fontSize: 13 }}>
-                        {`${entry.level.toUpperCase()} · ${entry.scope} · ${entry.msg}`}
-                      </text>
-                      <text style={{ color: '#9ca7b7', fontSize: 11 }}>{entry.ts}</text>
+                      <Button testId="add-selected-forms" disabled={!pendingCodes.length} onClick={addSelectedForms}>{`Add selected ${pendingCodes.length || ''}`}</Button>
+                    </Panel>
+                  )}
+                  {selectedLibrary.length === 0 && <Panel title="Your form library is empty" subtitle="Choose forms to add returns for this year." />}
+                  {selectedLibrary.map((entry) => (
+                    <div key={entry.formCode} style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                      {periodCard(entry)}
                     </div>
                   ))}
-              </div>
-            </>
+                </>
+              )}
+            </div>
           )}
         </div>
       </div>
-      <div style={{ height: 42, padding: 12, backgroundColor: '#1b1f27' }}>
-        <text style={{ color: '#aab2bf', fontSize: 12 }}>
-          {describeSftpConfig(loadSftpConfig())}
-        </text>
+    )
+  }
+
+  function formPage() {
+    const currentStatus = draft?.status ?? 'draft'
+    const stages: DraftStatus[] = ['draft', 'queued', 'submitted', 'confirmed', 'paid']
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minHeight: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', paddingBottom: 12, borderBottomWidth: 1, borderColor: t.border }}>
+          <Button quiet onClick={() => void closeForm()}>← Back</Button>
+          <text style={{ color: t.fg, fontSize: 17, fontWeight: 700 }}>{formEntry?.label ?? 'Return'}</text>
+          <div
+            onMouseEnter={() => setShowPrintTip(true)}
+            onMouseLeave={() => setShowPrintTip(false)}
+            style={{ position: 'relative' }}
+          >
+            <Button quiet disabled onClick={() => {}}>Print preview</Button>
+            {showPrintTip && (
+              <div style={{
+                position: 'absolute', top: 42, right: 0,
+                padding: 8, borderWidth: 1, borderColor: t.border,
+                borderRadius: 6, backgroundColor: t.chrome,
+              }}>
+                <text style={{ color: t.fg, fontSize: 11 }}>Coming in P5</text>
+              </div>
+            )}
+          </div>
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'center', gap: 8, padding: 12, borderBottomWidth: 1, borderColor: t.border }}>
+          {stages.map((stage, index) => (
+              <div key={stage} onClick={() => updateDraftStatus(stage)} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <div style={{ width: 8, height: 8, borderRadius: 8, backgroundColor: index <= stages.indexOf(currentStatus) ? statusColor(currentStatus) : t.border }} />
+              <text style={{ color: index <= stages.indexOf(currentStatus) ? t.fg : t.mutedFg, fontSize: 11 }}>{stage[0].toUpperCase() + stage.slice(1)}</text>
+              {index < stages.length - 1 && <text style={{ color: t.border }}>—</text>}
+            </div>
+          ))}
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14, padding: 18, flexGrow: 1, minHeight: 0, overflow: 'scroll' }}>
+          {draft && (
+            <Panel title="Taxpayer facts · auto-filled" subtitle={`${formatTin(selectedProfile?.tin9 ?? '', selectedProfile?.branch)} · ${draft.period}`}>
+              <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap' }}>
+                <text style={{ color: t.mutedFg, fontSize: 12 }}>{taxpayer?.name ?? selectedProfile?.registeredName}</text>
+                <text style={{ color: t.mutedFg, fontSize: 12 }}>{branch?.facts.rdo ? `RDO ${branch.facts.rdo}` : 'RDO —'}</text>
+                <text style={{ color: t.mutedFg, fontSize: 12 }}>{branch?.facts.address ?? 'Address —'}</text>
+                <text style={{ color: t.mutedFg, fontSize: 12 }}>{branch?.facts.zip ?? 'ZIP —'}</text>
+              </div>
+            </Panel>
+          )}
+          {issues.some((issue) => issue.fieldId === null) && (
+            <Panel title="Review required"><text style={{ color: t.danger, fontSize: 12 }}>{editorModel.bannerErrorText}</text></Panel>
+          )}
+          {formLoading && <text style={{ color: t.mutedFg }}>Opening official form…</text>}
+          {editorModel.sections.map((section, index) => (
+            <Panel key={`${section.section ?? 'other'}-${index}`} title={section.section ?? 'Return fields'}>
+              {section.rows.map((row) => (
+                <div key={row.id} style={{ display: 'flex', flexDirection: 'column', gap: 4, paddingBottom: 8, borderBottomWidth: 1, borderColor: t.border }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    {row.item && <text style={{ color: t.mutedFg, fontSize: 10, width: 48 }}>{row.item}</text>}
+                    <text style={{ color: t.fg, fontSize: 12, flexGrow: 1 }}>{row.label || row.name}</text>
+                    {row.locked && <text style={{ color: t.mutedFg, fontSize: 9 }}>AUTO</text>}
+                    {row.type === 'checkbox' ? (
+                      <div onClick={() => editField(row.fields[0], !Boolean(editorValues[row.fields[0].id]))} style={{ width: 30, height: 25, display: 'flex', justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: t.border, borderRadius: 5, backgroundColor: t.bg }}>
+                        <text style={{ color: t.fg }}>{editorValues[row.fields[0].id] ? '✓' : ''}</text>
+                      </div>
+                    ) : row.type === 'radio' ? (
+                      <div style={{ display: 'flex', gap: 4 }}>
+                        {row.fields.map((field) => (
+                          <div key={field.id} onClick={() => editField(field, true)} style={{ padding: 8, borderWidth: 1, borderColor: Boolean(editorValues[field.id]) ? t.primary : t.border, borderRadius: 5, backgroundColor: Boolean(editorValues[field.id]) ? t.secondary : t.bg }}>
+                            <text style={{ color: t.fg, fontSize: 11 }}>{field.label || field.value || field.id}</text>
+                          </div>
+                        ))}
+                      </div>
+                    ) : row.type === 'select-one' ? (
+                      <Select value={String(editorValues[row.fields[0].id] ?? '')} onValueChange={(value) => editField(row.fields[0], value)} disabled={row.locked || row.fields[0].disabled}>
+                        <SelectTrigger style={{ width: 250, height: 32 }}><SelectValue placeholder="Select" /></SelectTrigger>
+                        <SelectContent>{row.fields[0].options?.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
+                      </Select>
+                    ) : (
+                      <input
+                        testId={`field-${row.fields[0].id}`}
+                        value={String(editorValues[row.fields[0].id] ?? '')}
+                        readOnly={row.locked || row.fields[0].disabled}
+                        onChange={(event) => editField(row.fields[0], event.value ?? '')}
+                        style={{
+                          width: row.label.toLowerCase().includes('amount') ? 180 : 280,
+                          height: 32, padding: 8, textAlign: row.label.toLowerCase().includes('amount') ? 'right' : 'left',
+                          color: row.locked || row.fields[0].disabled ? t.mutedFg : t.fg,
+                          backgroundColor: row.locked || row.fields[0].disabled ? t.muted : t.bg,
+                          borderWidth: 1, borderColor: t.input, borderRadius: 5,
+                        }}
+                      />
+                    )}
+                  </div>
+                  <div style={{ minHeight: 16, height: 16 }}>
+                    <text style={{ color: row.errorText ? t.danger : t.mutedFg, fontSize: 10 }}>{row.errorText}</text>
+                  </div>
+                </div>
+              ))}
+            </Panel>
+          ))}
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, padding: 12, borderTopWidth: 1, borderColor: t.border, backgroundColor: t.chrome }}>
+          <Button quiet testId="validate-return" onClick={() => formInstance && refreshEditor(formInstance)}>Validate</Button>
+          <Button testId="save-return" onClick={saveDraft}>Save draft</Button>
+        </div>
+      </div>
+    )
+  }
+
+  function sidebar() {
+    const navItems: Array<[NavPage, string]> = [
+      ['tasks', 'Background tasks'],
+      ['logs', 'Logs'],
+      ['calendar', 'Tax calendars'],
+      ['settings', 'Settings'],
+    ]
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', width: sidebarCollapsed ? 64 : 250, minWidth: sidebarCollapsed ? 64 : 250, padding: 12, gap: 10, backgroundColor: t.chrome, borderRightWidth: 1, borderColor: t.border }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: 7 }}>
+          {!sidebarCollapsed && <text style={{ color: t.fg, fontSize: 18, fontWeight: 800 }}>eBIRForms</text>}
+          <div testId="sidebar-toggle" onClick={() => setSidebarCollapsed((value) => !value)}><text style={{ color: t.mutedFg }}>☰</text></div>
+        </div>
+        {!sidebarCollapsed && (
+          <>
+            <input value={taxpayerSearch} onChange={(event) => setTaxpayerSearch(event.value ?? '')} placeholder="Search taxpayer" style={{ height: 34, padding: 8, color: t.fg, backgroundColor: t.bg, borderWidth: 1, borderColor: t.input, borderRadius: 6 }} />
+            <Button onClick={() => { setShowNewTaxpayer(true); setPage('taxpayer'); setTab('details') }}>+ New taxpayer</Button>
+            <div testId="taxpayer-tree" style={{ display: 'flex', flexDirection: 'column', gap: 8, flexGrow: 1, overflow: 'scroll' }}>
+              {filteredTaxpayers.map((item) => (
+                <div key={item.tin9} style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                  <text style={{ color: t.fg, fontSize: 12, fontWeight: 700 }}>{item.name || formatTin(item.tin9)}</text>
+                  {item.branches.map((branchItem) => (
+                    <div key={branchItem.code} style={{ display: 'flex', flexDirection: 'column', paddingLeft: 8, gap: 4 }}>
+                      <div testId={`branch-${item.tin9}-${branchItem.code}`} onClick={() => chooseBranch(item.tin9, branchItem.code)} style={{ padding: 5, borderRadius: 5, backgroundColor: selectedBranchId === branchId(item.tin9, branchItem.code) ? t.secondary : t.chrome }}>
+                        <text style={{ color: t.mutedFg, fontSize: 11 }}>⌄ {branchItem.code} · {branchItem.name}</text>
+                      </div>
+                      {branchItem.years.map((profile) => (
+                        <div key={profile.id} testId={`year-${profile.year}-${profile.branch}`} onClick={() => chooseProfile(profile)} style={{ padding: 6, paddingLeft: 18, borderRadius: 5, backgroundColor: selectedProfile?.id === profile.id ? t.accent : t.chrome }}>
+                          <text style={{ color: t.fg, fontSize: 11 }}>{profile.year}</text>
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4, borderTopWidth: 1, borderColor: t.border, paddingTop: 8 }}>
+          {navItems.map(([id, label]) => (
+            <div key={id} testId={`nav-${id}`} onClick={() => setPage(id)} style={{ padding: 9, borderRadius: 6, backgroundColor: page === id ? t.secondary : t.chrome }}>
+              <text style={{ color: t.fg, fontSize: 12 }}>{sidebarCollapsed ? label.slice(0, 1) : label}</text>
+            </div>
+          ))}
+        </div>
+      </div>
+    )
+  }
+
+  function taskPage() {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+        <text style={{ color: t.fg, fontSize: 24, fontWeight: 700 }}>Background tasks</text>
+        {queueJobs.map((job) => (
+          <Panel key={job.id} title={`${job.kind} · ${job.state}`} subtitle={`Attempts ${job.attempts}/${job.maxAttempts}`}>
+            <text style={{ color: job.lastError ? t.danger : t.mutedFg, fontSize: 12 }}>{job.lastError ?? JSON.stringify(job.payload)}</text>
+          </Panel>
+        ))}
+      </div>
+    )
+  }
+
+  function logsPage() {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 12, flexGrow: 1, minHeight: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <text style={{ color: t.fg, fontSize: 24, fontWeight: 700 }}>Logs</text>
+          <Select value={logFilter} onValueChange={(value) => setLogFilter(value as LogFilter)}>
+            <SelectTrigger style={{ width: 140, height: 34 }}><SelectValue /></SelectTrigger>
+            <SelectContent>{(['all', 'debug', 'info', 'warn', 'error'] as LogFilter[]).map((level) => <SelectItem key={level} value={level}>{level}</SelectItem>)}</SelectContent>
+          </Select>
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4, overflow: 'scroll' }}>
+          {shownLogs.map((entry, index) => (
+            <div key={`${entry.ts}-${index}`} style={{ display: 'flex', gap: 10, padding: 9, backgroundColor: t.chrome, borderWidth: 1, borderColor: t.border, borderRadius: 6 }}>
+              <text style={{ color: t.mutedFg, fontSize: 10 }}>{new Date(entry.ts).toLocaleTimeString()}</text>
+              <text style={{ color: entry.level === 'error' ? t.danger : entry.level === 'warn' ? t.warning : t.fg, fontSize: 10, width: 48 }}>{entry.level}</text>
+              <text style={{ color: t.mutedFg, fontSize: 10, width: 72 }}>{entry.scope}</text>
+              <text style={{ color: t.fg, fontSize: 11, flexGrow: 1 }}>{entry.msg}</text>
+            </div>
+          ))}
+        </div>
+      </div>
+    )
+  }
+
+  function mainContent() {
+    if (page === 'form') return formPage()
+    if (page === 'taxpayer') return taxpayerPage()
+    if (page === 'tasks') return taskPage()
+    if (page === 'logs') return logsPage()
+    if (page === 'calendar') return <Panel title="Tax calendars" subtitle="Coming in a future release." />
+    return (
+      <Panel title="Settings">
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <text style={{ color: t.fg, fontSize: 13 }}>Appearance</text>
+          <Button testId="theme-toggle" quiet onClick={() => setThemeMode((mode) => mode === 'light' ? 'dark' : 'light')}>{themeMode === 'light' ? 'Switch to dark' : 'Switch to light'}</Button>
+        </div>
+        <text style={{ color: t.mutedFg, fontSize: 12 }}>Theme preference is saved on this device.</text>
+      </Panel>
+    )
+  }
+
+  const sftpMode = describeSftpConfig(loadSftpConfig())
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', backgroundColor: t.bg, fontFamily: 'Bricolage Grotesque, sans-serif' }}>
+      <div style={{ display: 'flex', flexGrow: 1, minHeight: 0 }}>
+        {sidebar()}
+        <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0, minHeight: 0 }}>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, padding: 12, borderBottomWidth: 1, borderColor: t.border, backgroundColor: t.chrome }}>
+            <div testId="notification-bell" onClick={() => setPage('logs')}><text style={{ color: t.fg, fontSize: 15 }}>♢</text></div>
+            <div testId="theme-quick-toggle" onClick={() => setThemeMode((mode) => mode === 'light' ? 'dark' : 'light')}><text style={{ color: t.fg, fontSize: 13 }}>{themeMode === 'light' ? '☾' : '☀'}</text></div>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minHeight: 0, padding: 20 }}>
+            {mainContent()}
+          </div>
+        </div>
+      </div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', padding: 8, borderTopWidth: 1, borderColor: t.border, backgroundColor: t.chrome }}>
+        <text style={{ color: t.mutedFg, fontSize: 10 }}>eBIRForms · prepare with confidence</text>
+        <text style={{ color: t.mutedFg, fontSize: 10 }}>SFTP: {sftpMode} · Offline first</text>
       </div>
     </div>
   )
 }
 
-render(<App />, {
-  title: 'eBIRForms',
-  width: 1200,
-  height: 850,
-  focus: process.env.GPUIX_BACKGROUND !== '1',
-})
+render(<><FontRegistration /><App /></>, { title: 'eBIRForms', width: 1440, height: 940 })

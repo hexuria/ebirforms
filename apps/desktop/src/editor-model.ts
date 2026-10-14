@@ -9,10 +9,11 @@ export interface EditorRow {
   type: FieldSnapshot['type']
   fields: FieldSnapshot[]
   errorText: string
+  locked: boolean
 }
 
 export interface EditorSection {
-  item: string | null
+  section: string | null
   rows: EditorRow[]
 }
 
@@ -35,6 +36,9 @@ export const prefillMap: Record<
     zip: string
     email: string
     phone?: string
+    period:
+      | { kind: 'monthly'; month: string; year: string }
+      | { kind: 'quarterly'; year: string; quarter: [string, string, string, string] }
   }
 > = {
   '1601Cv2018': {
@@ -47,6 +51,7 @@ export const prefillMap: Record<
     zip: 'frm1601c:txtZipCode',
     email: 'txtEmail',
     phone: 'frm1601c:txtTelNum',
+    period: { kind: 'monthly', month: 'frm1601c:txtMonth', year: 'frm1601c:txtYear' },
   },
   '2551Qv2018': {
     tin: [
@@ -60,6 +65,16 @@ export const prefillMap: Record<
     address: 'frm2551Qv2018:registeredAddress',
     zip: 'frm2551Qv2018:zipCode',
     email: 'txtEmail',
+    period: {
+      kind: 'quarterly',
+      year: 'frm2551Qv2018:txtYear',
+      quarter: [
+        'frm2551Qv2018:qtr_1',
+        'frm2551Qv2018:qtr_2',
+        'frm2551Qv2018:qtr_3',
+        'frm2551Qv2018:qtr_4',
+      ],
+    },
   },
   '0619E': {
     tin: ['frm0619E:txtTIN1', 'frm0619E:txtTIN2', 'frm0619E:txtTIN3'],
@@ -70,7 +85,26 @@ export const prefillMap: Record<
     address2: 'frm0619E:txtAddress2',
     zip: 'frm0619E:txtZipCode',
     email: 'txtEmail',
+    period: { kind: 'monthly', month: 'frm0619E:txtMonth', year: 'frm0619E:txtYear' },
   },
+}
+
+export function autoFieldIds(code: PrefillFormCode): Set<string> {
+  const mapping = prefillMap[code]
+  const periodIds =
+    mapping.period.kind === 'monthly'
+      ? [mapping.period.month, mapping.period.year]
+      : [mapping.period.year, ...mapping.period.quarter]
+  return new Set([
+    ...mapping.tin,
+    mapping.branch,
+    mapping.rdo,
+    mapping.name,
+    mapping.address,
+    ...(mapping.address2 ? [mapping.address2] : []),
+    mapping.zip,
+    ...periodIds,
+  ])
 }
 
 export function buildPrefillValues(
@@ -80,11 +114,12 @@ export function buildPrefillValues(
     'tin9' | 'branch' | 'rdo' | 'registeredName' | 'address' | 'zip' | 'email' | 'phone'
   >,
   fields: FieldSnapshot[],
-): Record<string, string> {
+  period: string,
+): Record<string, string | boolean> {
   const mapping = prefillMap[code]
   const widths = code === '2551Qv2018' ? [4, 4, 1] : [3, 3, 3]
   let tinOffset = 0
-  const values: Record<string, string> = {}
+  const values: Record<string, string | boolean> = {}
   for (const [index, id] of mapping.tin.entries()) {
     const width = widths[index]
     values[id] = profile.tin9.slice(tinOffset, tinOffset + width)
@@ -104,12 +139,42 @@ export function buildPrefillValues(
   if (mapping.phone) {
     values[mapping.phone] = profile.phone
   }
+  if (mapping.period.kind === 'monthly') {
+    const monthlyPeriod = mapping.period
+    const match = /^(\d{4})-(0[1-9]|1[0-2])$/.exec(period)
+    if (!match) {
+      throw new Error(`Expected a monthly period for ${code}.`)
+    }
+    const monthField = fields.find((field) => field.id === monthlyPeriod.month)
+    values[monthlyPeriod.year] = match[1]
+    values[monthlyPeriod.month] =
+      monthField?.options?.find((option) => option.value === match[2])?.value ??
+      monthField?.options?.[Number(match[2]) - 1]?.value ??
+      match[2]
+  } else {
+    const match = /^(\d{4})-Q([1-4])$/.exec(period)
+    if (!match) {
+      throw new Error(`Expected a quarterly period for ${code}.`)
+    }
+    values[mapping.period.year] = match[1]
+    mapping.period.quarter.forEach((id, index) => {
+      values[id] = String(index + 1) === match[2]
+    })
+  }
   return values
+}
+
+export function mergeDraftPrefill(
+  savedValues: Record<string, string | boolean>,
+  prefillValues: Record<string, string | boolean>,
+): Record<string, string | boolean> {
+  return { ...savedValues, ...prefillValues }
 }
 
 export function buildEditorModel(
   snapshot: FieldSnapshot[],
   issues: ValidationIssue[],
+  lockedFieldIds: ReadonlySet<string> = new Set(),
 ): EditorModel {
   const issuesByField = new Map<string, string[]>()
   for (const issue of issues) {
@@ -127,6 +192,7 @@ export function buildEditorModel(
     const existing = radioGroup ? radioRows.get(radioGroup) : undefined
     if (existing) {
       existing.fields.push(field)
+      existing.locked ||= lockedFieldIds.has(field.id) || field.disabled
       const messages = issuesByField.get(field.id) ?? []
       if (messages.length) {
         existing.errorText = [...new Set([...existing.errorText.split('\n'), ...messages])]
@@ -144,6 +210,7 @@ export function buildEditorModel(
       type: field.type,
       fields: [field],
       errorText: messages.join('\n'),
+      locked: lockedFieldIds.has(field.id) || field.disabled,
     }
     rows.push(row)
     if (radioGroup) {
@@ -152,9 +219,10 @@ export function buildEditorModel(
   }
   const sections: EditorSection[] = []
   for (const row of rows) {
-    let section = sections.find((entry) => entry.item === row.item)
+    const sectionName = row.fields[0].section
+    let section = sections.find((entry) => entry.section === sectionName)
     if (!section) {
-      section = { item: row.item, rows: [] }
+      section = { section: sectionName, rows: [] }
       sections.push(section)
     }
     section.rows.push(row)

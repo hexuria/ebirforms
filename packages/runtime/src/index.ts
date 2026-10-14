@@ -20,6 +20,7 @@ export interface FieldSnapshot {
   value: string
   label: string
   item: string | null
+  section: string | null
   checked?: boolean
   disabled: boolean
   maxLength?: number
@@ -399,6 +400,23 @@ export async function openOfficialForm(
       return { label: label || element.id, item }
     }
 
+    const fieldSection = (element: any): string | null => {
+      const walker = w.document.createTreeWalker(mainForm, w.NodeFilter.SHOW_TEXT)
+      let section: string | null = null
+      let node = walker.nextNode()
+      while (node) {
+        if (element.contains(node.parentNode)) {
+          break
+        }
+        const text = textContent(node).trim()
+        if (/^Part\s+[IVX]+/i.test(text)) {
+          section = text
+        }
+        node = walker.nextNode()
+      }
+      return section
+    }
+
     const instance: FormInstance = {
       code,
       alerts,
@@ -425,6 +443,7 @@ export async function openOfficialForm(
               value: element.value,
               label: text.label,
               item: text.item,
+              section: fieldSection(element),
               disabled: element.disabled,
             }
             if (type === 'radio' || type === 'checkbox') {

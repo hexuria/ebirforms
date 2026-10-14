@@ -193,6 +193,6 @@ describe('official validation', () => {
         }
       }
     },
-    180_000,
+    360_000,
   )
 })

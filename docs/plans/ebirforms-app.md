@@ -38,16 +38,17 @@ vendor/             submodules (official package, frozen HTML)
 ### Domain model
 
 ```
-Taxpayer      tin9 (999-999-999, check digit validated like the official profile)
- +- Branch    branch code, 5 digits, default "00000"
-     +- TaxYearProfile   year + registered name, RDO, address, ZIP, line of business,
-         |               contact, email (the official profile fields, per year)
-         +- Library      only the forms the user picked for that year
-             +- Draft    one return: form code, period, field values, status
+Taxpayer      TIN, registered name, type, birth date
+ +- Branch    branch code, name, RDO, address, ZIP, phone, email
+     +- TaxYearProfile   year; owns the selected form library
+         +- Draft        one return per form and period, with field values/status
 ```
 
-A TIN can have many branches; each branch can have many tax years; a form only
-appears in a year's library after the user picks it.
+A TIN can have many branches; branch facts inherit field-by-field from branch
+`00000` until overridden. Each branch can have many tax years; a form only
+appears in a year's library after the user picks it. Draft periods are
+`YYYY-MM`, `YYYY-Qn`, or `YYYY`, and the unique key is
+`(profile_id, form_code, period)`.
 
 ### Official runtime engine (requirements 5, 9 and parity)
 
@@ -136,8 +137,9 @@ Status: `[ ]` todo, `[~]` in progress, `[x]` done (gate passed).
   reserved lines.
   *Gate:* parity oracle passes for 1601C, 2551Q, 0619E; GPUIX automation test
   proves no layout shift when errors appear.
-- [~] **P4 Form editor.** Generated editor for the first forms (1601C, 2551Q,
-  0619E) bound to the official runtime instance, drafts.
+- [~] **P4 Form editor.** Branch-owned taxpayer facts, period-aware selected
+  form library, light/dark GPUIX shell, and generated editors for the first
+  forms (1601C, 2551Q, 0619E) bound to the official runtime instance.
   *Gate:* filled fixtures compute the same totals as the official HTA.
 - [ ] **P5 Print preview and print.**
   *Gate:* filled values visible on rendered pages; PDF printed via the OS
@@ -199,3 +201,16 @@ Status: `[ ]` todo, `[~]` in progress, `[x]` done (gate passed).
   referenced only by disabled 2551Q rate fields (:1974-2085), so read-only
   fields are not included in the eventful fill oracle. Drafts use schema v3;
   new-draft prefill and reopening use `FormInstance.set()` before saving values.
+- The P4 redesign replaces the unmerged P4 draft-only v3 migration with one
+  consolidated v3 migration from main's v2 schema. It promotes taxpayer and
+  branch facts out of year profiles, copies the latest profile facts into
+  those shared records, and creates period-unique drafts. The intermediate
+  P4 v3 draft schema never shipped, so no v3-to-v4 migration is needed.
+- Filing frequency is read from the active official catalog labels, with
+  explicit overrides for forms whose labels do not name a period. Runtime
+  field snapshots carry the nearest official `Part I`, `Part II`, etc. heading
+  so the editor follows the form's structure rather than item numbering.
+- P4 scratch walkthrough data is seeded by `scripts/seed-p4.ts`; it uses
+  `EBIRFORMS_DATA_DIR`, a generated second test TIN, and no live SFTP setting.
+  Bricolage Grotesque and its OFL license are bundled for the native GPUIX font
+  registration API, with a system-font fallback when the renderer lacks it.

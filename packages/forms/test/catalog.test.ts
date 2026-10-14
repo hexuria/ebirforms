@@ -13,6 +13,19 @@ describe('official form catalog', () => {
     expect(catalog).toHaveLength(79)
   })
 
+  test('assigns a return frequency to every active form', () => {
+    const frequency = (code: string) => catalog.find((entry) => entry.code === code)?.frequency
+    expect(frequency('1601Cv2018')).toBe('monthly')
+    expect(frequency('0619E')).toBe('monthly')
+    expect(frequency('2551Qv2018')).toBe('quarterly')
+    expect(frequency('1601EQ')).toBe('quarterly')
+    expect(frequency('1604C')).toBe('annual')
+    expect(frequency('1701Qv2018')).toBe('quarterly')
+    expect(frequency('1701A')).toBe('annual')
+    expect(frequency('2550M')).toBe('monthly')
+    expect(catalog.every((entry) => ['monthly', 'quarterly', 'annual'].includes(entry.frequency))).toBe(true)
+  })
+
   test('does not include commented-out options', () => {
     const codes = catalog.map((entry) => entry.code)
     expect(codes).not.toContain('0620')
