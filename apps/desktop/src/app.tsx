@@ -135,32 +135,45 @@ function ProfileField({
 function CheckboxRow({
   entry,
   checked,
+  disabled = false,
   testId,
   onClick,
 }: {
   entry: CatalogEntry
   checked: boolean
+  disabled?: boolean
   testId: string
   onClick: () => void
 }) {
   return (
     <div
       testId={testId}
-      onClick={onClick}
+      onClick={() => {
+        if (!disabled) {
+          onClick()
+        }
+      }}
       style={{
         display: 'flex',
         alignItems: 'center',
         gap: 10,
-        padding: 8,
-        cursor: 'pointer',
+        padding: 4,
+        minWidth: 0,
+        cursor: disabled ? 'default' : 'pointer',
         backgroundColor: '#202631',
-        hover: { backgroundColor: '#2b3340' },
+        hover: { backgroundColor: disabled ? '#202631' : '#2b3340' },
       }}
     >
       <div
+        testId={`${testId}-indicator`}
         style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
           width: 18,
+          minWidth: 18,
           height: 18,
+          flexShrink: 0,
           borderWidth: 1,
           borderColor: checked ? '#60a5fa' : '#707987',
           borderRadius: 3,
@@ -169,8 +182,31 @@ function CheckboxRow({
       >
         <text style={{ color: '#ffffff', fontSize: 13 }}>{checked ? '✓' : ''}</text>
       </div>
-      <text style={{ color: '#e3e6eb', fontSize: 13 }}>{entry.label}</text>
-      <text style={{ color: '#9ca7b7', fontSize: 12 }}>{entry.code}</text>
+      <text
+        style={{
+          color: '#e3e6eb',
+          fontSize: 13,
+          flexGrow: 1,
+          minWidth: 0,
+          whiteSpace: 'nowrap',
+          textOverflow: 'ellipsis',
+        }}
+      >
+        {entry.label}
+      </text>
+      <text
+        style={{
+          color: '#9ca7b7',
+          fontSize: 12,
+          width: 120,
+          minWidth: 120,
+          flexShrink: 0,
+          textAlign: 'right',
+          whiteSpace: 'nowrap',
+        }}
+      >
+        {entry.code}
+      </text>
     </div>
   )
 }
@@ -282,6 +318,9 @@ function App() {
   }
 
   function togglePendingCode(code: string) {
+    if (library.some((entry) => entry.formCode === code)) {
+      return
+    }
     setPendingCodes((current) =>
       current.includes(code) ? current.filter((item) => item !== code) : [...current, code],
     )
@@ -527,8 +566,9 @@ function App() {
                       placeholder="Search forms by code or name"
                       onChange={(event) => setSearch(event.value ?? '')}
                       style={{
-                        height: 36,
+                        height: 34,
                         padding: 8,
+                        flexShrink: 0,
                         color: '#f4f5f7',
                         backgroundColor: '#10141a',
                         borderWidth: 1,
@@ -569,15 +609,21 @@ function App() {
                         padding: 8,
                       }}
                     >
-                      {filteredCatalog.map((entry) => (
-                        <CheckboxRow
-                          key={entry.code}
-                          entry={entry}
-                          checked={pendingCodes.includes(entry.code)}
-                          testId={`picker-option-${entry.code}`}
-                          onClick={() => togglePendingCode(entry.code)}
-                        />
-                      ))}
+                      {filteredCatalog.map((entry) => {
+                        const inLibrary = library.some(
+                          (item) => item.formCode === entry.code,
+                        )
+                        return (
+                          <CheckboxRow
+                            key={entry.code}
+                            entry={entry}
+                            checked={inLibrary || pendingCodes.includes(entry.code)}
+                            disabled={inLibrary}
+                            testId={`picker-option-${entry.code}`}
+                            onClick={() => togglePendingCode(entry.code)}
+                          />
+                        )
+                      })}
                       {filteredCatalog.length === 0 && (
                         <text style={{ color: '#9ca7b7', fontSize: 13, padding: 10 }}>
                           No forms match this search.
@@ -597,7 +643,9 @@ function App() {
                       display: 'flex',
                       flexDirection: 'column',
                       gap: 10,
-                      width: 360,
+                      width: 300,
+                      minWidth: 300,
+                      flexShrink: 0,
                       minHeight: 0,
                     }}
                   >
@@ -631,10 +679,31 @@ function App() {
                             backgroundColor: '#1b1f27',
                           }}
                         >
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                            <text style={{ color: '#e3e6eb', fontSize: 13 }}>{entry.label}</text>
-                            <text style={{ color: '#9ca7b7', fontSize: 11 }}>{entry.formCode}</text>
-                          </div>
+                          <text
+                            style={{
+                              color: '#e3e6eb',
+                              fontSize: 13,
+                              flexGrow: 1,
+                              minWidth: 0,
+                              whiteSpace: 'nowrap',
+                              textOverflow: 'ellipsis',
+                            }}
+                          >
+                            {entry.label}
+                          </text>
+                          <text
+                            style={{
+                              color: '#9ca7b7',
+                              fontSize: 11,
+                              width: 100,
+                              minWidth: 100,
+                              flexShrink: 0,
+                              textAlign: 'right',
+                              whiteSpace: 'nowrap',
+                            }}
+                          >
+                            {entry.formCode}
+                          </text>
                           <div
                             testId={`library-remove-${entry.formCode}`}
                             onClick={() => removeLibraryForm(entry.formCode)}

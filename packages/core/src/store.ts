@@ -123,7 +123,7 @@ function migrate(db: Database): void {
           id TEXT PRIMARY KEY,
           kind TEXT NOT NULL,
           payload JSON NOT NULL,
-          state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'succeeded', 'failed', 'dead')),
+          state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'succeeded', 'dead')),
           attempts INTEGER NOT NULL DEFAULT 0,
           max_attempts INTEGER NOT NULL DEFAULT 5,
           run_after INTEGER NOT NULL,
@@ -134,6 +134,36 @@ function migrate(db: Database): void {
       `)
       db.exec('CREATE INDEX jobs_due_order ON jobs (state, created_at, id)')
       db.exec('PRAGMA user_version = 1')
+    }
+    if (version < 2) {
+      db.exec(`
+        CREATE TABLE jobs_v2 (
+          id TEXT PRIMARY KEY,
+          kind TEXT NOT NULL,
+          payload JSON NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'succeeded', 'dead')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          max_attempts INTEGER NOT NULL DEFAULT 5,
+          run_after INTEGER NOT NULL,
+          last_error TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        )
+      `)
+      db.exec(`
+        INSERT INTO jobs_v2 (
+          id, kind, payload, state, attempts, max_attempts, run_after,
+          last_error, created_at, updated_at
+        )
+        SELECT
+          id, kind, payload, state, attempts, max_attempts, run_after,
+          last_error, created_at, updated_at
+        FROM jobs
+      `)
+      db.exec('DROP TABLE jobs')
+      db.exec('ALTER TABLE jobs_v2 RENAME TO jobs')
+      db.exec('CREATE INDEX jobs_due_order ON jobs (state, created_at, id)')
+      db.exec('PRAGMA user_version = 2')
     }
   })
   migration()

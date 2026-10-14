@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { Store } from './store.js'
 
-export type JobState = 'queued' | 'running' | 'succeeded' | 'failed' | 'dead'
+export type JobState = 'queued' | 'running' | 'succeeded' | 'dead'
 
 export interface Job {
   id: string
