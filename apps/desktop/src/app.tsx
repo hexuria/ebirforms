@@ -1287,7 +1287,7 @@ function App() {
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', flexGrow: 1, minHeight: 0, overflow: 'scroll', padding: 16 }}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 14, width: 720, maxWidth: '100%' }}>
             {draft && (
-              <Panel title="Taxpayer Profile">
+              <Panel title="TAXPAYER PROFILE">
                 {(() => {
                   const [yearPart, periodPart] = draft.period.split('-')
                   const isMonth = /^\d{2}$/.test(periodPart ?? '')
