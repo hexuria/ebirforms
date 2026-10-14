@@ -121,7 +121,7 @@ Status: `[ ]` todo, `[~]` in progress, `[x]` done (gate passed).
   `scripts/setup-*`, CI on Windows/Linux/macOS (typecheck + `bun test`), app
   window with an empty shell.
   *Gate:* CI green; window opens on Windows (screenshot).
-- [~] **P1 Reverse-engineering inventory.** Confirm the latest version on
+- [~] **P1 Reverse-engineering inventory.** ([PR #4](https://github.com/hexuria/ebirforms/pull/4): runtime + 79-form catalog + 1601C/2551Q/0619E parity with documented `knownDifferences`.) Confirm the latest version on
   bir.gov.ph with REA; REA JS analysis of the package; generated form catalog
   (79 active forms in the official `formType` list, 43 with printable sheets) and
   per-form field models taken from the official `frmMain.elements`
@@ -177,3 +177,6 @@ Status: `[ ]` todo, `[~]` in progress, `[x]` done (gate passed).
   built in a `$(document).ready` handler (the sandbox must fire ready), and
   2551Q's rules list `txtEmail` twice (serialized twice). The P1 field model is
   therefore the captured official `saveXML()` output.
+- P1 slice in #4: `openOfficialForm` runs official compute/validate/saveXML. Rules-vs-official
+  diffs are explicit (`merged` txtAddress2, `absent` commented 2551Q txtEmail, `moved` 2551Q RDO).
+  Open takes ~2.4-3.1 s (ready wait capped at 3 s); optimize in P3 if the editor needs it.
