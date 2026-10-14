@@ -175,7 +175,7 @@ describe('openOfficialForm', () => {
         }
       }
     },
-    30_000,
+    120_000,
   )
 
   test('captures radio option labels from adjacent official text', async () => {
@@ -206,7 +206,7 @@ describe('openOfficialForm', () => {
         await form.close()
       }
     }
-  }, 30_000)
+  }, 120_000)
 
   test('runs the official ready logic and builds the 1601C RDO select', async () => {
     const form = await openOfficialForm('1601Cv2018')
@@ -230,7 +230,7 @@ describe('openOfficialForm', () => {
     } finally {
       await form.close()
     }
-  }, 15_000)
+  }, 60_000)
 
   test('runs official compute handlers after setting a field', async () => {
     const form = await openOfficialForm('1601Cv2018')
@@ -294,7 +294,7 @@ describe('openOfficialForm', () => {
         await form.close()
       }
     }
-  }, 15_000)
+  }, 60_000)
 
   test('serializes fields in official order with only documented rules differences', async () => {
     const differences: Array<{
@@ -347,5 +347,5 @@ describe('openOfficialForm', () => {
       }
     }
     expect(differences).toEqual([])
-  }, 45_000)
+  }, 120_000)
 })

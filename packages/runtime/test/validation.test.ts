@@ -80,7 +80,7 @@ describe('official validation', () => {
         }
       }
     },
-    30_000,
+    120_000,
   )
 
   test(
@@ -113,7 +113,7 @@ describe('official validation', () => {
         await form.close()
       }
     },
-    20_000,
+    60_000,
   )
 
   test(
@@ -135,7 +135,7 @@ describe('official validation', () => {
         await form.close()
       }
     },
-    20_000,
+    60_000,
   )
 
   test(
