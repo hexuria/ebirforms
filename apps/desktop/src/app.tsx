@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { render } from '@gpuix/react'
@@ -30,6 +30,7 @@ import {
   SelectTrigger,
   SelectValue,
   useGpuixRequired,
+  type PublicInstance,
 } from '@gpuix/react'
 import {
   autoFieldIds,
@@ -42,6 +43,7 @@ import {
   type PrefillFormCode,
 } from './editor-model.js'
 import { themes, type ThemeMode, type ThemeTokens } from './theme.js'
+import { beginWindowDrag, closeWindow, dragWindowTo, type DragAnchor } from './win32.js'
 
 const appDir = dataDir()
 mkdirSync(appDir, { recursive: true })
@@ -85,8 +87,20 @@ function FontRegistration() {
   return null
 }
 
-type NavPage = 'taxpayer' | 'tasks' | 'logs' | 'calendar' | 'settings' | 'form'
-type TaxpayerTab = 'details' | 'forms' | 'templates'
+type NavPage = 'taxpayer' | 'tasks' | 'logs' | 'calendar' | 'settings' | 'form' | 'import'
+type TaxpayerTab = 'details' | 'forms' | 'templates' | 'email' | 'export'
+type NavState = {
+  page: NavPage
+  tab: TaxpayerTab
+  tin?: string
+  branchId?: string
+  profileId?: string
+  formCode?: string
+  period?: string
+}
+const WINDOW_TITLE = 'eBIRForms'
+const isWin = process.platform === 'win32'
+const isMac = process.platform === 'darwin'
 type LogFilter = LogLevel | 'all'
 type DraftStatus = Draft['status']
 type FactsForm = {
@@ -326,6 +340,14 @@ function App() {
   const [issues, setIssues] = useState<ValidationIssue[]>([])
   const [editorValues, setEditorValues] = useState<Record<string, string | boolean>>({})
   const [formLoading, setFormLoading] = useState(false)
+  const [rightSidebar, setRightSidebar] = useState(false)
+  const [formFilter, setFormFilter] = useState('')
+  const searchInputRef = useRef<PublicInstance | null>(null)
+  const pendingSearchFocus = useRef(false)
+  const dragAnchor = useRef<DragAnchor | null>(null)
+  const histRef = useRef<{ stack: NavState[]; idx: number }>({ stack: [], idx: -1 })
+  const [, setHistVersion] = useState(0)
+  const gpuix = useGpuixRequired()
 
   const taxpayer = tree.find((item) => item.tin9 === selectedTin)
   const branch = taxpayer?.branches.find((item) => branchId(taxpayer.tin9, item.code) === selectedBranchId)
@@ -347,8 +369,30 @@ function App() {
   const editorModel = buildEditorModel(fieldSnapshot, issues, formEntry ? autoFieldIds(formEntry.formCode as PrefillFormCode) : new Set())
   const shownLogs = logFilter === 'all' ? logs : logs.filter((entry) => entry.level === logFilter)
 
+  const navNow: NavState = {
+    page,
+    tab,
+    tin: selectedTin,
+    branchId: selectedBranchId,
+    profileId: selectedProfileId,
+    formCode: formEntry?.formCode,
+    period: draft?.period,
+  }
+  if (histRef.current.idx === -1) {
+    histRef.current.stack = [navNow]
+    histRef.current.idx = 0
+  }
+  const canNavBack = histRef.current.idx > 0
+  const canNavFwd = histRef.current.idx < histRef.current.stack.length - 1
+
   useEffect(() => queue.onChange(setQueueJobs), [])
   useEffect(() => logger.subscribe((entry) => setLogs((current) => [...current.slice(-999), entry])), [])
+  useEffect(() => {
+    if (pendingSearchFocus.current && !sidebarCollapsed) {
+      pendingSearchFocus.current = false
+      focusSearchNow()
+    }
+  }, [sidebarCollapsed])
   useEffect(() => {
     writeFileSync(themePath, JSON.stringify({ mode: themeMode }))
   }, [themeMode])
@@ -377,21 +421,85 @@ function App() {
     if (nextProfileId) setSelectedProfileId(nextProfileId)
   }
 
+  function navTo(next: NavState) {
+    const h = histRef.current
+    h.stack = [...h.stack.slice(0, h.idx + 1), next]
+    h.idx += 1
+    setHistVersion((value) => value + 1)
+    void applyNav(next)
+  }
+
+  function navJump(delta: -1 | 1) {
+    const h = histRef.current
+    const idx = h.idx + delta
+    if (idx < 0 || idx >= h.stack.length) return
+    h.idx = idx
+    setHistVersion((value) => value + 1)
+    void applyNav(h.stack[idx])
+  }
+
+  async function applyNav(next: NavState) {
+    const switching = formInstance && (next.page !== 'form' || next.formCode !== formEntry?.formCode || next.period !== draft?.period)
+    if (switching) {
+      await formInstance.close()
+      setFormInstance(null)
+      setFieldSnapshot([])
+      setIssues([])
+    }
+    if (next.page !== 'form' && formEntry) {
+      setFormEntry(null)
+      setDraft(null)
+    }
+    setPage(next.page)
+    setTab(next.tab)
+    setSelectedTin(next.tin)
+    setSelectedBranchId(next.branchId)
+    setSelectedProfileId(next.profileId)
+    if (next.page === 'form' && next.formCode && next.period && next.profileId) {
+      const profile = store
+        .listTaxpayers()
+        .flatMap((item) => item.branches.flatMap((itemBranch) => itemBranch.years))
+        .find((item) => item.id === next.profileId)
+      const entry = profile
+        ? store.listLibrary(profile.id).find((item) => item.formCode === next.formCode)
+        : undefined
+      if (profile && entry) await openForm(entry, next.period, profile)
+    }
+  }
+
   function chooseBranch(tin9: string, code: string) {
     const id = branchId(tin9, code)
     const item = tree.find((entry) => entry.tin9 === tin9)?.branches.find((entry) => entry.code === code)
-    setSelectedTin(tin9)
-    setSelectedBranchId(id)
-    setSelectedProfileId(item?.years.at(-1)?.id)
-    setPage('taxpayer')
+    navTo({ ...navNow, page: 'taxpayer', tin: tin9, branchId: id, profileId: item?.years.at(-1)?.id, formCode: undefined, period: undefined })
   }
 
   function chooseProfile(profile: Profile) {
-    setSelectedTin(profile.tin9)
-    setSelectedBranchId(branchId(profile.tin9, profile.branch))
-    setSelectedProfileId(profile.id)
-    setPage('taxpayer')
-    setTab('forms')
+    navTo({ ...navNow, page: 'taxpayer', tab: 'forms', tin: profile.tin9, branchId: branchId(profile.tin9, profile.branch), profileId: profile.id, formCode: undefined, period: undefined })
+  }
+
+  function openNewTaxpayer() {
+    setShowNewTaxpayer(true)
+    navTo({ ...navNow, page: 'taxpayer', tab: 'details', formCode: undefined, period: undefined })
+  }
+
+  function focusSearchNow() {
+    const el = searchInputRef.current
+    if (el?.id != null && gpuix.focusElement) {
+      try {
+        gpuix.focusElement(el.id)
+      } catch {
+        // Renderer without focusElement: expanding the sidebar still helps.
+      }
+    }
+  }
+
+  function focusSidebarSearch() {
+    if (sidebarCollapsed) {
+      pendingSearchFocus.current = true
+      setSidebarCollapsed(false)
+      return
+    }
+    focusSearchNow()
   }
 
   function saveNewTaxpayer() {
@@ -424,6 +532,7 @@ function App() {
       setNewTaxpayer(blankTaxpayer)
       setNewTaxpayerErrors({})
       setStatusMessage('Taxpayer added.')
+      navTo({ ...navNow, page: 'taxpayer', tab: 'details', tin: created.tin9, branchId: branchId(created.tin9, '00000'), profileId: undefined, formCode: undefined, period: undefined })
     } catch (error) {
       setNewTaxpayerErrors({ tin: error instanceof Error ? error.message : String(error) })
     }
@@ -476,6 +585,7 @@ function App() {
       setShowNewBranch(false)
       setNewBranch(blankBranch)
       setBranchError('')
+      navTo({ ...navNow, page: 'taxpayer', tab: 'details', tin: taxpayer.tin9, branchId: created.id, profileId: undefined, formCode: undefined, period: undefined })
     } catch (error) {
       setBranchError(error instanceof Error ? error.message : String(error))
     }
@@ -498,6 +608,7 @@ function App() {
       refreshTree(taxpayer.tin9, branchId(taxpayer.tin9, branch.code), profile.id)
       setShowNewYear(false)
       setStatusMessage(`${profile.year} added.`)
+      navTo({ ...navNow, page: 'taxpayer', tab: 'forms', tin: taxpayer.tin9, branchId: branchId(taxpayer.tin9, branch.code), profileId: profile.id, formCode: undefined, period: undefined })
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : String(error))
     }
@@ -517,11 +628,14 @@ function App() {
     setPickerOpen(false)
   }
 
-  async function openForm(entry: LibraryEntry, period: string) {
-    if (!selectedProfile || !['1601Cv2018', '2551Qv2018', '0619E'].includes(entry.formCode)) return
+  async function openForm(entry: LibraryEntry, period: string, profile: Profile | undefined = selectedProfile) {
+    if (!profile || !['1601Cv2018', '2551Qv2018', '0619E'].includes(entry.formCode)) return
     const code = entry.formCode as PrefillFormCode
-    const previous = store.listDrafts(selectedProfile.id, code).find((item) => item.period === period)
-    const opened = store.openDraft(selectedProfile.id, code, period)
+    const previous = store.listDrafts(profile.id, code).find((item) => item.period === period)
+    const opened = store.openDraft(profile.id, code, period)
+    if (formInstance) {
+      await formInstance.close()
+    }
     setFormEntry(entry)
     setDraft(opened)
     setPage('form')
@@ -532,7 +646,7 @@ function App() {
     let form: FormInstance | undefined
     try {
       form = await openOfficialForm(code)
-      const prefillValues = buildPrefillValues(code, selectedProfile, form.fields(), period)
+      const prefillValues = buildPrefillValues(code, profile, form.fields(), period)
       const initialValues = mergeDraftPrefill(opened.values, prefillValues)
       for (const [id, value] of Object.entries(initialValues)) form.set(id, value)
       const nextDraft = previous
@@ -590,13 +704,12 @@ function App() {
     setDraft(store.setDraftStatus(draft.id, status))
   }
 
-  async function closeForm() {
-    await formInstance?.close()
-    setFormInstance(null)
-    setFormEntry(null)
-    setDraft(null)
-    setPage('taxpayer')
-    setTab('forms')
+  function closeForm() {
+    navTo({ ...navNow, page: 'taxpayer', tab: 'forms', formCode: undefined, period: undefined })
+  }
+
+  function navOpenForm(entry: LibraryEntry, period: string) {
+    navTo({ ...navNow, page: 'form', formCode: entry.formCode, period })
   }
 
   const supportedPresets: Record<string, string[]> = {
@@ -690,7 +803,20 @@ function App() {
           <text style={{ color: t.mutedFg, fontSize: 10, padding: 5, borderRadius: 12, backgroundColor: t.secondary }}>{formCategory(entry.formCode)}</text>
         </div>
         <text style={{ color: t.fg, fontSize: 12, minWidth: 0, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{cleanFormTitle(form.label)}</text>
-        <text style={{ color: t.mutedFg, fontSize: 11 }}>Year {selectedProfile.year}:</text>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+          <text style={{ color: t.mutedFg, fontSize: 11 }}>{`Year ${selectedProfile.year}:`}</text>
+          <text style={{ color: t.mutedFg, fontSize: 10, textAlign: 'right' }}>Dev preview (not yet certified)</text>
+        </div>
+        {form.frequency === 'annual' && (
+          <div
+            testId={`period-${entry.formCode}-annual`}
+            onClick={() => navOpenForm(entry, choices[0].period)}
+            style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 9, borderWidth: 1, borderColor: t.border, borderRadius: 7, cursor: 'pointer', backgroundColor: t.bg }}
+          >
+            <text style={{ color: t.primary, fontSize: 12, fontWeight: 600 }}>+ File Annual Return</text>
+          </div>
+        )}
+        {form.frequency !== 'annual' && (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
           {choices.map((choice) => {
             const status = statusFor(entry, choice.period)
@@ -699,7 +825,7 @@ function App() {
               <div
                 key={choice.period}
                 testId={`period-${entry.formCode}-${choice.period}`}
-                onClick={() => void openForm(entry, choice.period)}
+                onClick={() => navOpenForm(entry, choice.period)}
                 style={{
                   display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'center',
                   padding: 7, width: 85, minWidth: 85, height: 60,
@@ -713,6 +839,7 @@ function App() {
             )
           })}
         </div>
+        )}
       </div>
     )
   }
@@ -831,13 +958,13 @@ function App() {
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <div>
             <text style={{ color: t.fg, fontSize: 25, fontWeight: 700 }}>{taxpayer?.name || 'Taxpayers'}</text>
-            <text style={{ color: t.mutedFg, fontSize: 12 }}>{taxpayer ? `${formatTin(taxpayer.tin9)}  /  ${branch?.name ?? ''}` : 'Taxpayer, branch, and return workspace'}</text>
+            <text style={{ color: t.mutedFg, fontSize: 12 }}>{taxpayer ? `TIN: ${formatTin(taxpayer.tin9)} · ${taxpayer.type === 'individual' ? 'Individual' : 'Non-individual'} · Tax Year ${selectedProfile?.year ?? '-'} · ${branch?.name ?? ''}` : 'Taxpayer, branch, and return workspace'}</text>
           </div>
         </div>
         <div style={{ display: 'flex', gap: 6, borderBottomWidth: 1, borderColor: t.border }}>
-          {(['details', 'forms', 'templates'] as const).map((item) => (
-            <div key={item} testId={`tab-${item}`} onClick={() => setTab(item)} style={{ padding: 12, borderBottomWidth: tab === item ? 2 : 0, borderColor: t.primary }}>
-              <text style={{ color: tab === item ? t.fg : t.mutedFg, fontSize: 13, fontWeight: tab === item ? 700 : 500 }}>{item === 'forms' ? 'Forms' : item[0].toUpperCase() + item.slice(1)}</text>
+          {(['details', 'forms', 'templates', 'email', 'export'] as const).map((item) => (
+            <div key={item} testId={`tab-${item}`} onClick={() => navTo({ ...navNow, tab: item })} style={{ padding: 12, borderBottomWidth: tab === item ? 2 : 0, borderColor: t.primary }}>
+              <text style={{ color: tab === item ? t.fg : t.mutedFg, fontSize: 13, fontWeight: tab === item ? 700 : 500 }}>{item === 'forms' ? 'Forms' : item === 'email' ? 'Email Settings' : item[0].toUpperCase() + item.slice(1)}</text>
             </div>
           ))}
         </div>
@@ -846,6 +973,16 @@ function App() {
           {tab === 'templates' && (
             <Panel title="Templates" subtitle="P4b">
               <text style={{ color: t.mutedFg, fontSize: 13 }}>Guided templates and filing workflows are planned for P4b.</text>
+            </Panel>
+          )}
+          {tab === 'email' && (
+            <Panel title="Email Settings" subtitle="P5">
+              <text style={{ color: t.mutedFg, fontSize: 13 }}>eBIR notification email settings arrive with the filing pipeline.</text>
+            </Panel>
+          )}
+          {tab === 'export' && (
+            <Panel title="Export" subtitle="P5">
+              <text style={{ color: t.mutedFg, fontSize: 13 }}>Return export packages arrive with the filing pipeline.</text>
             </Panel>
           )}
           {tab === 'forms' && (
@@ -873,7 +1010,7 @@ function App() {
                     <text style={{ color: t.fg, fontSize: 22, fontWeight: 700 }}>Forms</text>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
                       {branch?.years.map((profile) => (
-              <div key={profile.id} testId={`year-${profile.year}-${profile.branch}`} onClick={() => setSelectedProfileId(profile.id)} style={{ padding: 8, borderRadius: 16, borderWidth: 1, borderColor: profile.id === selectedProfile.id ? t.primary : t.border, backgroundColor: profile.id === selectedProfile.id ? t.secondary : t.chrome }}>
+              <div key={profile.id} testId={`year-${profile.year}-${profile.branch}`} onClick={() => navTo({ ...navNow, profileId: profile.id })} style={{ padding: 8, borderRadius: 16, borderWidth: 1, borderColor: profile.id === selectedProfile.id ? t.primary : t.border, backgroundColor: profile.id === selectedProfile.id ? t.secondary : t.chrome }}>
                           <text style={{ color: t.fg, fontSize: 11, fontWeight: profile.id === selectedProfile.id ? 700 : 500 }}>Tax Year {profile.year}</text>
                         </div>
                       ))}
@@ -888,8 +1025,15 @@ function App() {
                       </div>
                     </Panel>
                   )}
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end' }}>
-                    <Button testId="choose-forms" onClick={() => setPickerOpen((current) => !current)}>{pickerOpen ? 'Close picker' : 'Choose forms'}</Button>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <input
+                      testId="form-filter"
+                      value={formFilter}
+                      placeholder="Filter forms…"
+                      onChange={(event) => setFormFilter(event.value ?? '')}
+                      style={{ height: 36, minHeight: 36, padding: 9, flexGrow: 1, minWidth: 0, color: t.fg, backgroundColor: t.bg, borderWidth: 1, borderColor: t.input, borderRadius: 6 }}
+                    />
+                    <Button quiet testId="choose-forms" onClick={() => setPickerOpen((current) => !current)}>{pickerOpen ? 'Close' : 'Filters'}</Button>
                   </div>
                   {pickerOpen && (
                     <Panel title="Choose forms" subtitle="Pick the returns used for this branch and tax year.">
@@ -909,7 +1053,17 @@ function App() {
                   )}
                   {selectedLibrary.length === 0 && <Panel title="Your form library is empty" subtitle="Choose forms to add returns for this year." />}
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14 }}>
-                    {selectedLibrary.map(periodCard)}
+                    {selectedLibrary
+                      .filter((entry) => {
+                        const needle = formFilter.trim().toLowerCase()
+                        if (!needle) return true
+                        const catalogEntry = catalog.find((item) => item.code === entry.formCode)
+                        return (
+                          entry.formCode.toLowerCase().includes(needle) ||
+                          (catalogEntry?.label ?? '').toLowerCase().includes(needle)
+                        )
+                      })
+                      .map(periodCard)}
                   </div>
                 </>
               )}
@@ -1091,7 +1245,10 @@ function App() {
     return (
       <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minHeight: 0 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', paddingBottom: 12, borderBottomWidth: 1, borderColor: t.border }}>
-          <Button quiet onClick={() => void closeForm()}>‹ Back</Button>
+          <Button quiet testId="form-back" onClick={() => closeForm()}>‹ Back</Button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+            <Button quiet testId="form-dismiss" onClick={() => closeForm()}>Dismiss</Button>
+            <Button quiet testId="form-overflow" onClick={() => {}}>⋯</Button>
           <div
             onMouseEnter={() => setShowPrintTip(true)}
             onMouseLeave={() => setShowPrintTip(false)}
@@ -1099,6 +1256,7 @@ function App() {
           >
             <Button quiet disabled onClick={() => {}}>Print Preview</Button>
             {showPrintTip && <div style={{ position: 'absolute', top: 42, right: 0, padding: 8, borderWidth: 1, borderColor: t.border, borderRadius: 6, backgroundColor: t.chrome }}><text style={{ color: t.fg, fontSize: 11 }}>Coming in P5</text></div>}
+          </div>
           </div>
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4, padding: 14 }}>
@@ -1129,22 +1287,45 @@ function App() {
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', flexGrow: 1, minHeight: 0, overflow: 'scroll', padding: 16 }}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 14, width: 720, maxWidth: '100%' }}>
             {draft && (
-              <Panel title="Taxpayer">
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16 }}>
-                  <text style={{ color: t.fg, fontSize: 12 }}>{taxpayer?.name ?? selectedProfile?.registeredName}</text>
-                  <text style={{ color: t.mutedFg, fontSize: 12 }}>{formatTin(selectedProfile?.tin9 ?? '', selectedProfile?.branch)}</text>
-                  <text style={{ color: t.mutedFg, fontSize: 12 }}>RDO {branch?.facts.rdo ?? '-'}</text>
-                  <text style={{ color: t.mutedFg, fontSize: 12 }}>{branch?.facts.address ?? 'Address -'}</text>
-                  <text style={{ color: t.mutedFg, fontSize: 9, padding: 3, borderRadius: 10, backgroundColor: t.muted }}>AUTO</text>
-                </div>
+              <Panel title="Taxpayer Profile">
+                {(() => {
+                  const [yearPart, periodPart] = draft.period.split('-')
+                  const isMonth = /^\d{2}$/.test(periodPart ?? '')
+                  const isQuarter = /^Q\d$/.test(periodPart ?? '')
+                  return (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                      <text style={{ color: t.mutedFg, fontSize: 11 }}>
+                        {isMonth
+                          ? `1 For the Month (MM): ${periodPart}   For the Year (YYYY): ${yearPart}`
+                          : isQuarter
+                            ? `1 For the Quarter: ${periodPart}   For the Year (YYYY): ${yearPart}`
+                            : `1 For the Year (YYYY): ${yearPart}`}
+                      </text>
+                      <text style={{ color: t.fg, fontSize: 15, fontWeight: 700 }}>{(taxpayer?.name ?? selectedProfile?.registeredName ?? '').toUpperCase()}</text>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16 }}>
+                        <text style={{ color: t.mutedFg, fontSize: 11 }}>TIN: {formatTin(selectedProfile?.tin9 ?? '', selectedProfile?.branch)}</text>
+                        <text style={{ color: t.mutedFg, fontSize: 11 }}>RDO Code: {branch?.facts.rdo ?? '-'}</text>
+                        <text style={{ color: t.mutedFg, fontSize: 11 }}>Address: {branch?.facts.address ?? '-'}</text>
+                        <text style={{ color: t.mutedFg, fontSize: 9, padding: 3, borderRadius: 10, backgroundColor: t.muted }}>AUTO</text>
+                      </div>
+                    </div>
+                  )
+                })()}
               </Panel>
             )}
             {issues.some((issue) => issue.fieldId === null) && (
               <Panel title="Review required"><text style={{ color: t.danger, fontSize: 12 }}>{editorModel.bannerErrorText}</text></Panel>
             )}
             {formLoading && <text style={{ color: t.mutedFg }}>Opening official form.</text>}
-            {editorModel.sections.map((section, index) => (
-              <Panel key={`${section.section ?? 'other'}-${index}`} title={section.section ?? 'Part I - Background Information'}>
+            {editorModel.sections.map((section, index) => {
+              const filled = section.rows.filter((row) =>
+                row.fields.some((field) => {
+                  const value = editorValues[field.id]
+                  return value !== undefined && value !== '' && value !== false
+                }),
+              ).length
+              return (
+              <Panel key={`${section.section ?? 'other'}-${index}`} title={section.section ?? 'Part I - Background Information'} aside={`${filled} of ${section.rows.length} rows`}>
                 {section.rows.map((row) => {
                   const fields = row.fields
                   const radios = row.kind === 'radio' || (row.kind === 'period' && fields.some((field) => field.type === 'radio'))
@@ -1186,7 +1367,8 @@ function App() {
                   )
                 })}
               </Panel>
-            ))}
+              )
+            })}
           </div>
         </div>
         <div style={{ display: 'flex', justifyContent: 'flex-end', width: 720, maxWidth: '100%', alignSelf: 'center', gap: 8, padding: 12, borderTopWidth: 1, borderColor: t.border, backgroundColor: t.chrome }}>
@@ -1197,10 +1379,127 @@ function App() {
     )
   }
 
+  function titleBar() {
+    const iconButton = (
+      key: string,
+      content: ReactNode,
+      action: () => void,
+      options: { disabled?: boolean; danger?: boolean } = {},
+    ) => (
+      <div
+        key={key}
+        testId={`tb-${key}`}
+        onClick={() => !options.disabled && action()}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          width: 38,
+          height: 42,
+          cursor: options.disabled ? 'default' : 'pointer',
+          opacity: options.disabled ? 0.35 : 1,
+          hover: options.disabled
+            ? {}
+            : { backgroundColor: options.danger ? '#e81123' : t.muted, color: options.danger ? '#ffffff' : t.fg },
+        }}
+      >
+        {content}
+      </div>
+    )
+    const glyph = (label: string, color?: string, weight = 500, size = 15) => (
+      <text style={{ color: color ?? t.fg, fontSize: size, fontWeight: weight }}>{label}</text>
+    )
+    const sidePanelGlyph = (side: 'left' | 'right', active: boolean) => (
+      <div style={{ width: 17, height: 14, display: 'flex', borderWidth: 1, borderColor: active ? t.primary : t.mutedFg, borderRadius: 3, overflow: 'hidden' }}>
+        {side === 'left' && <div style={{ width: 5, backgroundColor: active ? t.primary : t.mutedFg }} />}
+        <div style={{ flexGrow: 1 }} />
+        {side === 'right' && <div style={{ width: 5, backgroundColor: active ? t.primary : t.mutedFg }} />}
+      </div>
+    )
+    const separator = <div style={{ width: 1, height: 20, marginLeft: 6, marginRight: 6, backgroundColor: t.border }} />
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', height: 42, minHeight: 42, paddingLeft: isMac ? 78 : 0, backgroundColor: t.chrome, borderBottomWidth: 1, borderColor: t.border }}>
+        {isWin && (
+          <>
+            {iconButton('close', glyph('✕'), () => closeWindow(WINDOW_TITLE), { danger: true })}
+            {iconButton('min', glyph('─'), () => gpuix.minimizeWindow?.())}
+            {iconButton('max', glyph('▢'), () => gpuix.zoomWindow?.())}
+            {separator}
+          </>
+        )}
+        {iconButton('nav-back', glyph('←', canNavBack ? t.fg : t.mutedFg), () => navJump(-1), { disabled: !canNavBack })}
+        {iconButton('nav-fwd', glyph('→', canNavFwd ? t.fg : t.mutedFg), () => navJump(1), { disabled: !canNavFwd })}
+        {separator}
+        {iconButton('sidebar-left', sidePanelGlyph('left', !sidebarCollapsed), () => setSidebarCollapsed((value) => !value))}
+        {iconButton('search', glyph('⌕'), focusSidebarSearch)}
+        {iconButton('new-taxpayer', glyph('+', undefined, 600, 17), openNewTaxpayer)}
+        <div
+          testId="tb-drag"
+          onMouseDown={() => {
+            dragAnchor.current = beginWindowDrag(WINDOW_TITLE)
+          }}
+          onMouseMove={() => {
+            if (dragAnchor.current) dragWindowTo(WINDOW_TITLE, dragAnchor.current)
+          }}
+          onMouseUp={() => {
+            dragAnchor.current = null
+          }}
+          style={{ flexGrow: 1, height: '100%' }}
+        />
+        {iconButton('sidebar-right', sidePanelGlyph('right', rightSidebar), () => setRightSidebar((value) => !value))}
+      </div>
+    )
+  }
+
+  function notificationsPanel() {
+    const rank = (level: LogLevel) => (level === 'error' ? 0 : level === 'warn' ? 1 : level === 'info' ? 2 : 3)
+    const entries = [...logs]
+      .sort((a, b) => rank(a.level) - rank(b.level) || b.ts.localeCompare(a.ts))
+      .slice(0, 80)
+    const alerts = logs.filter((entry) => entry.level === 'error' || entry.level === 'warn').length
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', width: 300, minWidth: 300, backgroundColor: t.chrome, borderLeftWidth: 1, borderColor: t.border }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: 10, borderBottomWidth: 1, borderColor: t.border }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <text style={{ color: t.fg, fontSize: 13, fontWeight: 700 }}>Notifications</text>
+            {alerts > 0 && <text style={{ color: '#ffffff', fontSize: 10, padding: 4, borderRadius: 9, backgroundColor: t.danger }}>{alerts}</text>}
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <div testId="theme-quick-toggle" onClick={() => setThemeMode((mode) => (mode === 'light' ? 'dark' : 'light'))} style={{ padding: 6, cursor: 'pointer' }}>
+              <text style={{ color: t.mutedFg, fontSize: 14 }}>{themeMode === 'light' ? '☾' : '☀'}</text>
+            </div>
+            <div testId="notifications-close" onClick={() => setRightSidebar(false)} style={{ padding: 6, cursor: 'pointer' }}>
+              <text style={{ color: t.mutedFg, fontSize: 14 }}>✕</text>
+            </div>
+          </div>
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: 10, flexGrow: 1, minHeight: 0, overflow: 'scroll' }}>
+          {entries.length === 0 && <text style={{ color: t.mutedFg, fontSize: 12 }}>No notifications yet.</text>}
+          {entries.map((entry, index) => (
+            <div key={`${entry.ts}-${index}`} style={{ display: 'flex', flexDirection: 'column', gap: 3, padding: 9, borderWidth: 1, borderColor: t.border, borderRadius: 7, backgroundColor: t.bg }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <text style={{ color: entry.level === 'error' ? t.danger : entry.level === 'warn' ? t.warning : t.mutedFg, fontSize: 10, fontWeight: 700 }}>{entry.level.toUpperCase()}</text>
+                <text style={{ color: t.mutedFg, fontSize: 10 }}>{entry.scope}</text>
+                <div style={{ flexGrow: 1 }} />
+                <text style={{ color: t.mutedFg, fontSize: 9 }}>{new Date(entry.ts).toLocaleTimeString()}</text>
+              </div>
+              <text style={{ color: t.fg, fontSize: 11 }}>{entry.msg}</text>
+            </div>
+          ))}
+        </div>
+        <div style={{ padding: 8, borderTopWidth: 1, borderColor: t.border }}>
+          <div testId="notifications-open-logs" onClick={() => navTo({ ...navNow, page: 'logs', formCode: undefined, period: undefined })} style={{ padding: 6, cursor: 'pointer' }}>
+            <text style={{ color: t.primary, fontSize: 11 }}>Open full logs</text>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   function sidebar() {
     const navItems: Array<[NavPage, string, string]> = [
+      ['import', 'Import Data', '⇩'],
       ['tasks', 'Background Tasks', '▤'],
-      ['logs', 'Logs', '≡'],
       ['calendar', 'Tax Calendars', '▦'],
       ['settings', 'Settings', '⚙'],
     ]
@@ -1214,11 +1513,11 @@ function App() {
           <>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: 6 }}>
               <text style={{ color: t.mutedFg, fontSize: 10, fontWeight: 700 }}>TAXPAYERS</text>
-              <div testId="add-taxpayer" onClick={() => { setShowNewTaxpayer(true); setPage('taxpayer'); setTab('details') }} style={{ width: 24, height: 24, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 6, backgroundColor: t.secondary }}>
+              <div testId="add-taxpayer" onClick={openNewTaxpayer} style={{ width: 24, height: 24, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 6, backgroundColor: t.secondary }}>
                 <text style={{ color: t.fg, fontSize: 17 }}>+</text>
               </div>
             </div>
-            <input value={taxpayerSearch} onChange={(event) => setTaxpayerSearch(event.value ?? '')} placeholder="Search taxpayer" style={{ height: 36, minHeight: 36, padding: 9, color: t.fg, backgroundColor: t.bg, borderWidth: 1, borderColor: t.input, borderRadius: 6 }} />
+            <input ref={searchInputRef} testId="taxpayer-search" value={taxpayerSearch} onChange={(event) => setTaxpayerSearch(event.value ?? '')} placeholder="Search TIN or name" style={{ height: 36, minHeight: 36, padding: 9, color: t.fg, backgroundColor: t.bg, borderWidth: 1, borderColor: t.input, borderRadius: 6 }} />
             <div testId="taxpayer-tree" style={{ display: 'flex', flexDirection: 'column', gap: 8, flexGrow: 1, overflow: 'scroll' }}>
               {filteredTaxpayers.map((item) => (
                 <div key={item.tin9} style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
@@ -1238,11 +1537,17 @@ function App() {
                     </div>
                   ))}
                   <div testId={`add-branch-${item.tin9}`} onClick={() => {
-                    setSelectedTin(item.tin9)
-                    setSelectedBranchId(item.branches[0] ? branchId(item.tin9, item.branches[0].code) : undefined)
                     setShowNewBranch(true)
-                    setPage('taxpayer')
-                    setTab('details')
+                    navTo({
+                      ...navNow,
+                      page: 'taxpayer',
+                      tab: 'details',
+                      tin: item.tin9,
+                      branchId: item.branches[0] ? branchId(item.tin9, item.branches[0].code) : undefined,
+                      profileId: undefined,
+                      formCode: undefined,
+                      period: undefined,
+                    })
                   }} style={{ marginLeft: 15, padding: 6, borderRadius: 6 }}>
                     <text style={{ color: t.mutedFg, fontSize: 10 }}>+ Add branch</text>
                   </div>
@@ -1253,11 +1558,14 @@ function App() {
         )}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4, borderTopWidth: 1, borderColor: t.border, paddingTop: 8 }}>
           {navItems.map(([id, label, icon]) => (
-            <div key={id} testId={`nav-${id}`} onClick={() => setPage(id)} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: 10, borderRadius: 8, backgroundColor: page === id ? t.secondary : t.chrome }}>
+            <div key={id} testId={`nav-${id}`} onClick={() => navTo({ ...navNow, page: id, formCode: undefined, period: undefined })} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: 10, borderRadius: 8, backgroundColor: page === id ? t.secondary : t.chrome }}>
               <text style={{ color: t.mutedFg, fontSize: 15, width: 18 }}>{icon}</text>
                 {!sidebarCollapsed && <text style={{ color: page === id ? t.fg : t.mutedFg, fontSize: 12 }}>{label}</text>}
             </div>
           ))}
+          <div style={{ display: 'flex', justifyContent: 'flex-end', paddingTop: 4 }}>
+            <text style={{ color: t.mutedFg, fontSize: 9, padding: 4, borderRadius: 8, backgroundColor: t.secondary }}>Dev</text>
+          </div>
         </div>
       </div>
     )
@@ -1306,6 +1614,7 @@ function App() {
     if (page === 'tasks') return taskPage()
     if (page === 'logs') return logsPage()
     if (page === 'calendar') return <Panel title="Tax calendars" subtitle="Coming in a future release." />
+    if (page === 'import') return <Panel title="Import data" subtitle="Coming in P5."><text style={{ color: t.mutedFg, fontSize: 13 }}>eBIR package and official-app data import land with the filing pipeline.</text></Panel>
     return (
       <Panel title="Settings">
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -1320,17 +1629,15 @@ function App() {
   const sftpMode = describeSftpConfig(loadSftpConfig())
   return (
     <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', backgroundColor: t.bg, fontFamily: 'Bricolage Grotesque, sans-serif' }}>
+      {titleBar()}
       <div style={{ display: 'flex', flexGrow: 1, minHeight: 0 }}>
         {sidebar()}
         <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0, minHeight: 0 }}>
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, padding: 12, borderBottomWidth: 1, borderColor: t.border, backgroundColor: t.chrome }}>
-            <div testId="notification-bell" onClick={() => setPage('logs')}><text style={{ color: t.fg, fontSize: 17 }}>🔔</text></div>
-            <div testId="theme-quick-toggle" onClick={() => setThemeMode((mode) => mode === 'light' ? 'dark' : 'light')}><text style={{ color: t.fg, fontSize: 17 }}>{themeMode === 'light' ? '☾' : '☀'}</text></div>
-          </div>
           <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minHeight: 0, padding: 20 }}>
             {mainContent()}
           </div>
         </div>
+        {rightSidebar && notificationsPanel()}
       </div>
       <div style={{ display: 'flex', justifyContent: 'flex-end', padding: 7, borderTopWidth: 1, borderColor: t.border, backgroundColor: t.chrome }}>
         <text style={{ color: t.mutedFg, fontSize: 10 }}>{sftpMode}</text>
@@ -1339,4 +1646,4 @@ function App() {
   )
 }
 
-render(<><FontRegistration /><App /></>, { title: 'eBIRForms', width: 1440, height: 940 })
+render(<><FontRegistration /><App /></>, { title: WINDOW_TITLE, width: 1440, height: 940, titlebarTransparent: true })
