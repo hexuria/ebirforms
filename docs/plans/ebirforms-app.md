@@ -29,7 +29,7 @@ Bun workspace, TypeScript everywhere, one process.
 apps/desktop        GPUIX React UI
 packages/core       SQLite (bun:sqlite) store, domain model, env config, logger, job queue
 packages/forms      form catalog + per-form field model generated from the official HTAs
-packages/validation official-runtime validator (happy-dom sandbox running BIR's own JS)
+packages/runtime     official HTA runtime: happy-dom sandbox running BIR's own JS (compute, validate, saveXML)
 packages/print      fill frozen HTML, render pages, print
 packages/submit     XML serializer, LZ + AES payload, dispatcher, SFTP upload
 vendor/             submodules (official package, frozen HTML)
@@ -49,24 +49,41 @@ Taxpayer      tin9 (999-999-999, check digit validated like the official profile
 A TIN can have many branches; each branch can have many tax years; a form only
 appears in a year's library after the user picks it.
 
-### Validation (requirements 5 and 9)
+### Official runtime engine (requirements 5, 9 and parity)
 
-The official forms are HTML apps whose `validate()` is a chain of
-`if (cond) { alert(msg); return; }` guards. We run BIR's own JavaScript in a
-happy-dom sandbox (verified: `BIR-Form1601Cv2018.hta` loads under Bun and its
-`validate()` returns the exact official alerts). To show every error at once
-instead of BIR's first-alert-only behaviour:
+Every draft is backed by a live instance of the official form HTA running in a
+happy-dom sandbox under Bun, with BIR's own JavaScript. The GPUIX editor is a
+native view over that instance: typing a value sets the DOM element by its
+official id (`frm1601c:txtTax14`) and fires its official `onblur`/`onchange`
+handlers. Computed fields come back from BIR's own code, and save and submit
+call the official `saveXML()` with an ActiveX shim that captures the file
+writes. Parity comes from running BIR's code, not from re-implementing it.
 
-1. At build time, parse each form's `validate()` and blur handlers (Babel AST,
-   cross-checked with REA's JavaScript application graph) into an ordered list
-   of guard clauses: condition, message, referenced field ids.
-2. At run time, evaluate every guard against the current values in the
-   sandbox and attach its message to the first field it references.
-3. Parity oracle (tests): running the unmodified official `validate()` must
-   alert exactly our first error, for every fixture.
+Shims the sandbox needs (all verified in a spike):
+`alert`/`confirm` capture, `ActiveXObject` (`Scripting.FileSystemObject`
+writes captured), string-callback `setTimeout`/`setInterval`, and compiling
+inline `on*` attributes into listeners, since happy-dom does not evaluate them.
+Spike result: on 1601C, `txtTax14 = 1000` plus blur gives `txtTax22 = 1,000.00`
+through the official handlers.
+
+Validation shows every error at once instead of BIR's first-alert-only flow:
+
+1. At build time, parse each form's `validate()` /
+   `initialValidateBeforeSave()` and blur handlers (Babel AST) into an ordered
+   list of guard clauses: condition, message, referenced field ids.
+2. At run time, evaluate every guard against the instance and attach its
+   message to the first field it references.
+3. Parity oracle (tests): the unmodified official function must alert exactly
+   our first error, for every fixture.
 
 Every field reserves one line under it for its error, so showing or clearing
 an error never moves the layout.
+
+REA covers what the static repos can't: `inspect-web-page` against the live
+download page, and `analyze-javascript-application` over the shared `js/`
+libraries. HTA inline scripts are exported to `.js` files first, because REA
+parses only JavaScript files. CDP endpoints must be given as `127.0.0.1`, not
+`localhost`.
 
 ### Submission and environment (requirement 6)
 
@@ -106,10 +123,14 @@ Status: `[ ]` todo, `[~]` in progress, `[x]` done (gate passed).
   *Gate:* CI green; window opens on Windows (screenshot).
 - [ ] **P1 Reverse-engineering inventory.** Confirm the latest version on
   bir.gov.ph with REA; REA JS analysis of the package; generated form catalog
-  (84 HTAs, 43 printable) and per-form field models (ids, types, maxlength,
-  options, item labels).
-  *Gate:* field counts match `buwiz-forms/rules/forms/*/fields.json` for
-  1601C, 2551Q, 0619E; REA evidence committed.
+  (83 forms in the official `formType` list, 43 with printable sheets) and
+  per-form field models taken from the official `frmMain.elements`
+  serialization order (ids, types, maxlength, options, item labels).
+  *Gate:* serializable field sets match
+  `buwiz-forms/rules/forms/*/fields.json` for 1601C, 2551Q, 0619E. Spike:
+  0619E matches 59/59; 1601C differs on `txtRDOCode` and 2551Q is off by one,
+  both still to explain from each form's own `saveXML`. REA evidence
+  committed.
 - [ ] **P2 Profiles and library.** Taxpayer, branch, tax year, form picker,
   library, SQLite store, logger, job queue.
   *Gate:* unit tests; UI walkthrough creating `123-456-788` branches `00000`
@@ -119,13 +140,14 @@ Status: `[ ]` todo, `[~]` in progress, `[x]` done (gate passed).
   *Gate:* parity oracle passes for 1601C, 2551Q, 0619E; GPUIX automation test
   proves no layout shift when errors appear.
 - [ ] **P4 Form editor.** Generated editor for the first forms (1601C, 2551Q,
-  0619E), compute handlers from the official JS, drafts.
+  0619E) bound to the official runtime instance, drafts.
   *Gate:* filled fixtures compute the same totals as the official HTA.
 - [ ] **P5 Print preview and print.**
   *Gate:* filled values visible on rendered pages; PDF printed via the OS
   dialog.
-- [ ] **P6 Submission.** Official XML, LZ + AES payload, queue job, dry run,
-  local SFTP server test, env control.
+- [ ] **P6 Submission.** Official `saveXML()` output captured through the
+  shim, LZ + AES payload, queue job, dry run, local SFTP server test, env
+  control.
   *Gate:* round-trip decrypt of our payload equals the official
   serialization; dry run never opens a socket.
 - [ ] **P7 All forms.** Extend P3 to P6 to every form in the catalog; parity
@@ -137,6 +159,16 @@ Status: `[ ]` todo, `[~]` in progress, `[x]` done (gate passed).
 - First forms: starting with 1601C, 2551Q and 0619E.
 - Print preview uses rendered page images (GPUIX has no web view).
 
+## Evidence
+
+- REA `inspect-web-page` on https://www.bir.gov.ph/ebirforms shows the
+  download link "Offline eBIRForms Package v7.9.6.2.1" (installer SHA-256
+  `e34979cf...cb96b6`, the same as the `buwiz-validation` manifest). Latest
+  confirmed.
+
 ## Change log
 
 - Initial plan.
+- Switched validation, compute and serialization to the official runtime
+  engine (spike verified). Confirmed v7.9.6.2.1 is still the latest via REA.
+  P1 counts corrected (83 listed forms).
