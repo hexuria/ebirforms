@@ -6,6 +6,7 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
+    "acorn": "8.15.0",
     "happy-dom": "21.0.1"
   },
   "scripts": {
