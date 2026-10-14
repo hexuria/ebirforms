@@ -58,7 +58,11 @@ const formSchemas = formSchemaJson as Record<string, FormSchema>
 const formMeta: Record<string, FormMeta> = Object.fromEntries(
   Object.entries(formSchemas).map(([key, schema]) => [key, { title: schema.title, frequency: schema.frequency, revision: schema.revision, pages: schema.pages, fields: schema.fields, parts: schema.parts.map((part) => part.items.length), draftLayout: schema.draftLayout }]),
 )
+/** A taxpayer's own 9-digit TIN (the branch code belongs to the branch). */
+const tin9Label = (tin9: string) => `${tin9.slice(0, 3)}-${tin9.slice(3, 6)}-${tin9.slice(6, 9)}`
 const isPrefillCode = (code: string): code is PrefillFormCode => code in prefillMap
+/** Earliest tax year a branch can add. */
+const MIN_TAX_YEAR = 2010
 const familyKey = (code: string) => code.replace(/v\d{4}.*$/i, '').toUpperCase()
 const versionOf = (code: string) => Number(/v(\d{4})/i.exec(code)?.[1] ?? 0)
 /** One library card per form family: the latest catalog variant that has prototype metadata. */
@@ -859,8 +863,14 @@ function App() {
   const [taxpayerEdit, setTaxpayerEdit] = useState({ name: '', type: 'individual' as 'individual' | 'non-individual', birthDate: '' })
   const [branchEdit, setBranchEdit] = useState<NewBranchForm>(blankBranch)
   const [branchInherit, setBranchInherit] = useState<Record<string, boolean>>({})
-  const [yearInput, setYearInput] = useState(String(new Date().getFullYear()))
+  const [yearInput, setYearInput] = useState('')
   const [showNewYear, setShowNewYear] = useState(false)
+  const [copyFromYear, setCopyFromYear] = useState(true)
+  const [formsEdit, setFormsEdit] = useState(false)
+  const [pendingFamilies, setPendingFamilies] = useState<Set<string>>(new Set())
+  const [formsQuery, setFormsQuery] = useState('')
+  const [formsFreq, setFormsFreq] = useState<'All' | 'Monthly' | 'Quarterly' | 'Annual' | 'As needed'>('All')
+  const [tinEdit, setTinEdit] = useState('')
   const [formSearch, setFormSearch] = useState('')
   const [pendingCodes, setPendingCodes] = useState<string[]>([])
   const [startFormCode, setStartFormCode] = useState<string | null>(null)
@@ -957,6 +967,7 @@ function App() {
       recentDrafts: store.listRecentDrafts(4),
     }
   }, [tree, dataVersion])
+  const templatesForBranch = useMemo(() => (taxpayer && branch ? store.listTemplates(taxpayer.tin9, branch.code) : []), [taxpayer?.tin9, branch?.code, tree, dataVersion])
   /** filedRow asks whether each filed form is still on its year's list; answer from one read per profile. */
   const libraryByProfile = useMemo(() => {
     const map = new Map<string, Set<string>>()
@@ -1215,12 +1226,24 @@ function App() {
 
   function saveTaxpayerDetails() {
     if (!taxpayer) return
-    store.updateTaxpayer(taxpayer.tin9, {
-      name: taxpayerEdit.name,
-      type: taxpayerEdit.type,
-      birthDate: taxpayerEdit.birthDate || null,
-    })
-    refreshTree(taxpayer.tin9)
+    let tin9 = taxpayer.tin9
+    try {
+      const parsed = parseTin(tinEdit || taxpayer.tin9)
+      if (parsed.branch !== '00000') throw new Error('Enter the 9-digit TIN without a branch code.')
+      if (parsed.tin9 !== taxpayer.tin9) {
+        store.renameTaxpayerTin(taxpayer.tin9, parsed.tin9)
+        tin9 = parsed.tin9
+      }
+      store.updateTaxpayer(tin9, {
+        name: taxpayerEdit.name,
+        type: taxpayerEdit.type,
+        birthDate: taxpayerEdit.birthDate || null,
+      })
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : String(error))
+      return
+    }
+    refreshTree(tin9, branch ? branchId(tin9, branch.code) : undefined)
     setEditSec(null)
     showToast('Taxpayer details saved.')
   }
@@ -1268,23 +1291,32 @@ function App() {
     }
   }
 
-  function addYear() {
-    if (!taxpayer || !branch || !/^\d{4}$/.test(yearInput)) return
+  /** Add a tax year to the current branch (up to next year), optionally copying the latest year's forms. */
+  function addYear(year: number) {
+    if (!taxpayer || !branch) return
+    const max = new Date().getFullYear() + 1
+    if (!Number.isInteger(year) || year < MIN_TAX_YEAR || year > max) {
+      showToast(`Choose a tax year from ${MIN_TAX_YEAR} to ${max}.`)
+      return
+    }
+    const source = copyFromYear ? branch.years.reduce<Profile | undefined>((best, profile) => (!best || profile.year > best.year ? profile : best), undefined) : undefined
     try {
       const profile = store.createProfile({
         tin: taxpayer.tin9,
         branch: branch.code,
-        year: Number(yearInput),
-        registeredName: selectedProfile?.registeredName ?? taxpayer.name,
-        rdo: selectedProfile?.rdo ?? branch.overrides.rdo ?? '',
-        address: selectedProfile?.address ?? branch.overrides.address ?? '',
-        zip: selectedProfile?.zip ?? branch.overrides.zip ?? '',
-        email: selectedProfile?.email ?? branch.overrides.email ?? '',
-        phone: selectedProfile?.phone ?? branch.overrides.phone ?? '',
+        year,
+        registeredName: taxpayer.name,
+        rdo: branch.facts.rdo ?? '',
+        address: branch.facts.address ?? '',
+        zip: branch.facts.zip ?? '',
+        email: branch.facts.email ?? '',
+        phone: branch.facts.phone ?? '',
       })
+      const codes = source ? store.listLibrary(source.id).map((entry) => entry.formCode) : []
+      if (codes.length) store.addForms(profile.id, codes)
       refreshTree(taxpayer.tin9, branchId(taxpayer.tin9, branch.code), profile.id)
       setShowNewYear(false)
-      showToast(`${profile.year} added.`)
+      showToast(codes.length ? `${year} added with ${codes.length} forms from ${source!.year}.` : `${year} added. Choose its forms next.`)
       navTo({ ...navNow, page: 'taxpayer', tab: 'forms', tin: taxpayer.tin9, branchId: branchId(taxpayer.tin9, branch.code), profileId: profile.id, formCode: undefined, period: undefined })
     } catch (error) {
       showToast(error instanceof Error ? error.message : String(error))
@@ -1322,7 +1354,8 @@ function App() {
         return
       }
       const prefillValues = isPrefillCode(code) ? buildPrefillValues(code, profile, form.fields(), period) : {}
-      const initialValues = mergeDraftPrefill(opened.values, prefillValues)
+      const template = previous ? null : store.getTemplate(profile.tin9, profile.branch, code) ?? store.listTemplates(profile.tin9, profile.branch).find((item) => familyKey(item.formCode) === familyKey(code)) ?? null
+      const initialValues = mergeDraftPrefill({ ...(template?.values ?? {}), ...opened.values }, prefillValues)
       for (const [id, value] of Object.entries(initialValues)) form.set(id, value)
       const nextDraft = previous
         ? opened
@@ -1420,37 +1453,13 @@ function App() {
     setOverlay({ kind: 'startReturn' })
   }
 
-  /** Copy a filed draft's values into a new draft for the next period. */
+  /** "Use as template" on a filed return keeps its setup answers as the branch template (D17). */
   function useAsTemplate(item: Draft) {
     const owner = profileById(item.profileId)
     if (!owner) return
-    const next = nextPeriod(item.period)
-    const nextYear = Number(next.slice(0, 4))
-    let profile = owner.profile
-    if (nextYear !== owner.profile.year) {
-      const target = tree
-        .find((entry) => entry.tin9 === owner.taxpayer.tin9)
-        ?.branches.find((entry) => entry.code === owner.branchCode)
-        ?.years.find((entry) => entry.year === nextYear)
-      if (!target) {
-        showToast(`Add a ${nextYear} profile for ${owner.taxpayer.name} first.`)
-        return
-      }
-      profile = target
-    }
-    const copied = store.openDraft(profile.id, item.formCode, next)
-    store.saveDraft(copied.id, { ...item.values })
+    store.saveTemplate(owner.taxpayer.tin9, owner.branchCode, item.formCode, setupAnswers(item.formCode, item.values), item.id)
     bumpData()
-    showToast(`${displayFormCode(item.formCode)} · ${periodLabel(next)} prefilled from ${periodLabel(item.period)}.`)
-    navTo({
-      ...navNow,
-      page: 'form',
-      tin: owner.taxpayer.tin9,
-      branchId: branchId(owner.taxpayer.tin9, owner.branchCode),
-      profileId: profile.id,
-      formCode: item.formCode,
-      period: next,
-    })
+    showToast(`${displayFormCode(item.formCode)} template saved from ${periodLabel(item.period)}. New returns start from it.`)
   }
 
   function toggleLibraryForm(code: string) {
@@ -1520,7 +1529,7 @@ function App() {
   // -- Title bar -------------------------------------------------------------
 
   function pillButton() {
-    const pillLabel = taxpayer ? (taxpayer.name || formatTin(taxpayer.tin9)) : 'eBIRForms'
+    const pillLabel = taxpayer ? (taxpayer.name || formatTin(taxpayer.tin9)) : 'Add a taxpayer'
     const pillTin = taxpayer ? formatTin(taxpayer.tin9, branch?.code ?? '00000') : ''
     return (
       <div
@@ -1827,6 +1836,17 @@ function App() {
       )
     }
     // panel === 'taxpayer'
+    if (!taxpayer) {
+      return (
+        <div style={{ display: 'flex', flexDirection: 'column', width: 320, minWidth: 320, backgroundColor: t.bg, paddingTop: 16, paddingLeft: 20, paddingRight: 20, gap: 12 }}>
+          <text style={{ color: t.fg, fontSize: F_TITLE, fontWeight: 600 }}>No taxpayer yet</text>
+          <text style={{ color: t.fg2, fontSize: F_BODY, lineHeight: 19 }}>Add a taxpayer to manage its branches, tax years, forms and templates here.</text>
+          <div style={{ display: 'flex' }}>
+            <Btn small icon="plus" testId="panel-new-taxpayer" onClick={() => { setShowNewTaxpayer(true); goto('taxpayer', { tab: 'profile' }) }}>New taxpayer</Btn>
+          </div>
+        </div>
+      )
+    }
     const formsCount = selectedLibrary.length
     const templateCount = 0
     const branches = taxpayer?.branches ?? []
@@ -2013,6 +2033,34 @@ function App() {
   // -- Views -----------------------------------------------------------------
 
   function homePage() {
+    if (tree.length === 0) {
+      return (
+        <div style={{ display: 'flex', flexDirection: 'column' }}>
+          <PageHead title="Welcome to eBIRForms" lede="Start with a taxpayer. Add its TIN and head-office details, then the tax years and forms it files. Deadlines, returns and templates follow from there." />
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 16, marginTop: 28, paddingTop: 24, paddingBottom: 24, paddingLeft: 24, paddingRight: 24, borderWidth: 1, borderColor: t.border, borderRadius: 12, backgroundColor: t.surface }}>
+            {([
+              ['user', 'Add a taxpayer', 'TIN, registered name and head-office address.'],
+              ['calendar', 'Add a tax year', 'Any year up to next year, per branch.'],
+              ['file', 'Choose its forms', 'Pick from all 43 BIR forms, or start from a pack.'],
+            ] as Array<[IconName, string, string]>).map(([icon, title, sub], index) => (
+              <div key={title} style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <div style={{ width: 28, height: 28, minWidth: 28, borderRadius: 14, backgroundColor: t.hover, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <text style={{ color: t.fg2, fontSize: F_META, fontWeight: 600 }}>{String(index + 1)}</text>
+                </div>
+                <Icon name={icon} size={16} color={t.fg2} />
+                <div style={{ display: 'flex', flexDirection: 'column' }}>
+                  <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 500 }}>{title}</text>
+                  <text style={{ color: t.fg3, fontSize: F_META }}>{sub}</text>
+                </div>
+              </div>
+            ))}
+            <div style={{ display: 'flex', paddingTop: 4 }}>
+              <Btn testId="welcome-new-taxpayer" icon="plus" onClick={() => { setShowNewTaxpayer(true); goto('taxpayer', { tab: 'profile' }) }}>Add your first taxpayer</Btn>
+            </div>
+          </div>
+        </div>
+      )
+    }
     const hour = new Date().getHours()
     const greeting = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening'
     const first = (displayName || 'there').split(' ')[0]
@@ -2280,7 +2328,7 @@ function App() {
     const facts = branch.facts
     const inherited = facts.inherited
     const isHO = branch.code === '00000'
-    const editBtn = (sec: string) => <Btn small kind="ghost" icon="pencil" testId={`edit-${sec}`} onClick={once(() => setEditSec(sec))}>Edit</Btn>
+    const editBtn = (sec: string) => <Btn small kind="ghost" icon="pencil" testId={`edit-${sec}`} onClick={once(() => { if (sec === 'taxpayer') setTinEdit(tin9Label(taxpayer.tin9)); setEditSec(sec) })}>Edit</Btn>
     const inheritOf = (key: 'rdo' | 'zip' | 'address' | 'phone' | 'email') =>
       isHO ? undefined : { on: branchInherit[key] !== false, toggle: (value: boolean) => setBranchInherit((current) => ({ ...current, [key]: value })) }
     const inheritCount = (['address', 'zip', 'phone', 'email'] as const).filter((key) => inherited[key]).length
@@ -2298,7 +2346,7 @@ function App() {
               <>
                 {fieldGrid([
                   editCell('Registered name', taxpayerEdit.name, (value) => setTaxpayerEdit((current) => ({ ...current, name: value })), { full: true }),
-                  factCell('TIN', formatTin(taxpayer.tin9), { mono: true }),
+                  editCell('TIN', tinEdit, (value) => setTinEdit(value.replace(/[^\d-]/g, '').slice(0, 11)), { mono: true }),
                   <div key="type" style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                     <text style={{ color: t.fg2, fontSize: F_META, minHeight: 20 }}>Taxpayer type</text>
                     <Seg<'individual' | 'non-individual'>
@@ -2309,12 +2357,13 @@ function App() {
                   </div>,
                   editCell('Birth date', taxpayerEdit.birthDate, (value) => setTaxpayerEdit((current) => ({ ...current, birthDate: value }))),
                 ])}
+                <text style={{ color: t.fg3, fontSize: F_META, paddingTop: 12 }}>Changing the TIN moves every branch, tax year, return and template to the new number.</text>
                 {editActions(saveTaxpayerDetails, 'taxpayer')}
               </>
             ) : (
               fieldGrid([
                 factCell('Registered name', taxpayer.name, { full: true }),
-                factCell('TIN', formatTin(taxpayer.tin9), { mono: true }),
+                factCell('TIN', tin9Label(taxpayer.tin9), { mono: true }),
                 factCell('Taxpayer type', taxpayer.type === 'individual' ? 'Individual' : 'Non-individual'),
                 ...(taxpayer.type === 'individual' ? [factCell('Birth date', taxpayer.birthDate ?? '')] : []),
               ])
@@ -2398,107 +2447,245 @@ function App() {
     )
   }
 
-  /** Library rows: one per form family, included forms first (prototype viewForms). */
+  /** Library rows: one per form family. */
   function familyIncluded(key: string): boolean {
     return selectedLibrary.some((entry) => familyKey(entry.formCode) === key)
   }
 
-  function toggleFamily(key: string, code: string) {
-    if (!selectedProfile) return
-    const owned = selectedLibrary.filter((entry) => familyKey(entry.formCode) === key)
-    if (owned.length) owned.forEach((entry) => store.removeForm(selectedProfile.id, entry.formCode))
-    else store.addForms(selectedProfile.id, [code])
-    refreshTree()
+  function startFormsEdit() {
+    setPendingFamilies(new Set(libraryCatalog.filter(({ key }) => familyIncluded(key)).map(({ key }) => key)))
+    setFormsQuery('')
+    setFormsFreq('All')
+    setFormsEdit(true)
   }
 
-  function taxpayerFormsTab() {
-    if (!taxpayer || !branch) return null
-    if (!selectedProfile) {
-      return (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', padding: 12, paddingLeft: 16, paddingRight: 16, borderRadius: 12, backgroundColor: t.accentSoft }}>
-          <text style={{ color: t.fg, fontSize: F_BODY, flexGrow: 1, minWidth: 200 }}>No tax year yet. A year opens the form checklist for this branch.</text>
-          <input value={yearInput} onChange={(event) => setYearInput((event.value ?? '').replace(/\D/g, '').slice(0, 4))} style={{ ...inputStyle(t, { mono: true }), width: 84 }} />
-          <Btn small testId="add-year-save" onClick={once(addYear)}>Create year</Btn>
-        </div>
-      )
-    }
-    const rows = [...libraryCatalog].sort((a, b) => Number(familyIncluded(b.key)) - Number(familyIncluded(a.key)))
-    const years = branch.years.map((profile) => profile.year)
-    const nextYear = Math.max(...years) + 1
+  function saveFormsEdit() {
+    if (!selectedProfile) return
+    const owned = new Map(selectedLibrary.map((entry) => [familyKey(entry.formCode), entry.formCode]))
+    const add = libraryCatalog.filter(({ key }) => pendingFamilies.has(key) && !owned.has(key)).map(({ code }) => code)
+    const remove = [...owned.entries()].filter(([key]) => !pendingFamilies.has(key)).map(([, code]) => code)
+    if (add.length) store.addForms(selectedProfile.id, add)
+    remove.forEach((code) => store.removeForm(selectedProfile.id, code))
+    refreshTree()
+    setFormsEdit(false)
+    showToast(add.length || remove.length ? `${selectedProfile.year} forms updated: ${add.length} added, ${remove.length} removed.` : 'No changes to the form list.')
+  }
+
+  function togglePending(key: string) {
+    setPendingFamilies((current) => {
+      const next = new Set(current)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+
+  function applyPackPending(pack: string) {
+    const keys = (STARTER_PACKS[pack] ?? []).map(familyKey)
+    setPendingFamilies((current) => new Set([...current, ...keys]))
+    showToast(`${pack} forms selected. Save to keep them.`)
+  }
+
+  /** Years a branch can add: from MIN_TAX_YEAR up to one year after the current year, minus the ones it has. */
+  function allowedYears(existing: number[]): number[] {
+    const years: number[] = []
+    for (let year = new Date().getFullYear() + 1; year >= MIN_TAX_YEAR; year--) if (!existing.includes(year)) years.push(year)
+    return years
+  }
+
+  function addYearPanel(existing: number[], onCancel?: () => void) {
+    const choices = allowedYears(existing)
+    const latest = branch?.years.reduce<Profile | undefined>((best, profile) => (!best || profile.year > best.year ? profile : best), undefined)
+    const latestCount = latest ? store.listLibrary(latest.id).length : 0
+    const value = choices.includes(Number(yearInput)) ? yearInput : String(choices[0] ?? '')
     return (
-      <div style={{ display: 'flex', flexDirection: 'column' }}>
-        {showNewYear && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', paddingTop: 12, paddingBottom: 12, paddingLeft: 16, paddingRight: 16, borderRadius: 12, backgroundColor: t.accentSoft, marginBottom: 16 }}>
-            <text style={{ color: t.fg, fontSize: F_BODY, flexGrow: 1, minWidth: 200 }}>{`Copy ${Math.max(...years)} forms to ${yearInput}? ${selectedLibrary.length} forms and their templates carry over. Amounts never do.`}</text>
-            <Btn small kind="ghost" onClick={once(() => setShowNewYear(false))}>Not now</Btn>
-            <Btn small testId="add-year-save" onClick={once(addYear)}>Copy forms</Btn>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', paddingTop: 12, paddingBottom: 12, paddingLeft: 16, paddingRight: 16, borderRadius: 12, backgroundColor: t.accentSoft, marginBottom: 16 }}>
+        <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 500 }}>Add tax year</text>
+        <Dropdown testId="add-year-select" width={110} value={value} options={choices.map((year) => ({ value: String(year), label: String(year) }))} onChange={setYearInput} />
+        {latest && (
+          <div testId="copy-forms" onClick={once(() => setCopyFromYear((on) => !on))} style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+            <Check on={copyFromYear} />
+            <text style={{ color: t.fg, fontSize: F_BODY }}>{`Copy ${latestCount} form${latestCount === 1 ? '' : 's'} from ${latest.year}`}</text>
           </div>
         )}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', marginBottom: 16 }}>
-          <Seg<string>
-            testId="year-seg"
-            options={[...years.map((year) => ({ value: String(year), label: String(year) })), { value: 'next', label: String(nextYear) }]}
-            value={showNewYear ? 'next' : String(selectedProfile.year)}
-            onChange={(value) => {
-              if (value === 'next') {
-                setYearInput(String(nextYear))
-                setShowNewYear(true)
-                return
-              }
-              setShowNewYear(false)
-              const profile = branch.years.find((item) => String(item.year) === value)
-              if (profile) navTo({ ...navNow, profileId: profile.id })
-            }}
-          />
-          <div style={{ flexGrow: 1 }} />
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-            <text style={{ color: t.fg3, fontSize: F_META, marginRight: 2 }}>Starter packs</text>
-            {Object.keys(STARTER_PACKS).map((pack) => (
-              <Btn key={pack} small kind="secondary" testId={`pack-${pack}`} onClick={once(() => applyPack(pack))}>{pack}</Btn>
-            ))}
-          </div>
-        </div>
-        <List>
-          {rows.map(({ key, code, meta }, index) => {
-            const on = familyIncluded(key)
-            const owned = selectedLibrary.find((entry) => familyKey(entry.formCode) === key)
-            const due = owned ? dueByKey.get(`${selectedProfile.id}:${owned.formCode}`) : undefined
-            return (
-              <Row key={key} first={index === 0} testId={`lib-${key}`}>
-                <div onClick={once(() => toggleFamily(key, code))} style={{ cursor: 'pointer' }}><Check on={on} /></div>
-                <Code dim={!on}>{key}</Code>
-                <RName title={meta.title} sub={on ? (due ? `Next: ${periodLabel(due.period)}` : 'Every period filed') : 'Not filed this year'} dim={!on} />
-                {!narrow && <div style={{ width: 84, minWidth: 84, display: 'flex' }}>{on && <Chip>{meta.frequency}</Chip>}</div>}
-                {!narrow && <text style={{ color: t.fg2, fontSize: F_META, width: 104, minWidth: 104 }}>{on && due ? `Due ${fmtDateShort(due.dueDate)}` : ''}</text>}
-                <div style={{ width: 112, minWidth: 112, display: 'flex' }}>{on && <Chip>No template</Chip>}</div>
-              </Row>
-            )
-          })}
-        </List>
+        <div style={{ flexGrow: 1 }} />
+        {onCancel && <Btn small kind="ghost" onClick={onCancel}>Cancel</Btn>}
+        <Btn small testId="add-year-save" disabled={!value} onClick={() => addYear(Number(value))}>{`Add ${value}`}</Btn>
       </div>
     )
   }
 
+  function taxpayerFormsTab() {
+    if (!taxpayer || !branch) return null
+    const years = branch.years.map((profile) => profile.year)
+    if (!selectedProfile) {
+      return (
+        <div style={{ display: 'flex', flexDirection: 'column' }}>
+          <text style={{ color: t.fg2, fontSize: F_BODY, lineHeight: 19, marginBottom: 16 }}>{`${branch.name} has no tax year yet. Add one to choose the forms it files.`}</text>
+          {addYearPanel(years)}
+        </div>
+      )
+    }
+    const ownedRows = libraryCatalog.filter(({ key }) => familyIncluded(key))
+    const editing = formsEdit
+    const q = formsQuery.trim().toLowerCase()
+    const editRows = libraryCatalog
+      .filter(({ meta }) => formsFreq === 'All' || meta.frequency === formsFreq)
+      .filter(({ key, meta }) => !q || `${key} ${meta.title}`.toLowerCase().includes(q))
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column' }}>
+        {showNewYear && !editing && addYearPanel(years, () => setShowNewYear(false))}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', marginBottom: 16 }}>
+          <Seg<string>
+            testId="year-seg"
+            options={[...years].sort((a, b) => a - b).map((year) => ({ value: String(year), label: String(year) }))}
+            value={String(selectedProfile.year)}
+            onChange={(value) => {
+              setFormsEdit(false)
+              const profile = branch.years.find((item) => String(item.year) === value)
+              if (profile) navTo({ ...navNow, profileId: profile.id })
+            }}
+          />
+          {!editing && allowedYears(years).length > 0 && (
+            <Btn small kind="ghost" icon="plus" testId="add-year-toggle" onClick={() => { setYearInput(''); setCopyFromYear(true); setShowNewYear((open) => !open) }}>Add year</Btn>
+          )}
+          <div style={{ flexGrow: 1 }} />
+          {editing ? (
+            <>
+              <text style={{ color: t.fg2, fontSize: F_META }}>{`${pendingFamilies.size} selected`}</text>
+              <Btn small kind="ghost" testId="forms-cancel" onClick={() => setFormsEdit(false)}>Cancel</Btn>
+              <Btn small testId="forms-save" onClick={saveFormsEdit}>Save forms</Btn>
+            </>
+          ) : (
+            <Btn small kind="secondary" icon="pencil" testId="forms-edit" onClick={startFormsEdit}>Edit forms</Btn>
+          )}
+        </div>
+
+        {editing && (
+          <>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', marginBottom: 12 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, width: 280, height: 32, paddingLeft: 10, paddingRight: 8, borderRadius: 8, borderWidth: 1, borderColor: t.border, backgroundColor: t.surface }}>
+                <Icon name="search" size={16} color={t.fg3} />
+                <input testId="forms-search" value={formsQuery} placeholder="Find a form, like 1601C or VAT" onChange={(event) => setFormsQuery(event.value ?? '')} style={{ flexGrow: 1, minWidth: 0, height: 30, color: t.fg, fontSize: F_BODY, backgroundColor: CLEAR, borderWidth: 0 }} />
+              </div>
+              <Seg options={LIB_FREQS.map((value) => ({ value, label: value }))} value={formsFreq} onChange={setFormsFreq} testId="forms-freq" />
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginBottom: 16 }}>
+              <text style={{ color: t.fg3, fontSize: F_META, marginRight: 2 }}>Starter packs</text>
+              {Object.keys(STARTER_PACKS).map((pack) => (
+                <Btn key={pack} small kind="secondary" testId={`pack-${pack}`} onClick={() => applyPackPending(pack)}>{pack}</Btn>
+              ))}
+            </div>
+            <List>
+              {editRows.length === 0 && emptyRow('No form matches. Try another filter.')}
+              {editRows.map(({ key, meta }, index) => {
+                const on = pendingFamilies.has(key)
+                return (
+                  <Row key={key} first={index === 0} testId={`lib-${key}`} onClick={() => togglePending(key)}>
+                    <Check on={on} />
+                    <Code dim={!on}>{key}</Code>
+                    <RName title={meta.title} sub={on ? 'Filed this year' : 'Not filed this year'} dim={!on} />
+                    {!narrow && <div style={{ width: 84, minWidth: 84, display: 'flex' }}><Chip>{meta.frequency}</Chip></div>}
+                  </Row>
+                )
+              })}
+            </List>
+          </>
+        )}
+
+        {!editing && (
+          <List>
+            {ownedRows.length === 0 && (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, paddingTop: 36, paddingBottom: 36 }}>
+                <text style={{ color: t.fg2, fontSize: F_BODY }}>{`No forms for ${selectedProfile.year} yet.`}</text>
+                <Btn small icon="pencil" onClick={startFormsEdit}>Choose forms</Btn>
+              </div>
+            )}
+            {ownedRows.map(({ key, meta }, index) => {
+              const owned = selectedLibrary.find((entry) => familyKey(entry.formCode) === key)
+              const due = owned ? dueByKey.get(`${selectedProfile.id}:${owned.formCode}`) : undefined
+              const tpl = owned ? templatesForBranch.some((item) => familyKey(item.formCode) === key) : false
+              return (
+                <Row key={key} first={index === 0} testId={`lib-${key}`}>
+                  <Code>{key}</Code>
+                  <RName title={meta.title} sub={due ? `Next: ${periodLabel(due.period)}` : 'Every period filed'} />
+                  {!narrow && <div style={{ width: 84, minWidth: 84, display: 'flex' }}><Chip>{meta.frequency}</Chip></div>}
+                  {!narrow && <text style={{ color: t.fg2, fontSize: F_META, width: 104, minWidth: 104 }}>{due ? `Due ${fmtDateShort(due.dueDate)}` : ''}</text>}
+                  <div style={{ width: 112, minWidth: 112, display: 'flex' }}>{tpl ? <Chip tone="success" icon="template">Template</Chip> : <Chip>No template</Chip>}</div>
+                </Row>
+              )
+            })}
+          </List>
+        )}
+      </div>
+    )
+  }
+
+  /** Setup answers only: drop amounts, rates and computed fields (D8). */
+  function setupAnswers(formCode: string, values: DraftValues): DraftValues {
+    const schema = formSchemas[familyKey(formCode)]
+    if (!schema) return values
+    const drop = new Set<string>()
+    for (const part of schema.parts) {
+      for (const item of part.items) {
+        for (const field of item.f ?? []) if (field.k && (field.t === 'money' || field.t === 'pct' || field.c)) drop.add(field.k)
+        item.keys?.forEach((row) => row.forEach((key, index) => { const col = item.cols?.[index]; if (key && col && (col.t === 'money' || col.t === 'pct' || col.c)) drop.add(key) }))
+      }
+    }
+    return Object.fromEntries(Object.entries(values).filter(([key, value]) => !drop.has(key) && value !== '' && value !== false))
+  }
+
+  /** The newest return of a form for this branch, any status and any year. */
+  function latestDraftFor(formCode: string): Draft | undefined {
+    if (!branch) return undefined
+    return branch.years
+      .flatMap((profile) => store.listDrafts(profile.id).filter((item) => familyKey(item.formCode) === familyKey(formCode)))
+      .sort((a, b) => b.updatedAt - a.updatedAt)[0]
+  }
+
+  function makeTemplate(formCode: string, from?: Draft) {
+    if (!taxpayer || !branch) return
+    const source = from ?? latestDraftFor(formCode)
+    if (!source) {
+      showToast(`Open and save a ${familyKey(formCode)} return first. The template keeps its setup answers.`)
+      return
+    }
+    const kept = setupAnswers(source.formCode, source.values)
+    store.saveTemplate(taxpayer.tin9, branch.code, source.formCode, kept, source.id)
+    bumpData()
+    showToast(`${familyKey(formCode)} template saved: ${Object.keys(kept).length} setup answers kept, amounts left out.`)
+  }
+
   function taxpayerTemplatesTab() {
-    if (!taxpayer || !selectedProfile) return null
+    if (!taxpayer || !branch) return null
     const owned = libraryCatalog.filter(({ key }) => familyIncluded(key))
     return (
       <div style={{ display: 'flex', flexDirection: 'column' }}>
-        <text style={{ color: t.fg2, fontSize: F_BODY, maxWidth: 520, lineHeight: 19, marginBottom: 16 }}>
-          One template per form for this branch. A template keeps setup answers and marks the fields to fill each period. It never keeps amounts.
+        <text style={{ color: t.fg2, fontSize: F_BODY, lineHeight: 19, marginBottom: 16 }}>
+          One template per form for this branch. A template keeps the setup answers from a return and fills them into each new one. It never keeps amounts.
         </text>
         <List>
-          {owned.length === 0 && emptyRow('Add forms under the Forms tab first.')}
-          {owned.map(({ key, meta }, index) => (
-            <Row key={key} first={index === 0} dim>
-              <Code dim>{key}</Code>
-              <RName title={meta.title} sub="No template yet" dim />
-              {!narrow && <text style={{ color: t.fg2, fontSize: F_META, width: 140, minWidth: 140 }} />}
-              <div style={{ width: 96, minWidth: 96, display: 'flex', justifyContent: 'flex-end' }}>
-                <Btn small kind="secondary" icon="plus" onClick={once(() => showToast(`${key} template created. Click fields on the blank form to mark them.`))}>Create</Btn>
-              </div>
-            </Row>
-          ))}
+          {owned.length === 0 && emptyRow(selectedProfile ? 'Choose this year’s forms under the Forms tab first.' : 'Add a tax year under the Forms tab first.')}
+          {owned.map(({ key, code, meta }, index) => {
+            const tpl = templatesForBranch.find((item) => familyKey(item.formCode) === key)
+            return (
+              <Row key={key} first={index === 0} dim={!tpl}>
+                <Code dim={!tpl}>{key}</Code>
+                <RName title={meta.title} sub={tpl ? `Updated ${fmtDate(tpl.updatedAt)}` : 'No template yet'} dim={!tpl} />
+                {!narrow && <text style={{ color: t.fg2, fontSize: F_META, width: 140, minWidth: 140 }}>{tpl ? `${Object.keys(tpl.values).length} answers kept` : ''}</text>}
+                <div style={{ width: 196, minWidth: 196, display: 'flex', justifyContent: 'flex-end', gap: 6 }}>
+                  {tpl ? (
+                    <>
+                      <Btn small kind="ghost" testId={`tpl-update-${key}`} onClick={() => makeTemplate(tpl.formCode)}>Update</Btn>
+                      <Btn small kind="ghost" testId={`tpl-delete-${key}`} onClick={() => { store.deleteTemplate(taxpayer.tin9, branch.code, tpl.formCode); bumpData(); showToast(`${key} template deleted.`) }}>Delete</Btn>
+                    </>
+                  ) : (
+                    <Btn small kind="secondary" icon="plus" testId={`tpl-create-${key}`} onClick={() => makeTemplate(selectedLibrary.find((entry) => familyKey(entry.formCode) === key)?.formCode ?? code)}>Create</Btn>
+                  )}
+                </div>
+              </Row>
+            )
+          })}
         </List>
       </div>
     )
@@ -2530,7 +2717,7 @@ function App() {
             />
           </div>
           {fieldGrid([
-            <FieldInput key="name" label="Registered name" value={newTaxpayer.name} onChange={(value) => setNew('name', value)} hint={newTaxpayerErrors.name} />,
+            <FieldInput key="name" label="Registered name" value={newTaxpayer.name} onChange={(value) => setNew('name', value)} hint={newTaxpayerErrors.name} testId="new-taxpayer-name" />,
             <FieldInput key="birth" label="Birth date" value={newTaxpayer.birthDate} placeholder="YYYY-MM-DD (individuals)" onChange={(value) => setNew('birthDate', value)} />,
             <FieldInput key="rdo" label="RDO" value={newTaxpayer.rdo} onChange={(value) => setNew('rdo', value)} />,
             <FieldInput key="zip" label="ZIP code" value={newTaxpayer.zip} onChange={(value) => setNew('zip', value)} />,

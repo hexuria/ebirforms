@@ -113,6 +113,16 @@ export interface Draft {
   updatedAt: number
 }
 
+export interface FormTemplate {
+  tin9: string
+  branch: string
+  formCode: string
+  values: DraftValues
+  sourceDraftId: string | null
+  createdAt: number
+  updatedAt: number
+}
+
 export function parseTin(input: string): ParsedTin {
   const digits = input.replace(/[\s-]/g, '')
   if (/^\d{9}$/.test(digits)) {
@@ -312,6 +322,24 @@ function migrate(db: Database): void {
         )
       `)
       db.exec('PRAGMA user_version = 4')
+    }
+
+    if (version < 5) {
+      // v5: one form template per taxpayer branch and form. A template keeps
+      // setup answers (never amounts) and prefills each new return of that form.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS form_templates (
+          tin9 TEXT NOT NULL,
+          branch TEXT NOT NULL,
+          form_code TEXT NOT NULL,
+          "values" JSON NOT NULL,
+          source_draft_id TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY (tin9, branch, form_code)
+        )
+      `)
+      db.exec('PRAGMA user_version = 5')
     }
   })
   migration()
@@ -528,6 +556,10 @@ export class Store {
       }
       if (!Number.isInteger(input.year) || input.year < 1 || input.year > 9999) {
         throw new Error('Enter a valid tax year.')
+      }
+      const maxYear = new Date().getFullYear() + 1
+      if (input.year > maxYear) {
+        throw new Error(`Tax years go up to ${maxYear}, one year after the current year.`)
       }
 
       const profileId = randomUUID()
@@ -944,6 +976,76 @@ export class Store {
         throw new Error(`Draft not found: ${id}.`)
       }
       return this.getDraft(id)!
+    })
+  }
+
+  /**
+   * Change a taxpayer's 9-digit TIN. Branches, tax years and templates move
+   * with it; drafts follow their tax year by id. One transaction.
+   */
+  renameTaxpayerTin(fromTin: string, toTin: string): void {
+    this.withErrorLogging('renameTaxpayerTin', () => {
+      const from = parseTin(fromTin)
+      const to = parseTin(toTin)
+      if (from.branch !== '00000' || to.branch !== '00000') {
+        throw new Error('Enter the 9-digit TIN without a branch code.')
+      }
+      if (from.tin9 === to.tin9) return
+      if (this.db.query('SELECT 1 FROM taxpayers WHERE tin9 = ?').get(to.tin9)) {
+        throw new Error(`Another taxpayer already uses TIN ${formatTin(to.tin9)}.`)
+      }
+      if (!this.db.query('SELECT 1 FROM taxpayers WHERE tin9 = ?').get(from.tin9)) {
+        throw new Error(`Taxpayer not found: ${from.tin9}.`)
+      }
+      const columns = (this.db.query('PRAGMA table_info(taxpayers)').all() as Array<{ name: string }>)
+        .map((column) => column.name)
+        .filter((name) => name !== 'tin9')
+      const list = columns.map((name) => `"${name}"`).join(', ')
+      this.db.transaction(() => {
+        // branches → taxpayers and profiles → branches have no ON UPDATE CASCADE;
+        // check the keys at commit, once every row has moved.
+        this.db.exec('PRAGMA defer_foreign_keys = ON')
+        this.db.query(`INSERT INTO taxpayers (tin9${columns.length ? `, ${list}` : ''}) SELECT ?${columns.length ? `, ${list}` : ''} FROM taxpayers WHERE tin9 = ?`).run(to.tin9, from.tin9)
+        this.db.query('UPDATE branches SET tin9 = ? WHERE tin9 = ?').run(to.tin9, from.tin9)
+        this.db.query('UPDATE profiles SET tin9 = ? WHERE tin9 = ?').run(to.tin9, from.tin9)
+        this.db.query('UPDATE form_templates SET tin9 = ? WHERE tin9 = ?').run(to.tin9, from.tin9)
+        this.db.query('DELETE FROM taxpayers WHERE tin9 = ?').run(from.tin9)
+      })()
+      this.logger.log('info', 'store', 'Taxpayer TIN changed', { from: from.tin9, to: to.tin9 })
+    })
+  }
+
+  listTemplates(tin9: string, branch: string): FormTemplate[] {
+    return this.withErrorLogging('listTemplates', () =>
+      (this.db
+        .query('SELECT form_code AS formCode, "values" AS rawValues, source_draft_id AS sourceDraftId, created_at AS createdAt, updated_at AS updatedAt FROM form_templates WHERE tin9 = ? AND branch = ? ORDER BY form_code')
+        .all(tin9, branch) as Array<Omit<FormTemplate, 'values' | 'tin9' | 'branch'> & { rawValues: string }>).map(({ rawValues, ...row }) => ({ ...row, tin9, branch, values: JSON.parse(rawValues) as DraftValues })),
+    )
+  }
+
+  getTemplate(tin9: string, branch: string, formCode: string): FormTemplate | null {
+    return this.listTemplates(tin9, branch).find((template) => template.formCode === formCode) ?? null
+  }
+
+  saveTemplate(tin9: string, branch: string, formCode: string, values: DraftValues, sourceDraftId: string | null = null): FormTemplate {
+    return this.withErrorLogging('saveTemplate', () => {
+      const now = Date.now()
+      this.db
+        .query(`
+          INSERT INTO form_templates (tin9, branch, form_code, "values", source_draft_id, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT (tin9, branch, form_code) DO UPDATE SET "values" = excluded."values", source_draft_id = excluded.source_draft_id, updated_at = excluded.updated_at
+        `)
+        .run(tin9, branch, formCode, JSON.stringify(values), sourceDraftId, now, now)
+      this.logger.log('info', 'store', 'Template saved', { tin9, branch, formCode })
+      return this.getTemplate(tin9, branch, formCode)!
+    })
+  }
+
+  deleteTemplate(tin9: string, branch: string, formCode: string): void {
+    this.withErrorLogging('deleteTemplate', () => {
+      this.db.query('DELETE FROM form_templates WHERE tin9 = ? AND branch = ? AND form_code = ?').run(tin9, branch, formCode)
+      this.logger.log('info', 'store', 'Template deleted', { tin9, branch, formCode })
     })
   }
 
