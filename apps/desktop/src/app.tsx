@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { copyFileSync, mkdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { render, useGpuixRequired, useWindowSize } from '@gpuix/react'
@@ -110,6 +110,11 @@ function FontRegistration() {
 function AutomationBridge() {
   const renderer = useGpuixRequired()
   useEffect(() => {
+    if (process.env.EBIRFORMS_FRAMES) {
+      const r = renderer as unknown as { getDebugFrameOverlayStats?: () => unknown; resetDebugFrameOverlayStats?: () => void }
+      ;(globalThis as Record<string, unknown>).__frames = () => { const v = r.getDebugFrameOverlayStats?.(); r.resetDebugFrameOverlayStats?.(); return v }
+      setInterval(() => { require('node:fs').appendFileSync(process.env.EBIRFORMS_FRAMES!, JSON.stringify((globalThis as any).__frames()) + '\n') }, 1000)
+    }
     if (process.env.EBIRFORMS_AUTOMATION !== 'stdio') return
     void import('@gpuix/native/automation').then(({ serveAutomationStdio, InProcessBackend, liveRendererAsTest }) => {
       serveAutomationStdio(new InProcessBackend(liveRendererAsTest(renderer as unknown as Parameters<typeof liveRendererAsTest>[0])))
@@ -122,7 +127,7 @@ function AutomationBridge() {
 // Design constants (verbatim from the mockup's Components tab)
 
 const FONT = 'Segoe UI Variable Text, Segoe UI, Bricolage Grotesque, sans-serif'
-const NUM_STYLE = { fontVariantNumeric: 'tabular-nums', fontWeight: 600 } as const
+const NUM_STYLE = { fontWeight: 600 } as const
 const F_CAP = 11
 const F_META = 12
 const F_BODY = 13
@@ -793,7 +798,10 @@ type KeyEvent = {
 
 let rootKeyHandler: ((event: KeyEvent) => void) | null = null
 
+const perf = { renders: 0, ms: 0 }
+if (process.env.EBIRFORMS_PERF) setInterval(() => { require('node:fs').appendFileSync(process.env.EBIRFORMS_PERF!, `PERF renders=${perf.renders} ms=${perf.ms.toFixed(0)}\n`); perf.renders = 0; perf.ms = 0 }, 1000)
 function App() {
+  const perfStart = performance.now()
   const [themeMode, setThemeModeState] = useState<ThemeMode>(() => {
     const saved = store.getSetting('theme')
     return saved === 'dark' || saved === 'system' ? saved : 'light'
@@ -822,6 +830,13 @@ function App() {
   /** Content-column width; below 640 the prototype drops secondary columns (its container queries). */
   const contentWidth = Math.min(page === 'form' || page === 'library' ? 1120 : 880, windowSize.width - (sidebarCollapsed ? 16 : 256) - (panel ? 320 : 8) - 64)
   const narrow = contentWidth < 640
+  /**
+   * Centre the content column by computing the side padding here. Centring with
+   * alignItems:'center' + maxWidth made the layout engine size the whole column
+   * at max-content first, re-measuring every text each frame (200ms+ frames).
+   */
+  const mainWidth = windowSize.width - (sidebarCollapsed ? 16 : 256) - (panel ? 320 : 8)
+  const sidePad = Math.max(narrow ? 16 : 32, Math.floor((mainWidth - (page === 'form' || page === 'library' ? 1120 : 880)) / 2))
   const [tree, setTree] = useState<TaxpayerTree[]>(() => store.listTaxpayers())
   const [selectedTin, setSelectedTin] = useState<string | undefined>(() => store.listTaxpayers()[0]?.tin9)
   const [selectedBranchId, setSelectedBranchId] = useState<string | undefined>(() => {
@@ -880,7 +895,14 @@ function App() {
   const branch = taxpayer?.branches.find((item) => branchId(taxpayer.tin9, item.code) === selectedBranchId)
   const selectedProfile =
     branch?.years.find((item) => item.id === selectedProfileId) ?? branch?.years.at(-1)
-  const selectedLibrary = selectedProfile ? store.listLibrary(selectedProfile.id) : []
+  /**
+   * Store reads are synchronous SQLite calls; running them on every render cost
+   * 30–55ms per click. Derived data is memoised on `dataVersion`, which every
+   * write path bumps (see bumpData / refreshTree).
+   */
+  const [dataVersion, setDataVersion] = useState(0)
+  const bumpData = () => setDataVersion((value) => value + 1)
+  const selectedLibrary = useMemo(() => (selectedProfile ? store.listLibrary(selectedProfile.id) : []), [selectedProfile?.id, tree, dataVersion])
 
   function showToast(text: string) {
     if (toastTimer.current) clearTimeout(toastTimer.current)
@@ -911,25 +933,36 @@ function App() {
     )
   }
 
-  const dueInputs: DueProjectionInput[] = tree.flatMap((item) =>
-    item.branches.flatMap((itemBranch) =>
-      itemBranch.years.flatMap((profile) =>
-        store.listLibrary(profile.id).map((entry) => ({
-          profileId: profile.id,
-          tin9: item.tin9,
-          branchCode: itemBranch.code,
-          year: profile.year,
-          formCode: entry.formCode,
-          frequency: catalogByCode.get(entry.formCode)?.frequency ?? 'annual',
-          statuses: draftStatuses(profile.id, entry.formCode),
-        })),
+  const { dueRows, dueByKey, filedDrafts, recentDrafts } = useMemo(() => {
+    const dueInputs: DueProjectionInput[] = tree.flatMap((item) =>
+      item.branches.flatMap((itemBranch) =>
+        itemBranch.years.flatMap((profile) =>
+          store.listLibrary(profile.id).map((entry) => ({
+            profileId: profile.id,
+            tin9: item.tin9,
+            branchCode: itemBranch.code,
+            year: profile.year,
+            formCode: entry.formCode,
+            frequency: catalogByCode.get(entry.formCode)?.frequency ?? 'annual',
+            statuses: draftStatuses(profile.id, entry.formCode),
+          })),
+        ),
       ),
-    ),
-  )
-  const dueRows = projectDue(dueInputs)
-  const dueByKey = new Map(dueRows.map((row) => [`${row.profileId}:${row.formCode}`, row]))
-  const filedDrafts = store.listFiledDrafts()
-  const recentDrafts = store.listRecentDrafts(4)
+    )
+    const rows = projectDue(dueInputs)
+    return {
+      dueRows: rows,
+      dueByKey: new Map(rows.map((row) => [`${row.profileId}:${row.formCode}`, row])),
+      filedDrafts: store.listFiledDrafts(),
+      recentDrafts: store.listRecentDrafts(4),
+    }
+  }, [tree, dataVersion])
+  /** filedRow asks whether each filed form is still on its year's list; answer from one read per profile. */
+  const libraryByProfile = useMemo(() => {
+    const map = new Map<string, Set<string>>()
+    for (const item of tree) for (const itemBranch of item.branches) for (const profile of itemBranch.years) map.set(profile.id, new Set(store.listLibrary(profile.id).map((entry) => entry.formCode)))
+    return map
+  }, [tree, dataVersion])
 
   function profileById(profileId: string): { profile: Profile; taxpayer: TaxpayerTree; branchCode: string; branchName: string } | null {
     for (const item of tree) {
@@ -1055,6 +1088,7 @@ function App() {
   function refreshTree(nextTin?: string, nextBranchId?: string, nextProfileId?: string) {
     const nextTree = store.listTaxpayers()
     setTree(nextTree)
+    bumpData()
     if (nextTin) setSelectedTin(nextTin)
     if (nextBranchId) setSelectedBranchId(nextBranchId)
     if (nextProfileId) setSelectedProfileId(nextProfileId)
@@ -1265,6 +1299,7 @@ function App() {
     const ticket = ++formLoadSeq.current
     const previous = store.listDrafts(profile.id, code).find((item) => item.period === period)
     const opened = store.openDraft(profile.id, code, period)
+    bumpData()
     if (formInstance) {
       await formInstance.close()
     }
@@ -1338,12 +1373,14 @@ function App() {
   function saveDraft() {
     if (!formInstance || !draft) return
     setDraft(store.saveDraft(draft.id, valuesFromForm(formInstance)))
+    bumpData()
     if (askTemplate) showToast('Saved. (Template update prompt arrives with guided mode.)')
   }
 
   function updateDraftStatus(status: DraftStatus) {
     if (!draft) return
     setDraft(store.setDraftStatus(draft.id, status))
+    bumpData()
   }
 
   function closeForm() {
@@ -1360,6 +1397,7 @@ function App() {
     const entry = store.listLibrary(item.profileId).find((entry) => entry.formCode === item.formCode)
     if (!entry) return
     store.touchDraft(item.id)
+    bumpData()
     navTo({
       ...navNow,
       page: 'form',
@@ -1402,6 +1440,7 @@ function App() {
     }
     const copied = store.openDraft(profile.id, item.formCode, next)
     store.saveDraft(copied.id, { ...item.values })
+    bumpData()
     showToast(`${displayFormCode(item.formCode)} · ${periodLabel(next)} prefilled from ${periodLabel(item.period)}.`)
     navTo({
       ...navNow,
@@ -1945,7 +1984,7 @@ function App() {
 
   function filedRow(item: Draft, key: string, first: boolean) {
     const owner = profileById(item.profileId)
-    const inLibrary = owner ? store.listLibrary(item.profileId).some((entry) => entry.formCode === item.formCode) : false
+    const inLibrary = owner ? libraryByProfile.get(item.profileId)?.has(item.formCode) ?? false : false
     const code = displayFormCode(item.formCode)
     return (
       <Row key={key} first={first} testId={`filed-${item.id}`} onClick={once(() => openDraftById(item))}>
@@ -2154,7 +2193,7 @@ function App() {
   }
 
   /** .fields — two columns, gaps 16 × 32; a `full` cell takes its own row (one column when narrow). */
-  function fieldGrid(cells: GridCell[]) {
+  function fieldGrid(cells: GridCell[], available?: number) {
     const rows: ReactNode[][] = []
     let pending: ReactNode[] = []
     for (const cell of cells) {
@@ -2173,14 +2212,16 @@ function App() {
       }
     }
     if (pending.length) rows.push(pending)
+    // Pixel widths, not flex-grow: flex-sized text cells cost ~200ms per frame in GPUIX.
+    const cellFull = Math.max(200, available ?? contentWidth - 2 - 56)
+    const cellHalf = Math.floor((cellFull - 32) / 2)
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
         {rows.map((row, index) => (
           <div key={index} style={{ display: 'flex', gap: 32 }}>
             {row.map((node, cellIndex) => (
-              <div key={cellIndex} style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0 }}>{node}</div>
+              <div key={cellIndex} style={{ display: 'flex', flexDirection: 'column', width: row.length === 1 && rowIsFull(cells, node) ? cellFull : narrow ? cellFull : cellHalf }}>{node}</div>
             ))}
-            {row.length === 1 && !narrow && !rowIsFull(cells, row[0]) ? <div style={{ flexGrow: 1, flexBasis: 0 }} /> : null}
           </div>
         ))}
       </div>
@@ -2345,7 +2386,7 @@ function App() {
               <FieldInput key="name" label="Branch name" value={newBranch.name} placeholder="Cebu branch" onChange={(value) => setNewBranch((current) => ({ ...current, name: value }))} />,
               <FieldInput key="rdo" label="RDO" value={newBranch.rdo} placeholder="Same as head office" onChange={(value) => setNewBranch((current) => ({ ...current, rdo: value }))} />,
               <FieldInput key="zip" label="ZIP code" value={newBranch.zip} placeholder="Same as head office" onChange={(value) => setNewBranch((current) => ({ ...current, zip: value }))} />,
-            ])}
+            ], contentWidth - 2 - 32)}
             <FieldInput label="Registered address" value={newBranch.address} placeholder="Same as head office" onChange={(value) => setNewBranch((current) => ({ ...current, address: value }))} />
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
               <Btn small kind="ghost" onClick={once(() => setShowNewBranch(false))}>Cancel</Btn>
@@ -2495,7 +2536,7 @@ function App() {
             <FieldInput key="zip" label="ZIP code" value={newTaxpayer.zip} onChange={(value) => setNew('zip', value)} />,
             <FieldInput key="phone" label="Phone" value={newTaxpayer.phone} onChange={(value) => setNew('phone', value)} />,
             <FieldInput key="email" label="Email" value={newTaxpayer.email} onChange={(value) => setNew('email', value)} />,
-          ])}
+          ], contentWidth - 2 - 32)}
           <FieldInput label="Registered address" value={newTaxpayer.address} onChange={(value) => setNew('address', value)} />
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
             <Btn kind="ghost" onClick={once(() => setShowNewTaxpayer(false))}>Cancel</Btn>
@@ -2687,6 +2728,8 @@ function App() {
     const statusTone: ChipTone = status === 'draft' ? 'accent' : status === 'queued' ? 'plain' : 'success'
     const periodText = draft ? periodLabel(draft.period) : ''
     const showFor = (item: ModelItem) => showErrors || touched.has(item.id)
+    /** One scroller per window (GPUIX has no nested scrolling): the Parts column sizes to its content. */
+    const partsWidth = narrow ? contentWidth : contentWidth - 208 - 28
 
     function fieldValue(field: FieldSnapshot | null): string {
       return field ? String(editorValues[field.id] ?? '') : ''
@@ -2903,7 +2946,7 @@ function App() {
     )
 
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minHeight: 0 }}>
+      <div style={{ display: 'flex', flexDirection: 'column' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
           <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, paddingBottom: 4 }}>
@@ -2945,9 +2988,9 @@ function App() {
         {formLoading && <text style={{ color: t.fg3, fontSize: F_BODY, paddingBottom: 8 }}>Opening official form…</text>}
         {!schema && !formLoading && <text style={{ color: t.fg3, fontSize: F_BODY }}>This form's screen layout isn't available yet. Use Print preview to see the official sheet.</text>}
 
-        <div style={{ display: 'flex', flexDirection: narrow ? 'column' : 'row', gap: narrow ? 16 : 28, flexGrow: 1, minHeight: 0 }}>
+        <div style={{ display: 'flex', flexDirection: narrow ? 'column' : 'row', alignItems: 'flex-start', gap: narrow ? 16 : 28 }}>
           {partNav}
-          <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0, minHeight: 0, overflow: 'scroll', gap: 16, paddingBottom: 40 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', width: partsWidth, gap: 16 }}>
             {schemaParts.map((part, index) => {
               const open = !collapsedPartSet.has(String(index))
               return (
@@ -3210,6 +3253,7 @@ function App() {
     return settingsPage()
   }
 
+  if (process.env.EBIRFORMS_PERF) { perf.renders++; perf.ms += performance.now() - perfStart }
   return (
     <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', backgroundColor: t.bg, fontFamily: FONT, position: 'relative' }}>
       {titleBar()}
@@ -3232,8 +3276,10 @@ function App() {
             borderColor: t.border,
           }}
         >
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', flexGrow: 1, minHeight: 0, paddingTop: 28, paddingBottom: page === 'form' ? 0 : 56, paddingLeft: narrow ? 16 : 32, paddingRight: narrow ? 16 : 32, overflow: page === 'form' ? 'hidden' : 'scroll' }}>
-            <div style={{ display: 'flex', flexDirection: 'column', width: '100%', maxWidth: page === 'form' || page === 'library' ? 1120 : 880, flexShrink: 0, flexGrow: page === 'form' ? 1 : 0, minHeight: page === 'form' ? 0 : undefined }}>
+          <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minHeight: 0, paddingTop: 28, paddingBottom: 56, paddingLeft: sidePad, paddingRight: sidePad, overflow: 'scroll' }}>
+            {/* A definite width matters: an auto-width column made Taffy re-measure every text
+                each frame (Profile 250ms frames → 30ms with a pixel width). */}
+            <div style={{ display: 'flex', flexDirection: 'column', flexShrink: 0, width: contentWidth }}>
               {mainContent()}
             </div>
           </div>
