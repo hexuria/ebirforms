@@ -13,14 +13,55 @@ export interface ParsedTin {
 export interface CreateProfileInput {
   tin: string
   branch?: string
+  branchName?: string
   year: number
   registeredName?: string
+  taxpayerType?: TaxpayerType
+  birthDate?: string | null
   rdo?: string
   address?: string
   zip?: string
-  lineOfBusiness?: string
   email?: string
   phone?: string
+}
+
+export type TaxpayerType = 'individual' | 'non-individual'
+
+export interface TaxpayerFacts {
+  name: string
+  type: TaxpayerType
+  birthDate: string | null
+}
+
+export interface BranchFacts {
+  rdo: string
+  zip: string
+  address: string
+  phone: string
+  email: string
+}
+
+export type BranchFactOverrides = {
+  [K in keyof BranchFacts]?: string | null
+}
+
+export interface ResolvedBranchFacts extends BranchFacts {
+  inherited: Record<keyof BranchFacts, boolean>
+}
+
+export interface CreateTaxpayerInput extends TaxpayerFacts {
+  tin: string
+  rdo?: string
+  zip?: string
+  address?: string
+  phone?: string
+  email?: string
+}
+
+export interface CreateBranchInput extends BranchFactOverrides {
+  tin9: string
+  code: string
+  name: string
 }
 
 export interface Profile {
@@ -32,15 +73,21 @@ export interface Profile {
   rdo: string
   address: string
   zip: string
-  lineOfBusiness: string
   email: string
   phone: string
 }
 
 export interface TaxpayerTree {
   tin9: string
+  name: string
+  type: TaxpayerType
+  birthDate: string | null
   branches: Array<{
+    id: string
     code: string
+    name: string
+    overrides: BranchFactOverrides
+    facts: ResolvedBranchFacts
     years: Profile[]
   }>
 }
@@ -51,6 +98,19 @@ export interface LibraryEntry {
   label: string
   printable: string | null
   addedAt: number
+}
+
+export type DraftValues = Record<string, string | boolean>
+
+export interface Draft {
+  id: string
+  profileId: string
+  formCode: string
+  period: string
+  values: DraftValues
+  status: 'draft' | 'queued' | 'submitted' | 'confirmed' | 'paid'
+  createdAt: number
+  updatedAt: number
 }
 
 export function parseTin(input: string): ParsedTin {
@@ -165,6 +225,94 @@ function migrate(db: Database): void {
       db.exec('CREATE INDEX jobs_due_order ON jobs (state, created_at, id)')
       db.exec('PRAGMA user_version = 2')
     }
+    if (version < 3) {
+      db.exec(`
+        ALTER TABLE taxpayers ADD COLUMN name TEXT NOT NULL DEFAULT '';
+        ALTER TABLE taxpayers ADD COLUMN type TEXT NOT NULL DEFAULT 'individual'
+          CHECK (type IN ('individual', 'non-individual'));
+        ALTER TABLE taxpayers ADD COLUMN birth_date TEXT;
+
+        ALTER TABLE branches ADD COLUMN name TEXT NOT NULL DEFAULT '';
+        ALTER TABLE branches ADD COLUMN rdo TEXT;
+        ALTER TABLE branches ADD COLUMN zip TEXT;
+        ALTER TABLE branches ADD COLUMN address TEXT;
+        ALTER TABLE branches ADD COLUMN phone TEXT;
+        ALTER TABLE branches ADD COLUMN email TEXT;
+
+        UPDATE taxpayers
+        SET name = COALESCE((
+          SELECT registered_name
+          FROM profiles
+          WHERE profiles.tin9 = taxpayers.tin9
+          ORDER BY (profiles.branch = '00000') DESC, profiles.year DESC
+          LIMIT 1
+        ), '');
+
+        UPDATE branches
+        SET
+          name = CASE WHEN code = '00000' THEN 'Head office' ELSE 'Branch ' || code END,
+          rdo = (
+            SELECT rdo FROM profiles
+            WHERE profiles.tin9 = branches.tin9 AND profiles.branch = branches.code
+            ORDER BY profiles.year DESC LIMIT 1
+          ),
+          zip = (
+            SELECT zip FROM profiles
+            WHERE profiles.tin9 = branches.tin9 AND profiles.branch = branches.code
+            ORDER BY profiles.year DESC LIMIT 1
+          ),
+          address = (
+            SELECT address FROM profiles
+            WHERE profiles.tin9 = branches.tin9 AND profiles.branch = branches.code
+            ORDER BY profiles.year DESC LIMIT 1
+          ),
+          phone = (
+            SELECT phone FROM profiles
+            WHERE profiles.tin9 = branches.tin9 AND profiles.branch = branches.code
+            ORDER BY profiles.year DESC LIMIT 1
+          ),
+          email = (
+            SELECT email FROM profiles
+            WHERE profiles.tin9 = branches.tin9 AND profiles.branch = branches.code
+            ORDER BY profiles.year DESC LIMIT 1
+          );
+
+        CREATE TABLE drafts (
+          id TEXT PRIMARY KEY,
+          profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+          form_code TEXT NOT NULL,
+          period TEXT NOT NULL CHECK (
+            period GLOB '[0-9][0-9][0-9][0-9]'
+            OR period GLOB '[0-9][0-9][0-9][0-9]-Q[1-4]'
+            OR (
+              period GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]'
+              AND substr(period, 6, 2) BETWEEN '01' AND '12'
+            )
+          ),
+          "values" JSON NOT NULL,
+          status TEXT NOT NULL CHECK (
+            status IN ('draft', 'queued', 'submitted', 'confirmed', 'paid')
+          ),
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          UNIQUE (profile_id, form_code, period)
+        )
+      `)
+      db.exec('CREATE INDEX drafts_profile_updated ON drafts (profile_id, updated_at)')
+      db.exec('PRAGMA user_version = 3')
+    }
+
+    if (version < 4) {
+      // v4: key/value settings for the desktop shell (display name, email,
+      // theme, sidebar prefs, last-read-notifications watermark, backups).
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS settings (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        )
+      `)
+      db.exec('PRAGMA user_version = 4')
+    }
   })
   migration()
 }
@@ -188,6 +336,189 @@ export class Store {
     }
   }
 
+  createTaxpayer(input: CreateTaxpayerInput): TaxpayerTree {
+    return this.withErrorLogging('createTaxpayer', () => {
+      const parsed = parseTin(input.tin)
+      if (parsed.branch !== '00000') {
+        throw new Error('Enter the taxpayer TIN without a branch code.')
+      }
+      if (!input.name.trim()) {
+        throw new Error('Enter a taxpayer name.')
+      }
+      if (input.type !== 'individual' && input.type !== 'non-individual') {
+        throw new Error('Choose an individual or non-individual taxpayer type.')
+      }
+      const facts = {
+        rdo: input.rdo ?? '',
+        zip: input.zip ?? '',
+        address: input.address ?? '',
+        phone: input.phone ?? '',
+        email: input.email ?? '',
+      }
+      const create = this.db.transaction(() => {
+        this.db
+          .query('INSERT INTO taxpayers (tin9, name, type, birth_date) VALUES (?, ?, ?, ?)')
+          .run(parsed.tin9, input.name.trim(), input.type, input.birthDate ?? null)
+        this.db
+          .query(`
+            INSERT INTO branches (tin9, code, name, rdo, zip, address, phone, email)
+            VALUES (?, '00000', 'Head office', ?, ?, ?, ?, ?)
+          `)
+          .run(
+            parsed.tin9,
+            facts.rdo,
+            facts.zip,
+            facts.address,
+            facts.phone,
+            facts.email,
+          )
+      })
+      try {
+        create()
+      } catch (error) {
+        if (errorMessage(error).includes('UNIQUE constraint failed: taxpayers.tin9')) {
+          throw new Error(`A taxpayer with TIN ${parsed.tin9} already exists.`)
+        }
+        throw error
+      }
+      this.logger.log('info', 'store', 'Taxpayer created', { tin9: parsed.tin9 })
+      return this.listTaxpayers().find((taxpayer) => taxpayer.tin9 === parsed.tin9)!
+    })
+  }
+
+  updateTaxpayer(tin: string, facts: Partial<TaxpayerFacts>): void {
+    this.withErrorLogging('updateTaxpayer', () => {
+      const { tin9, branch } = parseTin(tin)
+      if (branch !== '00000') {
+        throw new Error('Taxpayer updates require the 9-digit TIN.')
+      }
+      if (facts.type !== undefined && facts.type !== 'individual' && facts.type !== 'non-individual') {
+        throw new Error('Choose an individual or non-individual taxpayer type.')
+      }
+      if (facts.name !== undefined && !facts.name.trim()) {
+        throw new Error('Enter a taxpayer name.')
+      }
+      const current = this.db
+        .query('SELECT name, type, birth_date AS birthDate FROM taxpayers WHERE tin9 = ?')
+        .get(tin9) as TaxpayerFacts | null
+      if (!current) {
+        throw new Error(`Taxpayer not found: ${tin9}.`)
+      }
+      const result = this.db
+        .query('UPDATE taxpayers SET name = ?, type = ?, birth_date = ? WHERE tin9 = ?')
+        .run(
+          facts.name?.trim() ?? current.name,
+          facts.type ?? current.type,
+          facts.birthDate === undefined ? current.birthDate : facts.birthDate,
+          tin9,
+        )
+      if (!result.changes) {
+        throw new Error(`Taxpayer not found: ${tin9}.`)
+      }
+      this.logger.log('info', 'store', 'Taxpayer facts updated', { tin9 })
+    })
+  }
+
+  createBranch(input: CreateBranchInput): TaxpayerTree['branches'][number] {
+    return this.withErrorLogging('createBranch', () => {
+      const parsed = parseTin(input.tin9)
+      if (parsed.branch !== '00000' || !/^\d{9}$/.test(parsed.tin9)) {
+        throw new Error('Enter a 9-digit taxpayer TIN.')
+      }
+      if (!/^\d{5}$/.test(input.code) || input.code === '00000') {
+        throw new Error('Branch code must be a non-head-office 5-digit code.')
+      }
+      if (!input.name.trim()) {
+        throw new Error('Enter a branch name.')
+      }
+      const values = (['rdo', 'zip', 'address', 'phone', 'email'] as const).map((key) => {
+        const value = input[key]
+        return typeof value === 'string' && value.trim() ? value.trim() : null
+      })
+      try {
+        this.db
+          .query(`
+            INSERT INTO branches (tin9, code, name, rdo, zip, address, phone, email)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `)
+          .run(parsed.tin9, input.code, input.name.trim(), ...values)
+      } catch (error) {
+        if (errorMessage(error).includes('UNIQUE constraint failed: branches.tin9')) {
+          throw new Error(`Branch ${input.code} already exists for TIN ${parsed.tin9}.`)
+        }
+        throw error
+      }
+      this.logger.log('info', 'store', 'Branch created', { tin9: parsed.tin9, branch: input.code })
+      return this.listTaxpayers()
+        .find((taxpayer) => taxpayer.tin9 === parsed.tin9)!
+        .branches.find((branch) => branch.code === input.code)!
+    })
+  }
+
+  updateBranch(branchId: string, input: { name?: string } & BranchFactOverrides): void {
+    this.withErrorLogging('updateBranch', () => {
+      const { tin9, branch: code } = parseTin(branchId)
+      const current = this.db
+        .query('SELECT name, rdo, zip, address, phone, email FROM branches WHERE tin9 = ? AND code = ?')
+        .get(tin9, code) as
+        | ({ name: string } & { [K in keyof BranchFacts]: string | null })
+        | null
+      if (!current) {
+        throw new Error(`Branch not found: ${branchId}.`)
+      }
+      const value = (key: keyof BranchFacts) => {
+        const next = input[key] === undefined ? current[key] : input[key]
+        if (code !== '00000') {
+          return typeof next === 'string' && next.trim() ? next.trim() : null
+        }
+        return typeof next === 'string' ? next.trim() : ''
+      }
+      const result = this.db
+        .query(`
+          UPDATE branches SET name = ?, rdo = ?, zip = ?, address = ?, phone = ?, email = ?
+          WHERE tin9 = ? AND code = ?
+        `)
+        .run(
+          input.name?.trim() || current.name,
+          value('rdo'),
+          value('zip'),
+          value('address'),
+          value('phone'),
+          value('email'),
+          tin9,
+          code,
+        )
+      if (!result.changes) {
+        throw new Error(`Branch not found: ${branchId}.`)
+      }
+      this.logger.log('info', 'store', 'Branch facts updated', { tin9, branch: code })
+    })
+  }
+
+  resolveBranchFacts(branchId: string): ResolvedBranchFacts {
+    return this.withErrorLogging('resolveBranchFacts', () => {
+      const { tin9, branch: code } = parseTin(branchId)
+      const branch = this.db
+        .query('SELECT rdo, zip, address, phone, email FROM branches WHERE tin9 = ? AND code = ?')
+        .get(tin9, code) as BranchFactOverrides | null
+      if (!branch) {
+        throw new Error(`Branch not found: ${branchId}.`)
+      }
+      const head = code === '00000'
+        ? branch
+        : (this.db
+            .query('SELECT rdo, zip, address, phone, email FROM branches WHERE tin9 = ? AND code = ?')
+            .get(tin9, '00000') as BranchFactOverrides | null) ?? {}
+      const inherited = {} as Record<keyof BranchFacts, boolean>
+      const facts = {} as BranchFacts
+      for (const key of ['rdo', 'zip', 'address', 'phone', 'email'] as const) {
+        inherited[key] = code !== '00000' && branch[key] == null
+        facts[key] = branch[key] ?? head[key] ?? ''
+      }
+      return { ...facts, inherited }
+    })
+  }
+
   createProfile(input: CreateProfileInput): Profile {
     return this.withErrorLogging('createProfile', () => {
       const parsedTin = parseTin(input.tin)
@@ -199,24 +530,58 @@ export class Store {
         throw new Error('Enter a valid tax year.')
       }
 
-      const profile: Profile = {
-        id: randomUUID(),
-        tin9: parsedTin.tin9,
-        branch,
-        year: input.year,
-        registeredName: input.registeredName ?? '',
-        rdo: input.rdo ?? '',
-        address: input.address ?? '',
-        zip: input.zip ?? '',
-        lineOfBusiness: input.lineOfBusiness ?? '',
-        email: input.email ?? '',
-        phone: input.phone ?? '',
-      }
-      const insert = this.db.transaction(() => {
-        this.db.query('INSERT OR IGNORE INTO taxpayers (tin9) VALUES (?)').run(profile.tin9)
+      const profileId = randomUUID()
+      const create = this.db.transaction(() => {
         this.db
-          .query('INSERT OR IGNORE INTO branches (tin9, code) VALUES (?, ?)')
-          .run(profile.tin9, profile.branch)
+          .query('INSERT OR IGNORE INTO taxpayers (tin9) VALUES (?)')
+          .run(parsedTin.tin9)
+        if (input.registeredName?.trim()) {
+          this.db
+            .query('UPDATE taxpayers SET name = ? WHERE tin9 = ?')
+            .run(input.registeredName.trim(), parsedTin.tin9)
+        }
+        if (input.taxpayerType) {
+          this.db
+            .query('UPDATE taxpayers SET type = ? WHERE tin9 = ?')
+            .run(input.taxpayerType, parsedTin.tin9)
+        }
+        if (input.birthDate !== undefined) {
+          this.db
+            .query('UPDATE taxpayers SET birth_date = ? WHERE tin9 = ?')
+            .run(input.birthDate, parsedTin.tin9)
+        }
+        this.db
+          .query(`
+            INSERT OR IGNORE INTO branches (tin9, code, name)
+            VALUES (?, '00000', 'Head office')
+          `)
+          .run(parsedTin.tin9)
+        const defaultBranchName = branch === '00000' ? 'Head office' : `Branch ${branch}`
+        this.db
+          .query(`
+            INSERT OR IGNORE INTO branches (tin9, code, name)
+            VALUES (?, ?, ?)
+          `)
+          .run(parsedTin.tin9, branch, input.branchName?.trim() || defaultBranchName)
+        if (input.branchName?.trim()) {
+          this.db
+            .query('UPDATE branches SET name = ? WHERE tin9 = ? AND code = ?')
+            .run(input.branchName.trim(), parsedTin.tin9, branch)
+        }
+        for (const key of ['rdo', 'zip', 'address', 'phone', 'email'] as const) {
+          const value = input[key]
+          if (value !== undefined) {
+            const stored =
+              branch !== '00000' && !value.trim() ? null : value.trim()
+            this.db
+              .query(`UPDATE branches SET ${key} = ? WHERE tin9 = ? AND code = ?`)
+              .run(stored, parsedTin.tin9, branch)
+          } else if (branch === '00000') {
+            this.db
+              .query(`UPDATE branches SET ${key} = '' WHERE tin9 = ? AND code = ? AND ${key} IS NULL`)
+              .run(parsedTin.tin9, branch)
+          }
+        }
         this.db
           .query(`
             INSERT INTO profiles (
@@ -225,37 +590,41 @@ export class Store {
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `)
           .run(
-            profile.id,
-            profile.tin9,
-            profile.branch,
-            profile.year,
-            profile.registeredName,
-            profile.rdo,
-            profile.address,
-            profile.zip,
-            profile.lineOfBusiness,
-            profile.email,
-            profile.phone,
+            profileId,
+            parsedTin.tin9,
+            branch,
+            input.year,
+            input.registeredName ?? '',
+            input.rdo ?? '',
+            input.address ?? '',
+            input.zip ?? '',
+            '',
+            input.email ?? '',
+            input.phone ?? '',
           )
-        return profile
       })
-
       try {
-        const created = insert()
-        this.logger.log('info', 'store', 'Profile created', {
-          profileId: created.id,
-          branch: created.branch,
-          year: created.year,
-        })
-        return created
+        create()
       } catch (error) {
         if (errorMessage(error).includes('UNIQUE constraint failed: profiles.tin9')) {
           throw new Error(
-            `A profile already exists for TIN ${profile.tin9}, branch ${profile.branch}, and year ${profile.year}.`,
+            `A profile already exists for TIN ${parsedTin.tin9}, branch ${branch}, and year ${input.year}.`,
           )
         }
         throw error
       }
+      const profile = this.listTaxpayers()
+        .flatMap((taxpayer) => taxpayer.branches.flatMap((item) => item.years))
+        .find((item) => item.id === profileId)
+      if (!profile) {
+        throw new Error(`Could not load created profile ${profileId}.`)
+      }
+      this.logger.log('info', 'store', 'Profile created', {
+        profileId,
+        branch,
+        year: input.year,
+      })
+      return profile
     })
   }
 
@@ -265,54 +634,83 @@ export class Store {
         .query(`
           SELECT
             t.tin9,
-            b.code AS branch,
+            t.name,
+            t.type,
+            t.birth_date AS birthDate,
+            b.code,
+            b.name AS branchName,
+            b.rdo,
+            b.zip,
+            b.address,
+            b.phone,
+            b.email,
             p.id,
-            p.year,
-            p.registered_name AS registeredName,
-            p.rdo,
-            p.address,
-            p.zip,
-            p.line_of_business AS lineOfBusiness,
-            p.email,
-            p.phone
+            p.year
           FROM taxpayers t
           JOIN branches b ON b.tin9 = t.tin9
           LEFT JOIN profiles p ON p.tin9 = b.tin9 AND p.branch = b.code
           ORDER BY t.tin9, b.code, p.year
         `)
-        .all() as Array<
-        Omit<Profile, 'id' | 'branch' | 'year'> & {
-          tin9: string
-          branch: string
-          id: string | null
-          year: number | null
-        }
-      >
+        .all() as Array<{
+        tin9: string
+        name: string
+        type: TaxpayerType
+        birthDate: string | null
+        code: string
+        branchName: string
+        rdo: string | null
+        zip: string | null
+        address: string | null
+        phone: string | null
+        email: string | null
+        id: string | null
+        year: number | null
+      }>
       const taxpayers = new Map<string, TaxpayerTree>()
       for (const row of rows) {
         let taxpayer = taxpayers.get(row.tin9)
         if (!taxpayer) {
-          taxpayer = { tin9: row.tin9, branches: [] }
+          taxpayer = {
+            tin9: row.tin9,
+            name: row.name,
+            type: row.type,
+            birthDate: row.birthDate,
+            branches: [],
+          }
           taxpayers.set(row.tin9, taxpayer)
         }
-        let branch = taxpayer.branches.find((item) => item.code === row.branch)
+        let branch = taxpayer.branches.find((item) => item.code === row.code)
         if (!branch) {
-          branch = { code: row.branch, years: [] }
+          const id = `${row.tin9}${row.code}`
+          const facts = this.resolveBranchFacts(id)
+          branch = {
+            id,
+            code: row.code,
+            name: row.branchName,
+            overrides: {
+              rdo: row.rdo,
+              zip: row.zip,
+              address: row.address,
+              phone: row.phone,
+              email: row.email,
+            },
+            facts,
+            years: [],
+          }
           taxpayer.branches.push(branch)
         }
         if (row.id !== null && row.year !== null) {
           branch.years.push({
             id: row.id,
             tin9: row.tin9,
-            branch: row.branch,
+            branch: row.code,
             year: row.year,
-            registeredName: row.registeredName,
-            rdo: row.rdo,
-            address: row.address,
-            zip: row.zip,
-            lineOfBusiness: row.lineOfBusiness,
-            email: row.email,
-            phone: row.phone,
+            registeredName: taxpayer.name,
+            rdo: branch.facts.rdo,
+            address: branch.facts.address,
+            zip: branch.facts.zip,
+            email: branch.facts.email,
+            phone: branch.facts.phone,
           })
         }
       }
@@ -373,6 +771,211 @@ export class Store {
           addedAt,
         }
       })
+    })
+  }
+
+  openDraft(profileId: string, formCode: string, period: string): Draft {
+    return this.withErrorLogging('openDraft', () => {
+      const monthly = /^\d{4}-(0[1-9]|1[0-2])$/.test(period)
+      const quarterly = /^\d{4}-Q[1-4]$/.test(period)
+      const annual = /^\d{4}$/.test(period)
+      if (!monthly && !quarterly && !annual) {
+        throw new Error('Enter a valid period as YYYY-MM, YYYY-Qn, or YYYY.')
+      }
+      const open = this.db.transaction(() => {
+        const row = this.db
+          .query(`
+            SELECT id, profile_id AS profileId, form_code AS formCode, period,
+              "values" AS valuesJson, status, created_at AS createdAt, updated_at AS updatedAt
+            FROM drafts WHERE profile_id = ? AND form_code = ? AND period = ?
+          `)
+          .get(profileId, formCode, period) as
+          | (Omit<Draft, 'values'> & { valuesJson: string })
+          | null
+        if (row) {
+          const { valuesJson, ...draft } = row
+          return { ...draft, values: JSON.parse(valuesJson) as DraftValues }
+        }
+        const now = Date.now()
+        const draft: Draft = {
+          id: randomUUID(),
+          profileId,
+          formCode,
+          period,
+          values: {},
+          status: 'draft',
+          createdAt: now,
+          updatedAt: now,
+        }
+        this.db
+          .query(`
+            INSERT INTO drafts (
+              id, profile_id, form_code, period, "values", status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `)
+          .run(
+            draft.id,
+            profileId,
+            formCode,
+            period,
+            JSON.stringify(draft.values),
+            draft.status,
+            now,
+            now,
+          )
+        return draft
+      })
+      const draft = open()
+      if (draft.createdAt === draft.updatedAt && Object.keys(draft.values).length === 0) {
+        this.logger.log('info', 'store', 'Draft opened', {
+          draftId: draft.id,
+          formCode,
+          period,
+        })
+      }
+      return draft
+    })
+  }
+
+  saveDraft(id: string, values: DraftValues): Draft {
+    return this.withErrorLogging('saveDraft', () => {
+      const current = this.db
+        .query('SELECT updated_at AS updatedAt FROM drafts WHERE id = ?')
+        .get(id) as { updatedAt: number } | null
+      if (!current) {
+        throw new Error(`Draft not found: ${id}.`)
+      }
+      const updatedAt = Math.max(Date.now(), current.updatedAt + 1)
+      const result = this.db
+        .query('UPDATE drafts SET "values" = ?, updated_at = ? WHERE id = ?')
+        .run(JSON.stringify(values), updatedAt, id)
+      if (!result.changes) {
+        throw new Error(`Draft not found: ${id}.`)
+      }
+      this.logger.log('info', 'store', 'Draft saved', { draftId: id })
+      return this.getDraft(id)!
+    })
+  }
+
+  setDraftStatus(id: string, status: Draft['status']): Draft {
+    return this.withErrorLogging('setDraftStatus', () => {
+      if (!['draft', 'queued', 'submitted', 'confirmed', 'paid'].includes(status)) {
+        throw new Error(`Invalid draft status: ${status}.`)
+      }
+      const current = this.db
+        .query('SELECT updated_at AS updatedAt FROM drafts WHERE id = ?')
+        .get(id) as { updatedAt: number } | null
+      if (!current) {
+        throw new Error(`Draft not found: ${id}.`)
+      }
+      this.db
+        .query('UPDATE drafts SET status = ?, updated_at = ? WHERE id = ?')
+        .run(status, Math.max(Date.now(), current.updatedAt + 1), id)
+      this.logger.log('info', 'store', 'Draft status changed', { draftId: id, status })
+      return this.getDraft(id)!
+    })
+  }
+
+  listDrafts(profileId: string, formCode?: string): Draft[] {
+    return this.withErrorLogging('listDrafts', () => {
+      const rows = formCode
+        ? this.db
+            .query(
+              'SELECT id, profile_id AS profileId, form_code AS formCode, period, "values" AS valuesJson, status, created_at AS createdAt, updated_at AS updatedAt FROM drafts WHERE profile_id = ? AND form_code = ? ORDER BY updated_at DESC, created_at DESC, rowid DESC',
+            )
+            .all(profileId, formCode)
+        : this.db
+            .query(
+              'SELECT id, profile_id AS profileId, form_code AS formCode, period, "values" AS valuesJson, status, created_at AS createdAt, updated_at AS updatedAt FROM drafts WHERE profile_id = ? ORDER BY updated_at DESC, created_at DESC, rowid DESC',
+            )
+            .all(profileId)
+      return (rows as Array<Omit<Draft, 'values'> & { valuesJson: string }>).map(
+        ({ valuesJson, ...row }) => ({
+          ...row,
+          values: JSON.parse(valuesJson) as DraftValues,
+        }),
+      )
+    })
+  }
+
+  /** Drafts across every taxpayer, most recently touched first. */
+  listRecentDrafts(limit = 8): Draft[] {
+    return this.withErrorLogging('listRecentDrafts', () => {
+      const rows = this.db
+        .query(
+          'SELECT id, profile_id AS profileId, form_code AS formCode, period, "values" AS valuesJson, status, created_at AS createdAt, updated_at AS updatedAt FROM drafts ORDER BY updated_at DESC, created_at DESC, rowid DESC LIMIT ?',
+        )
+        .all(limit)
+      return (rows as Array<Omit<Draft, 'values'> & { valuesJson: string }>).map(
+        ({ valuesJson, ...row }) => ({
+          ...row,
+          values: JSON.parse(valuesJson) as DraftValues,
+        }),
+      )
+    })
+  }
+
+  /** Drafts already filed: queued, submitted, confirmed or paid. */
+  listFiledDrafts(): Draft[] {
+    return this.withErrorLogging('listFiledDrafts', () => {
+      const rows = this.db
+        .query(
+          `SELECT id, profile_id AS profileId, form_code AS formCode, period, "values" AS valuesJson, status, created_at AS createdAt, updated_at AS updatedAt FROM drafts WHERE status IN ('queued', 'submitted', 'confirmed', 'paid') ORDER BY updated_at DESC, created_at DESC, rowid DESC`,
+        )
+        .all()
+      return (rows as Array<Omit<Draft, 'values'> & { valuesJson: string }>).map(
+        ({ valuesJson, ...row }) => ({
+          ...row,
+          values: JSON.parse(valuesJson) as DraftValues,
+        }),
+      )
+    })
+  }
+
+  /** Bump updated_at without touching values/status (recent-returns list). */
+  touchDraft(id: string): Draft {
+    return this.withErrorLogging('touchDraft', () => {
+      const result = this.db
+        .query(
+          'UPDATE drafts SET updated_at = MAX((SELECT MAX(updated_at) FROM drafts) + 1, ?) WHERE id = ?',
+        )
+        .run(Date.now(), id)
+      if (!result.changes) {
+        throw new Error(`Draft not found: ${id}.`)
+      }
+      return this.getDraft(id)!
+    })
+  }
+
+  getSetting(key: string): string | null {
+    return this.withErrorLogging('getSetting', () => {
+      const row = this.db
+        .query('SELECT value FROM settings WHERE key = ?')
+        .get(key) as { value: string } | null
+      return row?.value ?? null
+    })
+  }
+
+  setSetting(key: string, value: string): void {
+    return this.withErrorLogging('setSetting', () => {
+      this.db
+        .query(
+          'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+        )
+        .run(key, value)
+    })
+  }
+
+  getDraft(id: string): Draft | null {
+    return this.withErrorLogging('getDraft', () => {
+      const row = this.db
+        .query(
+          'SELECT id, profile_id AS profileId, form_code AS formCode, period, "values" AS valuesJson, status, created_at AS createdAt, updated_at AS updatedAt FROM drafts WHERE id = ?',
+        )
+        .get(id) as (Omit<Draft, 'values'> & { valuesJson: string }) | null
+      if (!row) return null
+      const { valuesJson, ...draft } = row
+      return { ...draft, values: JSON.parse(valuesJson) as DraftValues }
     })
   }
 

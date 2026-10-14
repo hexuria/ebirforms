@@ -7,6 +7,56 @@ export interface CatalogEntry {
   label: string
   htaFile: string
   printable: string | null
+  frequency: ReturnFrequency
+}
+
+export type ReturnFrequency = 'monthly' | 'quarterly' | 'annual'
+
+const frequencyOverrides: Record<string, ReturnFrequency> = {
+  '0605': 'annual',
+  '0619E': 'monthly',
+  '1601C': 'monthly',
+  '1601Cv2018': 'monthly',
+  '2551Q': 'quarterly',
+  '2551Qv2018': 'quarterly',
+  '1600WP': 'monthly',
+  '1606': 'annual',
+  '1704': 'annual',
+  '1706': 'annual',
+  '1707': 'annual',
+  '1707v2018': 'annual',
+  '1707v2021': 'annual',
+  '1800': 'annual',
+  '1800v2018': 'annual',
+  '1801': 'annual',
+  '1801v2018': 'annual',
+  '2000': 'monthly',
+  '2000OT': 'annual',
+  '2000OTv2018': 'annual',
+  '2200A': 'monthly',
+  '2200Av2020': 'monthly',
+  '2200AN': 'monthly',
+  '2200ANv2018': 'monthly',
+  '2200Cv2018': 'monthly',
+  '2200M': 'monthly',
+  '2200Mv2018': 'monthly',
+  '2200P': 'monthly',
+  '2200Pv2020': 'monthly',
+  '2200S': 'monthly',
+  '2200T': 'monthly',
+  '2200Tv2020': 'monthly',
+  '2552': 'monthly',
+  '2552v2018': 'monthly',
+  '2553': 'monthly',
+}
+
+function returnFrequency(code: string, label: string): ReturnFrequency {
+  const override = frequencyOverrides[code]
+  if (override) return override
+  if (/\bmonthly\b/i.test(label)) return 'monthly'
+  if (/\bquarterly\b/i.test(label)) return 'quarterly'
+  if (/\bannual\b/i.test(label)) return 'annual'
+  throw new Error(`No filing frequency is defined for ${code}: ${label}`)
 }
 
 export const printableSlugByCode: Record<string, string> = {
@@ -96,6 +146,7 @@ export function loadCatalog(
           label: option.textContent?.trim() ?? '',
           htaFile: join('forms', `BIR-Form${option.value}.hta`),
           printable: printable && existsSync(printable) ? printable : null,
+          frequency: returnFrequency(option.value, option.textContent?.trim() ?? ''),
         }
       })
   } finally {

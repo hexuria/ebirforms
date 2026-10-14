@@ -38,16 +38,17 @@ vendor/             submodules (official package, frozen HTML)
 ### Domain model
 
 ```
-Taxpayer      tin9 (999-999-999, check digit validated like the official profile)
- +- Branch    branch code, 5 digits, default "00000"
-     +- TaxYearProfile   year + registered name, RDO, address, ZIP, line of business,
-         |               contact, email (the official profile fields, per year)
-         +- Library      only the forms the user picked for that year
-             +- Draft    one return: form code, period, field values, status
+Taxpayer      TIN, registered name, type, birth date
+ +- Branch    branch code, name, RDO, address, ZIP, phone, email
+     +- TaxYearProfile   year; owns the selected form library
+         +- Draft        one return per form and period, with field values/status
 ```
 
-A TIN can have many branches; each branch can have many tax years; a form only
-appears in a year's library after the user picks it.
+A TIN can have many branches; branch facts inherit field-by-field from branch
+`00000` until overridden. Each branch can have many tax years; a form only
+appears in a year's library after the user picks it. Draft periods are
+`YYYY-MM`, `YYYY-Qn`, or `YYYY`, and the unique key is
+`(profile_id, form_code, period)`.
 
 ### Official runtime engine (requirements 5, 9 and parity)
 
@@ -117,30 +118,50 @@ dialog from a Print button.
 
 Status: `[ ]` todo, `[~]` in progress, `[x]` done (gate passed).
 
-- [x] **P0 Bootstrap.** ([PR #3](https://github.com/hexuria/ebirforms/pull/3): CI green on Windows/Ubuntu/macOS, window verified on Windows.) Bun workspace, submodules, idempotent
+- [x] **P0 Bootstrap.** ([PR #3](https://github.com/hexuria/ebirforms/pull/3)) Bun workspace, submodules, idempotent
   `scripts/setup-*`, CI on Windows/Linux/macOS (typecheck + `bun test`), app
   window with an empty shell.
   *Gate:* CI green; window opens on Windows (screenshot).
-- [~] **P1 Reverse-engineering inventory.** ([PR #4](https://github.com/hexuria/ebirforms/pull/4): runtime + 79-form catalog + 1601C/2551Q/0619E parity with documented `knownDifferences`.) Confirm the latest version on
+- [x] **P1 Reverse-engineering inventory.** ([PR #4](https://github.com/hexuria/ebirforms/pull/4)) Confirm the latest version on
   bir.gov.ph with REA; REA JS analysis of the package; generated form catalog
   (79 active forms in the official `formType` list, 43 with printable sheets) and
   per-form field models taken from the official `frmMain.elements`
   serialization order (ids, types, maxlength, options, item labels).
-  *Gate:* serializable field sets match
-  `buwiz-forms/rules/forms/*/fields.json` for 1601C, 2551Q, 0619E. Spike:
-  0619E matches 59/59; 1601C differs on `txtRDOCode` and 2551Q is off by one,
-  both still to explain from each form's own `saveXML`. REA evidence
-  committed.
-- [~] **P2 Profiles and library.** ([PR #5](https://github.com/hexuria/ebirforms/pull/5)) Taxpayer, branch, tax year, form picker,
+  *Gate:* 79 active forms, printable mappings, and documented
+  rules-vs-official `knownDifferences` verified against each HTA.
+- [x] **P2 Profiles and library.** ([PR #5](https://github.com/hexuria/ebirforms/pull/5)) Taxpayer, branch, tax year, form picker,
   library, SQLite store, logger, job queue.
   *Gate:* unit tests; UI walkthrough creating `123-456-788` branches `00000`
   and `00002` with different years and different libraries.
-- [~] **P3 Validation engine.** ([PR #6](https://github.com/hexuria/ebirforms/pull/6)) Sandbox, guard extraction, inline errors with
+- [x] **P3 Validation engine.** ([PR #6](https://github.com/hexuria/ebirforms/pull/6)) Sandbox, guard extraction, inline errors with
   reserved lines.
   *Gate:* parity oracle passes for 1601C, 2551Q, 0619E; GPUIX automation test
   proves no layout shift when errors appear.
-- [ ] **P4 Form editor.** Generated editor for the first forms (1601C, 2551Q,
-  0619E) bound to the official runtime instance, drafts.
+- [~] **P4 Form editor.** Branch-owned taxpayer facts, period-aware selected
+  form library, and generated editors for the first forms (1601C, 2551Q,
+  0619E) bound to the official runtime instance. App shell rebuilt to the
+  `buwiz-ui-redesign` design system (DESIGN_SYSTEM.md + shell-prototype.html):
+  fg/bg/surface/hover/selected/border tokens in light, dark and system
+  (persisted in the settings kv); Windows chrome `[sidebar][back][fwd]` +
+  centered taxpayer ContextPill + `[bell][theme][captions]`, macOS reserves
+  the traffic-light pad and drops captions. Sidebar: search field +
+  start-a-return `+`, Home/Calendar/Filings nav, Recent returns (toggleable),
+  Settings, user card. Right panel: taxpayer card (profile facts, branches,
+  switch taxpayer) and notifications derived from real data (due ≤14d,
+  filed, dead jobs) with persisted last-read. Views: Home due/fed rows from
+  `projectDue`, Calendar month-grouped deadlines, Filings use-as-template
+  draft copy, Taxpayer Profile/Forms/Templates tabs with disclosure-group
+  editing and `Same as head office` inheritance switches, Settings
+  (appearance toggles, real Backup, job queue rows), search palette
+  (Ctrl+K), start-a-return modal. Form page restyled to the prototype's
+  Forms tab: meta + title + frequency/fields chips, context bar (avatar,
+  TIN, period, guided-mode stub), stage tracker, "On this form" part
+  navigator, collapsible Part cards with numbered item rows (PILL radios,
+  four-box TIN, period groups, ₱ money fields, locked "From tax profile"
+  controls, reserved error rows), sticky Validate/Save bar. `deadlines.ts`
+  adds BIR due-date rules + `projectDue`; store v4 adds the settings kv,
+  `listRecentDrafts`, `listFiledDrafts`, `touchDraft`. `EBIRFORMS_SEED=demo`
+  seeds three demo taxpayers/profiles/drafts for verification.
   *Gate:* filled fixtures compute the same totals as the official HTA.
 - [ ] **P5 Print preview and print.**
   *Gate:* filled values visible on rendered pages; PDF printed via the OS
@@ -185,6 +206,38 @@ Status: `[ ]` todo, `[~]` in progress, `[x]` done (gate passed).
   screens; reserved error rows verified pixel-stable. Note: this VM has live `BIR_SFTP_*` set,
   so tests and dev launches must keep stripping `BIR_SFTP_LIVE` until P6 adds an explicit guard.
 - P3 slice in #6: `validate()` = official first alert (Validate-button onclick + focus capture)
-  + acorn guard extraction for all errors; random-fill oracle 50/50 per form. Open items for P4:
-  1601C loop-contained schedule guards (:3035-3108), and sandbox gaps hit by eventful sets
-  (`tblSched1a`, `getReqWithheldCompute`).
+  + acorn guard extraction for all errors; random-fill oracle 50/50 per form.
+  Remaining known coverage gap: 1601C loop-contained schedule guards (:3035-3108).
+- P4: load local non-VBScript scripts from each target HTA in document order,
+  capture sandbox errors, and derive field labels/items from preceding row/cell
+  text. Eventful `computeSchedule1()` uses global `d` and
+  `d.getElementById('tblSched1a').rows.length` (`BIR-Form1601Cv2018.hta:3550`);
+  the element is a `<tbody>` (`:1246`). The official shell supplies `d=document`
+  (`BIRForms.hta:123`), so the sandbox mirrors that alias and polyfills the
+  missing `HTMLTableSectionElement.rows` property in happy-dom 21.0.1 (its
+  declaration exposes only `insertRow`/`deleteRow`). RDO options are read by
+  the official `loadXMLrdo()` through `Scripting.FileSystemObject`; the runtime
+  provides a read-only package-confined file shim so `xml/rdo.xml` is available
+  without editing vendor files. `getReqWithheldCompute`
+  has no definition in the package and is
+  referenced only by disabled 2551Q rate fields (:1974-2085), so read-only
+  fields are not included in the eventful fill oracle. Drafts use schema v3;
+  new-draft prefill and reopening use `FormInstance.set()` before saving values.
+- The P4 redesign replaces the unmerged P4 draft-only v3 migration with one
+  consolidated v3 migration from main's v2 schema. It promotes taxpayer and
+  branch facts out of year profiles, copies the latest profile facts into
+  those shared records, and creates period-unique drafts. The intermediate
+  P4 v3 draft schema never shipped, so no v3-to-v4 migration is needed.
+- Filing frequency is read from the active official catalog labels, with
+  explicit overrides for forms whose labels do not name a period. Runtime
+  field snapshots carry the nearest official `Part I`, `Part II`, etc. heading
+  so the editor follows the form's structure rather than item numbering.
+- P4 UI rebuilt to the buwiz-ui-redesign shell (DESIGN_SYSTEM.md tokens,
+  prototype forms tab for the editor); store v4 + deadlines projection added.
+- P4 scratch walkthrough data is seeded by `scripts/seed-p4.ts`; it uses
+  `EBIRFORMS_DATA_DIR`, a generated second test TIN, and no live SFTP setting.
+  Bricolage Grotesque and its OFL license are bundled for the native GPUIX font
+  registration API, with a system-font fallback when the renderer lacks it.
+- P4 Round 2 derives labels and radio options from adjacent document-order text,
+  groups related controls by item, keeps period controls in Part I, and tests
+  visible-label coverage and official Part ranges for the three editor forms.

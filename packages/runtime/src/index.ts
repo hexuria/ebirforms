@@ -1,6 +1,6 @@
-import { readFileSync } from 'node:fs'
-import { join, resolve, sep } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { readFileSync, realpathSync } from 'node:fs'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { Window } from 'happy-dom'
 import { extractGuards } from './validation.js'
 import type { ValidationIssue, ValidationLogger, ValidationResult } from './validation.js'
@@ -15,10 +15,16 @@ export { extractGuards } from './validation.js'
 
 export interface FieldSnapshot {
   id: string
+  name: string
   type: 'text' | 'select-one' | 'radio' | 'checkbox' | 'textarea'
   value: string
+  label: string
+  item: string | null
+  section: string | null
+  optionLabel?: string
   checked?: boolean
   disabled: boolean
+  visible?: boolean
   maxLength?: number
   options?: { value: string; label: string }[]
 }
@@ -31,6 +37,7 @@ export interface FormInstance {
   call(fn: string, ...args: unknown[]): unknown
   validate(logger?: ValidationLogger): ValidationResult
   readonly alerts: string[]
+  readonly errors: string[]
   captureSaveXml(): string
   close(): Promise<void>
 }
@@ -42,7 +49,6 @@ interface OpenOfficialFormOptions {
 
 const repositoryRoot = resolve(import.meta.dir, '../../..')
 const defaultPackageDir = join(repositoryRoot, 'vendor', 'buwiz-validation', 'package')
-const dependencies = ['jq/jquery-1.7.1.min.js', 'js/environment.js', 'js/string-util.js']
 
 export async function openOfficialForm(
   code: string,
@@ -53,6 +59,7 @@ export async function openOfficialForm(
   const formPath = join(formsDir, `BIR-Form${code}.hta`)
   const html = readFileSync(formPath, 'utf8').replace(/^\uFEFF/, '')
   const alerts: string[] = []
+  const errors: string[] = []
   const now = opts.now ?? new Date()
   const window = new Window({
     url: pathToFileURL(`${formsDir}${sep}`).href,
@@ -60,10 +67,20 @@ export async function openOfficialForm(
       disableJavaScriptFileLoading: true,
       disableCSSFileLoading: true,
       disableIframePageLoading: true,
-      errorCapture: 'processLevel',
+      errorCapture: 'tryAndCatch',
     } as any,
   })
   const w = window as any
+  w.d = window.document
+  const tableSectionPrototype = w.HTMLTableSectionElement?.prototype
+  if (tableSectionPrototype && !('rows' in tableSectionPrototype)) {
+    Object.defineProperty(tableSectionPrototype, 'rows', {
+      configurable: true,
+      get(this: any) {
+        return Array.from(this.children).filter((child: any) => child.tagName === 'TR')
+      },
+    })
+  }
   let saveXml = ''
 
   const focusLog: string[] = []
@@ -73,6 +90,18 @@ export async function openOfficialForm(
     alerts.push(String(message))
   }
   w.confirm = () => true
+  w.onerror = (message: unknown, _source: unknown, _line: unknown, _column: unknown, error: unknown) => {
+    errors.push(error instanceof Error ? `${error.name}: ${error.message}` : String(message))
+    return true
+  }
+  window.addEventListener('error', (event: any) => {
+    const error = event.error
+    errors.push(error instanceof Error ? `${error.name}: ${error.message}` : String(event.message ?? error))
+  })
+  window.addEventListener('unhandledrejection', (event: any) => {
+    const reason = event.reason
+    errors.push(reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason))
+  })
 
   const trackFocusTarget = (prototype: any, method: string) => {
     if (!prototype || typeof prototype[method] !== 'function') {
@@ -121,11 +150,49 @@ export async function openOfficialForm(
     Close: () => {},
     close: () => {},
   }
-  w.ActiveXObject = function () {
+  const insidePackage = (filePath: string) => {
+    const lexical = relative(packageDir, filePath)
+    if (lexical === '..' || lexical.startsWith(`..${sep}`) || isAbsolute(lexical)) {
+      return false
+    }
+    const real = relative(realpathSync(packageDir), realpathSync(filePath))
+    return !(real === '..' || real.startsWith(`..${sep}`) || isAbsolute(real))
+  }
+  const openPackageTextFile = (fileLocation: string, ioMode = 1) => {
+    if (ioMode !== 1 || isAbsolute(fileLocation)) {
+      throw new Error(`Unsupported file access: ${fileLocation}`)
+    }
+    const filePath = resolve(packageDir, fileLocation)
+    if (!insidePackage(filePath)) {
+      throw new Error(`File access is outside the official package: ${fileLocation}`)
+    }
+    const contents = readFileSync(filePath, 'utf8').replace(/^\uFEFF/, '')
+    let consumed = false
+    let closed = false
+    return {
+      get AtEndOfStream() {
+        return !contents.length || consumed || closed
+      },
+      ReadAll() {
+        if (consumed || closed) {
+          return ''
+        }
+        consumed = true
+        return contents
+      },
+      Close() {
+        closed = true
+      },
+    }
+  }
+  w.ActiveXObject = function (programId: string) {
     return new Proxy(
       {},
       {
         get: (_target, property) => {
+          if (property === 'OpenTextFile' && programId === 'Scripting.FileSystemObject') {
+            return openPackageTextFile
+          }
           if (property === 'CreateTextFile' || property === 'OpenTextFile') {
             return () => writer
           }
@@ -166,23 +233,58 @@ export async function openOfficialForm(
   }
 
   try {
-    for (const dependency of dependencies) {
-      w.eval(readFileSync(join(packageDir, dependency), 'utf8'))
-    }
-
-    const inlineScripts: string[] = []
+    const scripts: string[] = []
     const documentHtml = html.replace(
-      /<script([^>]*)>([\s\S]*?)<\/script>/gi,
+      /<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi,
       (_match, attributes: string, content: string) => {
-        if (!/\bsrc\s*=/i.test(attributes) && !/vbscript/i.test(attributes)) {
-          inlineScripts.push(content)
+        const isVBScript =
+          /\blanguage\s*=\s*["']?\s*vbscript\b/i.test(attributes) ||
+          /\btype\s*=\s*["']?\s*text\/vbscript\b/i.test(attributes)
+        if (isVBScript) {
+          return ''
+        }
+        const src = /\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(attributes)
+        if (src) {
+          const scriptSrc = (src[1] ?? src[2] ?? src[3] ?? '').trim()
+          if (scriptSrc.startsWith('//')) {
+            return ''
+          }
+          const scriptUrl = new URL(scriptSrc, pathToFileURL(formPath))
+          if (scriptUrl.protocol === 'file:') {
+            const scriptPath = fileURLToPath(scriptUrl)
+            if (!insidePackage(scriptPath)) {
+              throw new Error(`Script is outside the official package: ${scriptSrc}`)
+            }
+            scripts.push(readFileSync(scriptPath, 'utf8'))
+          }
+        } else {
+          scripts.push(content)
         }
         return ''
       },
     )
     window.document.write(documentHtml)
 
-    for (const script of inlineScripts) {
+    const radioOptionLabels = new Map<string, string>()
+    for (const match of html.matchAll(/<input\b[^>]*>/gi)) {
+      if (!/\btype\s*=\s*["']?radio\b/i.test(match[0])) continue
+      const idMatch = /\bid\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(match[0])
+      const labelMatch = /^\s*<label\b[^>]*>([\s\S]*?)<\/label\s*>/i.exec(
+        html.slice((match.index ?? 0) + match[0].length),
+      )
+      const rawText = labelMatch?.[1].replace(/<[^>]*>/g, '') ?? ''
+      const text = rawText
+        .replace(/&nbsp;|&#160;/gi, ' ')
+        .replace(/&amp;/gi, '&')
+        .replace(/&quot;/gi, '"')
+        .replace(/&#39;|&apos;/gi, "'")
+        .replace(/\s+/g, ' ')
+        .trim()
+      const id = idMatch?.[1] ?? idMatch?.[2] ?? idMatch?.[3]
+      if (id && text) radioOptionLabels.set(id, text)
+    }
+
+    for (const script of scripts) {
       w.eval(script)
     }
 
@@ -278,9 +380,202 @@ export async function openOfficialForm(
     const evaluateInSandbox = (prelude: string, expression: string): unknown =>
       w.eval(`(function () {\n${prelude}\nreturn (${expression});\n})()`)
 
+    const controlSelector = 'input, select, textarea, button'
+    const previousNode = (node: any): any => {
+      if (node?.previousSibling) {
+        node = node.previousSibling
+        if (node.matches?.(controlSelector)) return node
+        while (node.lastChild) {
+          if (node.lastChild.matches?.(controlSelector)) return node.lastChild
+          node = node.lastChild
+        }
+        return node
+      }
+      return node?.parentNode
+    }
+    const nextNode = (node: any): any => {
+      if (node?.firstChild) return node.firstChild
+      while (node && !node.nextSibling) node = node.parentNode
+      return node?.nextSibling
+    }
+    const adjacentText = (element: any, direction: -1 | 1): string => {
+      let node = element
+      while ((node = direction < 0 ? previousNode(node) : nextNode(node)) && node !== mainForm) {
+        if (node.nodeType === 3) {
+          const value = String(node.nodeValue ?? '').replace(/\s+/g, ' ').trim()
+          if (value && !/^[\p{P}\p{S}\s]+$/u.test(value) && !/^\d+[A-Z]?$/i.test(value)) {
+            const cell = (node.parentElement as any)?.closest?.('td, th')
+            const cellText = String(cell?.textContent ?? '').replace(/\s+/g, ' ').trim()
+            if (cell && !cell.querySelector(controlSelector) && cellText) return cellText
+            return value
+          }
+        } else if (node.nodeType === 1) {
+          if (node.matches?.(controlSelector) && node !== element) return ''
+          if (node.matches?.('option')) return ''
+          if (node.matches?.('script, style')) {
+            node = direction < 0 ? previousNode(node) : node
+          }
+        }
+      }
+      return ''
+    }
+
+  const splitItem = (value: string): { label: string; item: string | null } => {
+      const text = value.replace(/\s+/g, ' ').trim()
+      const match = /^(\d+[A-Z]?)(?:\s*[-.)]\s*|\s+|$)(.*)$/i.exec(text)
+      return {
+        label: match ? match[2].trim() : text,
+        item: match?.[1] ?? null,
+      }
+  }
+
+  const tableColumnLabel = (element: any): string => {
+    let cell = element.closest('td, th')
+    let row = cell?.parentElement
+    let table = row?.closest('table')
+    while (cell && row && table) {
+      const column = Array.from(row.children).indexOf(cell)
+      const rows = (Array.from(table.querySelectorAll('tr')) as any[])
+        .filter((candidate) => candidate.closest('table') === table)
+      for (let index = rows.indexOf(row) - 1; index >= 0; index -= 1) {
+        const candidate = rows[index].children[column]
+        if (!candidate || candidate.querySelector(controlSelector)) continue
+        const text = String(candidate.textContent ?? '').replace(/\s+/g, ' ').trim()
+        if (text && !/^[\p{P}\p{S}\s]+$/u.test(text)) return text
+      }
+      row = table.closest('tr')
+      cell = row?.querySelector('td, th') ?? null
+      table = row?.closest('table')
+    }
+    return ''
+  }
+
+  const fieldLabel = (element: any): { label: string; item: string | null; optionLabel: string } => {
+    let label = adjacentText(element, -1)
+    if (!label) {
+      const associatedLabel = Array.from(element.labels ?? []) as any[]
+      label = associatedLabel.map((candidate) => String(candidate.textContent ?? '').trim()).find(Boolean) ?? ''
+    }
+    if (!label) {
+      const row = element.closest('tr')
+      const controls = row ? Array.from(row.querySelectorAll(controlSelector)) as any[] : []
+      const firstControl = controls[0]
+      if (firstControl && controls.indexOf(element) > 0) {
+        label = adjacentText(firstControl, -1)
+      }
+    }
+    if (!label) label = tableColumnLabel(element)
+    if (!label && /2$/.test(element.id)) {
+      const baseId = element.id.slice(0, -1)
+      const original = mainForm.ownerDocument.getElementById(baseId)
+      if (original) label = fieldLabel(original).label
+    }
+    if (!label && element.type === 'checkbox') label = 'Remove schedule row'
+    let optionLabel = ''
+    if (element.type === 'radio') {
+      const associatedLabel = (Array.from(element.labels ?? []) as any[]).find(
+        (candidate) => String(candidate.textContent ?? '').trim(),
+      )
+      let sibling = element.nextSibling
+      let siblingLabel: any = null
+      while (sibling) {
+        if (sibling.nodeType === 1) {
+          if (sibling.tagName?.toLowerCase() === 'label') {
+            siblingLabel = sibling
+            break
+          }
+          if (sibling.matches?.(controlSelector)) break
+          siblingLabel = sibling.querySelector?.('label') ?? null
+          if (siblingLabel) break
+        }
+        sibling = sibling.nextSibling
+      }
+      const radioGroup = (Array.from(mainForm.querySelectorAll('input[type="radio"]')) as any[])
+        .filter((radio) => radio.name === element.name)
+      const groupIndex = radioGroup.indexOf(element)
+      const row = element.closest('tr')
+      const rowLabels = row ? Array.from(row.querySelectorAll('label')) as any[] : []
+      optionLabel =
+        radioOptionLabels.get(element.id) ||
+        String(associatedLabel?.textContent ?? siblingLabel?.textContent ?? '').trim() ||
+        String(rowLabels.slice(-radioGroup.length)[groupIndex]?.textContent ?? '').trim() ||
+        adjacentText(element, 1) ||
+        adjacentText(element, -1)
+    }
+    const parsed = splitItem(label)
+    const rowItem = splitItem(String(element.closest('tr')?.textContent ?? '')).item
+    return {
+      label: parsed.label || element.id,
+      item: parsed.item ?? rowItem,
+      optionLabel: optionLabel.replace(/\s+/g, ' ').trim(),
+    }
+    }
+
+    const fieldSectionCache = new WeakMap<any, string | null>()
+    const fieldSection = (element: any): string | null => {
+      if (fieldSectionCache.has(element)) {
+        return fieldSectionCache.get(element) ?? null
+      }
+      const walker = w.document.createTreeWalker(mainForm, w.NodeFilter.SHOW_TEXT)
+      let section: string | null = null
+      let node = walker.nextNode()
+      while (node) {
+        if (
+          element.compareDocumentPosition(node) &
+          w.Node.DOCUMENT_POSITION_FOLLOWING
+        ) {
+          break
+        }
+        const text = String(node.nodeValue ?? '').replace(/\s+/g, ' ').trim()
+        const match = /^Part\s+(IV|III|II|I|V)\b\s*[--:]?\s*(.*)$/i.exec(text)
+        if (match) {
+          const smallWords = new Set(['a', 'an', 'and', 'at', 'by', 'for', 'in', 'of', 'on', 'or', 'the', 'to'])
+          const title = match[2]
+            .toLowerCase()
+            .split(/\s+/)
+            .map((word, index) =>
+              index > 0 && smallWords.has(word)
+                ? word
+                : word.replace(/^[a-z]/, (letter) => letter.toUpperCase()),
+            )
+            .join(' ')
+          section = `Part ${match[1].toUpperCase()}${title ? ` - ${title}` : ''}`
+        }
+        node = walker.nextNode()
+      }
+      fieldSectionCache.set(element, section)
+      return section
+    }
+
+    const isVisible = (element: any): boolean => {
+      let node = element
+      while (node) {
+        if (
+          node.hidden ||
+          node.style?.display === 'none' ||
+          node.style?.visibility === 'hidden'
+        ) {
+          return false
+        }
+        node = node.parentElement
+      }
+      return true
+    }
+
+    let cachedValidation:
+      | {
+          source: string
+          entries: Array<{
+            guard: ReturnType<typeof extractGuards>[number]
+            evaluate: () => unknown
+          }>
+        }
+      | undefined
+
     const instance: FormInstance = {
       code,
       alerts,
+      errors,
       fields() {
         return (Array.from((mainForm as any).elements) as any[])
           .filter((element) => element.type !== 'button' && element.type !== 'hidden')
@@ -295,11 +590,18 @@ export async function openOfficialForm(
             ) {
               return []
             }
+            const text = fieldLabel(element)
             const field: FieldSnapshot = {
               id: element.id,
+              name: element.name ?? '',
               type,
               value: element.value,
+              label: text.label,
+              item: text.item,
+              section: fieldSection(element),
+              optionLabel: text.optionLabel || undefined,
               disabled: element.disabled,
+              visible: isVisible(element),
             }
             if (type === 'radio' || type === 'checkbox') {
               field.checked = element.checked
@@ -387,18 +689,26 @@ export async function openOfficialForm(
             ? null
             : { message: firstMessage, fieldId: officialFieldId, source: 'official' }
 
-        const guards = extractGuards(handler.toString())
+        const handlerSource = handler.toString()
+        if (!cachedValidation || cachedValidation.source !== handlerSource) {
+          cachedValidation = {
+            source: handlerSource,
+            entries: extractGuards(handlerSource).map((guard) => ({
+              guard,
+              evaluate: w.Function(
+                `return (function () {\n${guard.prelude}\nif (!(${guard.test})) { return null; }\nreturn String(${guard.message});\n})()`,
+              ) as () => unknown,
+            })),
+          }
+        }
         const issues: ValidationIssue[] = []
         const seen = new Set<string>()
         let evaluated = 0
         let failedToEvaluate = 0
-        for (const guard of guards) {
+        for (const { guard, evaluate } of cachedValidation.entries) {
           restoreFormState(snapshot)
           try {
-            const result = evaluateInSandbox(
-              guard.prelude,
-              `(function () {\nif (!(${guard.test})) { return null; }\nreturn String(${guard.message});\n})()`,
-            )
+            const result = evaluate()
             evaluated += 1
             if (result === null) {
               continue
@@ -448,7 +758,11 @@ export async function openOfficialForm(
         return {
           officialFirst,
           issues,
-          coverage: { guards: guards.length, evaluated, failedToEvaluate },
+          coverage: {
+            guards: cachedValidation.entries.length,
+            evaluated,
+            failedToEvaluate,
+          },
         }
       },
       captureSaveXml() {

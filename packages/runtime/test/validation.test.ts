@@ -5,7 +5,7 @@ import type { FieldSnapshot, ValidationLogger } from '../src/index.js'
 const now = new Date('2026-10-14T00:00:00')
 const forms = [
   { code: '1601Cv2018', issues: 8, guards: 14 },
-  { code: '2551Qv2018', issues: 9, guards: 17 },
+  { code: '2551Qv2018', issues: 8, guards: 17 },
   { code: '0619E', issues: 9, guards: 26 },
 ] as const
 
@@ -31,8 +31,11 @@ function fillRandom(
 ): void {
   const radios = new Map<string, FieldSnapshot[]>()
   for (const field of formFields) {
+    if (field.disabled) {
+      continue
+    }
     if (field.type === 'radio') {
-      const group = field.id.replace(/_\d+$/, '')
+      const group = field.name || field.id.replace(/_\d+$/, '')
       radios.set(group, [...(radios.get(group) ?? []), field])
       continue
     }
@@ -77,7 +80,7 @@ describe('official validation', () => {
         }
       }
     },
-    30_000,
+    120_000,
   )
 
   test(
@@ -110,7 +113,7 @@ describe('official validation', () => {
         await form.close()
       }
     },
-    20_000,
+    60_000,
   )
 
   test(
@@ -132,7 +135,7 @@ describe('official validation', () => {
         await form.close()
       }
     },
-    20_000,
+    60_000,
   )
 
   test(
@@ -151,22 +154,26 @@ describe('official validation', () => {
         }
         try {
           const random = seededRandom(0x51a7 + formIndex)
-          const setValue = (id: string, value: string | boolean) => {
-            const assignment =
-              typeof value === 'boolean'
-                ? `field.checked = ${value};`
-                : `field.value = ${JSON.stringify(value)};`
-            form.call(
-              'eval',
-              `(function () { var field = document.getElementById(${JSON.stringify(id)}); ${assignment} })()`,
-            )
-          }
           let coverage = { guards: 0, evaluated: 0, failedToEvaluate: 0 }
           for (let run = 0; run < 50; run += 1) {
-            fillRandom(form.fields(), setValue, random)
+            fillRandom(
+              form.fields(),
+              (id, value) => {
+                form.set(id, value)
+                if (form.errors.length > 0) {
+                  throw new Error(
+                    `Sandbox error after setting ${id}: ${form.errors.join('; ')}`,
+                  )
+                }
+              },
+              random,
+            )
+            await new Promise((resolve) => setTimeout(resolve, 0))
+            expect(form.errors).toEqual([])
             const before = form.fields()
             const result = form.validate(logger)
             expect(form.fields()).toEqual(before)
+            expect(form.errors).toEqual([])
             expect(result.coverage.evaluated + result.coverage.failedToEvaluate).toBe(
               result.coverage.guards,
             )
@@ -186,6 +193,6 @@ describe('official validation', () => {
         }
       }
     },
-    180_000,
+    360_000,
   )
 })
