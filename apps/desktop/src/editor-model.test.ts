@@ -132,6 +132,25 @@ describe('buildEditorModel', () => {
     expect(typeof model.sections[0].rows[0].errorText).toBe('string')
     expect(model.bannerErrorText).toBe('General error')
   })
+
+  test('binds null-field "Item N" issues under the row whose item matches', () => {
+    const issues: ValidationIssue[] = [
+      { message: 'Please select an option for Item 3.', fieldId: null, source: 'official' },
+      { message: 'Invalid amount in Item no.14. Value must be greater than zero(0).', fieldId: null, source: 'official' },
+      { message: 'Please select an option for Item 11.', fieldId: null, source: 'official' },
+      { message: 'General error', fieldId: null, source: 'official' },
+    ]
+    const snapshot = [
+      { ...field('a', '3'), section: 'Part I' },
+      { ...field('b', '14'), section: 'Part II - Computation' },
+    ]
+    const model = buildEditorModel(snapshot, issues)
+    const rowA = model.sections[0].rows.find((row) => row.item === '3')
+    expect(rowA?.errorText).toBe('Please select an option for Item 3.')
+    const rowB = model.sections[1].rows.find((row) => row.item === '14')
+    expect(rowB?.errorText).toBe('Invalid amount in Item no.14. Value must be greater than zero(0).')
+    expect(model.bannerErrorText).toBe('Please select an option for Item 11.\nGeneral error')
+  })
 })
 
 describe('form prefill maps', () => {

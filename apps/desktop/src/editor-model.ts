@@ -274,11 +274,35 @@ export function buildEditorModel(
       sectionOrder.indexOf(left.section?.split(' - ')[0] ?? '') -
       sectionOrder.indexOf(right.section?.split(' - ')[0] ?? ''),
   )
+  // Official validation alerts like "Please select an option for Item 3." carry
+  // no field focus, so bind them to the row whose item chip matches "Item N"
+  // and render them under that row instead of in the banner.
+  const rowItems = new Set(
+    rows.map((row) => row.item?.toUpperCase()).filter((item): item is string => Boolean(item)),
+  )
+  const issuesByItem = new Map<string, string[]>()
+  const bannerMessages: string[] = []
+  for (const issue of issues) {
+    if (issue.fieldId) continue
+    const match = /\bItem\s*(?:no\.?\s*)?(\d+[A-Za-z]?)\b/i.exec(issue.message)
+    const item = match?.[1]?.toUpperCase()
+    if (item && rowItems.has(item)) {
+      issuesByItem.set(item, [...(issuesByItem.get(item) ?? []), issue.message])
+    } else {
+      bannerMessages.push(issue.message)
+    }
+  }
+  for (const row of rows) {
+    const item = row.item?.toUpperCase()
+    const messages = item ? issuesByItem.get(item) : undefined
+    if (messages?.length) {
+      row.errorText = [...new Set([...row.errorText.split('\n'), ...messages])]
+        .filter(Boolean)
+        .join('\n')
+    }
+  }
   return {
-    bannerErrorText: issues
-      .filter((issue) => issue.fieldId === null)
-      .map((issue) => issue.message)
-      .join('\n'),
+    bannerErrorText: bannerMessages.join('\n'),
     sections,
   }
 }

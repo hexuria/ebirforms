@@ -1119,7 +1119,7 @@ function App() {
               </div>
             </Panel>
           )}
-          {issues.some((issue) => issue.fieldId === null) && (
+          {editorModel.bannerErrorText && (
             <Panel title="Review required"><text style={{ color: t.danger, fontSize: 12 }}>{editorModel.bannerErrorText}</text></Panel>
           )}
           {formLoading && <text style={{ color: t.mutedFg }}>Opening official form…</text>}
@@ -1313,7 +1313,7 @@ function App() {
                 })()}
               </Panel>
             )}
-            {issues.some((issue) => issue.fieldId === null) && (
+            {editorModel.bannerErrorText && (
               <Panel title="Review required"><text style={{ color: t.danger, fontSize: 12 }}>{editorModel.bannerErrorText}</text></Panel>
             )}
             {formLoading && <text style={{ color: t.mutedFg }}>Opening official form.</text>}
