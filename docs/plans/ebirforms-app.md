@@ -135,7 +135,7 @@ Status: `[ ]` todo, `[~]` in progress, `[x]` done (gate passed).
   library, SQLite store, logger, job queue.
   *Gate:* unit tests; UI walkthrough creating `123-456-788` branches `00000`
   and `00002` with different years and different libraries.
-- [ ] **P3 Validation engine.** Sandbox, guard extraction, inline errors with
+- [~] **P3 Validation engine.** ([PR #6](https://github.com/hexuria/ebirforms/pull/6)) Sandbox, guard extraction, inline errors with
   reserved lines.
   *Gate:* parity oracle passes for 1601C, 2551Q, 0619E; GPUIX automation test
   proves no layout shift when errors appear.
@@ -184,3 +184,7 @@ Status: `[ ]` todo, `[~]` in progress, `[x]` done (gate passed).
   queue with backoff/dead-letter/crash recovery, redacting JSONL logger with live stream, GPUIX
   screens; reserved error rows verified pixel-stable. Note: this VM has live `BIR_SFTP_*` set,
   so tests and dev launches must keep stripping `BIR_SFTP_LIVE` until P6 adds an explicit guard.
+- P3 slice in #6: `validate()` = official first alert (Validate-button onclick + focus capture)
+  + acorn guard extraction for all errors; random-fill oracle 50/50 per form. Open items for P4:
+  1601C loop-contained schedule guards (:3035-3108), and sandbox gaps hit by eventful sets
+  (`tblSched1a`, `getReqWithheldCompute`).
