@@ -1,0 +1,50 @@
+{
+ "evidence_id": "ev_978e78d800410f7f1c7500ee19009e193c5c4966715c011c28685bedccab640a",
+ "subject": {
+  "name": "C:\\Users\\Administrator\\repos\\buwiz-validation\\package",
+  "digest": {
+   "sha256": "8124dd877e5a4a8779a1d5397761d76cbebe002f5591e3b46d07af15364000ed"
+  },
+  "format": "directory",
+  "architecture": null,
+  "local_path": "C:\\Users\\Administrator\\repos\\buwiz-validation\\package"
+ },
+ "provider": {
+  "id": "rea-javascript-application",
+  "name": "REA JavaScript application analyzer",
+  "version": "1"
+ },
+ "statistics": {
+  "relevant_files": 24,
+  "nested_asar_containers": 0,
+  "text_bytes_read": 1887071,
+  "invalid_utf8_files": 1,
+  "parsed_javascript_files": 22,
+  "visited_ast_nodes": 241584,
+  "findings": 1,
+  "modules": 0,
+  "parse_failures": 0
+ },
+ "limitations": [
+  "CommonJS and ESM binding relationships were recovered from inert syntax and resolved only within the inventoried artifact container.",
+  "Graph coverage is incomplete; unavailable facts remain explicit and must not be read as absence.",
+  "JavaScript and HTML were parsed as inert text; bundle bootstrap code was never executed.",
+  "Static imports, entrypoints, workers, endpoints, and storage relationships do not prove runtime execution.",
+  "Static paths and relationships may remain unresolved when expressions are dynamic or obfuscated.",
+  "Webpack/Rspack factories were recovered from AST literals; REA did not invoke push handlers or bundle bootstrap code.",
+  "jq/jquery-1.11.0.js: Resource constraint during analyze_javascript_application: Owned JavaScript worker exhausted its heap while analyzing jq/jquery-1.11.0.js during semantic",
+  "jq/jquery-1.7.1.min.js: Resource constraint during analyze_javascript_application: Owned JavaScript worker exhausted its heap while analyzing jq/jquery-1.7.1.min.js during semantic",
+  "js/lib/1701.js: Resource constraint during analyze_javascript_application: Semantic graph for js/lib/1701.js exceeds the parent's remaining result budget; static and module facts were retained",
+  "js/lib/1702EX.js: Resource constraint during analyze_javascript_application: Semantic graph for js/lib/1702EX.js exceeds the parent's remaining result budget; static and module facts were retained",
+  "js/lib/1702MX.js: Resource constraint during analyze_javascript_application: Semantic graph for js/lib/1702MX.js exceeds the parent's remaining result budget; static and module facts were retained",
+  "js/lib/1702RT.js: Resource constraint during analyze_javascript_application: Semantic graph for js/lib/1702RT.js exceeds the parent's remaining result budget; static and module facts were retained",
+  "js/lib/jquery-1.11.0.js: Resource constraint during analyze_javascript_application: Owned JavaScript worker exhausted its heap while analyzing js/lib/jquery-1.11.0.js during semantic",
+  "js/lib/json3.min.js: Resource constraint during analyze_javascript_application: Owned JavaScript worker exhausted its heap while analyzing js/lib/json3.min.js during semantic",
+  "js/lz-string-1.3.4.js: Resource constraint during analyze_javascript_application: Semantic graph for js/lz-string-1.3.4.js exceeds the parent's remaining result budget; static and module facts were retained",
+  "js/on-load.js: Resource constraint during analyze_javascript_application: Semantic graph for js/on-load.js exceeds the parent's remaining result budget; static and module facts were retained",
+  "js/rijndael.js: Resource constraint during analyze_javascript_application: Semantic graph for js/rijndael.js exceeds the parent's remaining result budget; static and module facts were retained",
+  "js/string-util.js: Resource constraint during analyze_javascript_application: Semantic graph for js/string-util.js exceeds the parent's remaining result budget; static and module facts were retained",
+  "js/string-util2014.js: Resource constraint during analyze_javascript_application: Semantic graph for js/string-util2014.js exceeds the parent's remaining result budget; static and module facts were retained"
+ ],
+ "graph_id": "jag_4062acbbbc529933cb86fc3b8f5033cee12a1fc73f347bbe5ea2c1c20c0d6b2a"
+}

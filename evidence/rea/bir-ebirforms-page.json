@@ -1,0 +1,32 @@
+{
+  "evidence_id": "ev_54ab1e7b15f35210cf9b500c29f4ee43e8ed45aa1f928c790996eb7e17486609",
+  "provider": {
+    "id": "rea-cdp-browser",
+    "name": "REA Chrome DevTools Protocol observation provider",
+    "version": "2"
+  },
+  "predicate_type": "rea.web-page-inspection",
+  "operation": "inspect_web_page",
+  "normalized_result": {
+    "target": {
+      "url": "https://www.bir.gov.ph/ebirforms"
+    },
+    "capture_window": {
+      "started_at": "2026-10-14T07:23:47.325Z",
+      "ended_at": "2026-10-14T07:23:50.469Z"
+    },
+    "accessibility": {
+      "nodes": [
+        {
+          "node_id": "202",
+          "parent_id": "201",
+          "role": "image",
+          "name": "Click here to download the latest version of eBIRForms",
+          "description": "Offline eBIRForms Package v7.9.6.2.1 (e34979cf3c51d48228e239b348aef76674c4847036ba0f966799ecd3ecba96b6)",
+          "ignored": false,
+          "states": []
+        }
+      ]
+    }
+  }
+}
