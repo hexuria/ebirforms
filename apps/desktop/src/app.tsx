@@ -26,8 +26,8 @@ import {
   type TaxpayerTree,
 } from '@ebirforms/core'
 import { loadCatalog, type ReturnFrequency } from '@ebirforms/forms'
-import { openOfficialForm } from '@ebirforms/runtime'
-import type { FieldSnapshot, FormInstance, ValidationIssue } from '@ebirforms/runtime'
+import type { FieldSnapshot, ValidationIssue } from '@ebirforms/runtime'
+import { FormClient, type RemoteForm } from './form-client.js'
 import {
   autoFieldIds,
   buildPrefillValues,
@@ -51,6 +51,8 @@ const logger: Logger = store.logger
 const queue = new JobQueue(store)
 const catalog = loadCatalog()
 const catalogByCode = new Map(catalog.map((entry) => [entry.code, entry]))
+/** The official form runtime lives in a worker thread so opening and validating never block the UI. */
+const formClient = new FormClient((level, scope, msg, fields) => logger.log(level, scope, msg, fields))
 
 /** Per-form summary from the design prototype's schema (pages, fields, Part sizes). */
 type FormMeta = { title: string; frequency: string; revision: string; pages: number; fields: number; parts: number[]; draftLayout: boolean }
@@ -880,7 +882,12 @@ function App() {
   const [logFilter, setLogFilter] = useState<LogFilter>('all')
   const [formEntry, setFormEntry] = useState<LibraryEntry | null>(null)
   const [draft, setDraft] = useState<Draft | null>(null)
-  const [formInstance, setFormInstance] = useState<FormInstance | null>(null)
+  const [formInstance, setFormInstance] = useState<RemoteForm | null>(null)
+  const [validating, setValidating] = useState(false)
+  const pendingEdits = useRef(0)
+  const formInstanceRef = useRef<RemoteForm | null>(null)
+  formInstanceRef.current = formInstance
+  const validateTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [fieldSnapshot, setFieldSnapshot] = useState<FieldSnapshot[]>([])
   const [issues, setIssues] = useState<ValidationIssue[]>([])
   const [editorValues, setEditorValues] = useState<Record<string, string | boolean>>({})
@@ -1128,7 +1135,7 @@ function App() {
       formLoadSeq.current += 1
       if (draft) {
         try {
-          store.saveDraft(draft.id, valuesFromForm(formInstance))
+          store.saveDraft(draft.id, { ...editorValues })
         } catch {}
       }
       await formInstance.close()
@@ -1346,23 +1353,26 @@ function App() {
     setTouched(new Set())
     setOpenMore(new Set())
     setCollapsedPartSet(new Set())
-    let form: FormInstance | undefined
+    let form: RemoteForm | undefined
     try {
-      form = await openOfficialForm(code as PrefillFormCode)
+      form = await formClient.open(code)
       if (ticket !== formLoadSeq.current) {
         await form.close()
         return
       }
-      const prefillValues = isPrefillCode(code) ? buildPrefillValues(code, profile, form.fields(), period) : {}
+      const prefillValues = isPrefillCode(code) ? buildPrefillValues(code, profile, form.fields, period) : {}
       const template = previous ? null : store.getTemplate(profile.tin9, profile.branch, code) ?? store.listTemplates(profile.tin9, profile.branch).find((item) => familyKey(item.formCode) === familyKey(code)) ?? null
       const initialValues = mergeDraftPrefill({ ...(template?.values ?? {}), ...opened.values }, prefillValues)
-      for (const [id, value] of Object.entries(initialValues)) form.set(id, value)
-      const nextDraft = previous
-        ? opened
-        : store.saveDraft(opened.id, valuesFromForm(form))
+      const fields = await form.setMany(initialValues)
+      if (ticket !== formLoadSeq.current) {
+        await form.close()
+        return
+      }
+      const nextDraft = previous ? opened : store.saveDraft(opened.id, valuesFromSnapshot(fields))
       setDraft(nextDraft)
       setFormInstance(form)
-      refreshEditor(form)
+      applySnapshot(fields)
+      scheduleValidate(form, 0)
     } catch (error) {
       await form?.close()
       setIssues([{ message: error instanceof Error ? error.message : String(error), fieldId: null, source: 'official' }])
@@ -1371,41 +1381,59 @@ function App() {
     }
   }
 
-  function valuesFromForm(form: FormInstance): DraftValues {
-    return Object.fromEntries(
-      form.fields().map((field) => [
-        field.id,
-        field.type === 'checkbox' || field.type === 'radio' ? Boolean(field.checked) : field.value,
-      ]),
-    )
+  function valuesFromSnapshot(fields: FieldSnapshot[]): DraftValues {
+    return Object.fromEntries(fields.map((field) => [field.id, field.type === 'checkbox' || field.type === 'radio' ? Boolean(field.checked) : field.value]))
   }
 
-  function refreshEditor(form: FormInstance) {
-    const snapshot = form.fields()
-    const result = form.validate(logger)
-    setFieldSnapshot(snapshot)
-    setIssues(result.issues)
-    setEditorValues(
-      Object.fromEntries(
-        snapshot.map((field) => [
-          field.id,
-          field.type === 'checkbox' || field.type === 'radio' ? Boolean(field.checked) : field.value,
-        ]),
-      ),
-    )
-    return result
+  function applySnapshot(fields: FieldSnapshot[]) {
+    setFieldSnapshot(fields)
+    setEditorValues(valuesFromSnapshot(fields))
+  }
+
+  /** Validate in the worker after edits settle; results land without blocking the UI. */
+  function scheduleValidate(form: RemoteForm, delay = 300) {
+    if (validateTimer.current) clearTimeout(validateTimer.current)
+    validateTimer.current = setTimeout(() => {
+      setValidating(true)
+      form
+        .validate()
+        .then(({ issues: next, fields }) => {
+          if (form !== formInstanceRef.current) return
+          setIssues(next)
+          if (pendingEdits.current === 0) applySnapshot(fields)
+        })
+        .catch((error) => logger.log('warn', 'form', 'Validation failed', { error: String(error) }))
+        .finally(() => setValidating(false))
+    }, delay)
   }
 
   function editField(field: FieldSnapshot, value: string | boolean) {
-    if (!formInstance || !formEntry || field.disabled) return
+    const form = formInstance
+    if (!form || !formEntry || field.disabled) return
     if (isPrefillCode(formEntry.formCode) && autoFieldIds(formEntry.formCode).has(field.id)) return
-    formInstance.set(field.id, value)
-    refreshEditor(formInstance)
+    // Show the edit at once; the worker's snapshot replaces it when no edits are in flight.
+    setEditorValues((current) => {
+      const next = { ...current, [field.id]: value }
+      if (field.type === 'radio' && value === true) for (const other of fieldSnapshot) if (other.type === 'radio' && other.name === field.name && other.id !== field.id) next[other.id] = false
+      return next
+    })
+    pendingEdits.current += 1
+    form
+      .setMany({ [field.id]: value })
+      .then((fields) => {
+        pendingEdits.current -= 1
+        if (pendingEdits.current === 0 && form === formInstanceRef.current) applySnapshot(fields)
+      })
+      .catch((error) => {
+        pendingEdits.current -= 1
+        logger.log('warn', 'form', 'Field update failed', { error: String(error) })
+      })
+    scheduleValidate(form)
   }
 
   function saveDraft() {
     if (!formInstance || !draft) return
-    setDraft(store.saveDraft(draft.id, valuesFromForm(formInstance)))
+    setDraft(store.saveDraft(draft.id, { ...editorValues }))
     bumpData()
     if (askTemplate) showToast('Saved. (Template update prompt arrives with guided mode.)')
   }
@@ -3165,6 +3193,7 @@ function App() {
           <div testId="status-chip" onClick={once(() => { const next = stages[(stages.indexOf(status) + 1) % stages.length]; updateDraftStatus(next); showToast(`Marked ${next}.`) })} style={{ cursor: 'pointer' }}>
             <Chip tone={statusTone}>{status[0].toUpperCase() + status.slice(1)}</Chip>
           </div>
+          {validating && <Chip>Checking…</Chip>}
           <div style={{ flexGrow: 1 }} />
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <text style={{ color: t.fg2, fontSize: F_META }}>Guided mode</text>
