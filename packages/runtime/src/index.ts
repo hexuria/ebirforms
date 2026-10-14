@@ -2,6 +2,16 @@ import { readFileSync } from 'node:fs'
 import { join, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { Window } from 'happy-dom'
+import { extractGuards } from './validation.js'
+import type { ValidationIssue, ValidationLogger, ValidationResult } from './validation.js'
+
+export type {
+  GuardDescriptor,
+  ValidationIssue,
+  ValidationLogger,
+  ValidationResult,
+} from './validation.js'
+export { extractGuards } from './validation.js'
 
 export interface FieldSnapshot {
   id: string
@@ -19,6 +29,7 @@ export interface FormInstance {
   set(id: string, value: string | boolean): void
   get(id: string): string | boolean
   call(fn: string, ...args: unknown[]): unknown
+  validate(logger?: ValidationLogger): ValidationResult
   readonly alerts: string[]
   captureSaveXml(): string
   close(): Promise<void>
@@ -55,8 +66,29 @@ export async function openOfficialForm(
   const w = window as any
   let saveXml = ''
 
-  w.alert = (message: unknown) => alerts.push(String(message))
+  const focusLog: string[] = []
+  const alertFocusMarks: number[] = []
+  w.alert = (message: unknown) => {
+    alertFocusMarks.push(focusLog.length)
+    alerts.push(String(message))
+  }
   w.confirm = () => true
+
+  const trackFocusTarget = (prototype: any, method: string) => {
+    if (!prototype || typeof prototype[method] !== 'function') {
+      return
+    }
+    const original = prototype[method]
+    prototype[method] = function (this: any, ...args: unknown[]) {
+      if (this?.id) {
+        focusLog.push(this.id)
+      }
+      return original.apply(this, args)
+    }
+  }
+  trackFocusTarget(w.HTMLElement?.prototype, 'focus')
+  trackFocusTarget(w.HTMLInputElement?.prototype, 'select')
+  trackFocusTarget(w.HTMLTextAreaElement?.prototype, 'select')
 
   const originalSetTimeout = w.setTimeout.bind(w)
   const originalSetInterval = w.setInterval.bind(w)
@@ -197,6 +229,55 @@ export async function openOfficialForm(
       return element
     }
 
+    const formElements = (): any[] => Array.from((mainForm as any).elements) as any[]
+
+    const findValidateButton = (): any => {
+      const named = (element: any) => String(element.value ?? '').trim() === 'Validate'
+      const candidates = formElements().filter(named)
+      const fallback = candidates.length
+        ? candidates
+        : (Array.from(window.document.querySelectorAll('input')) as any[]).filter(named)
+      const button =
+        fallback.find((element) => String(element.id ?? '').endsWith('cmdValidate')) ?? fallback[0]
+      if (!button) {
+        throw new Error(`Official form ${code} does not contain a Validate button.`)
+      }
+      return button
+    }
+
+    const captureFormState = () =>
+      formElements().map((element) => ({
+        element,
+        value: element.value,
+        checked: element.checked,
+        disabled: element.disabled,
+        selectedIndex: element.selectedIndex,
+      }))
+
+    const restoreFormState = (snapshot: ReturnType<typeof captureFormState>) => {
+      for (const state of snapshot) {
+        const element = state.element
+        if (
+          typeof state.selectedIndex === 'number' &&
+          element.selectedIndex !== state.selectedIndex
+        ) {
+          element.selectedIndex = state.selectedIndex
+        }
+        if (element.value !== state.value) {
+          element.value = state.value
+        }
+        if (typeof state.checked === 'boolean' && element.checked !== state.checked) {
+          element.checked = state.checked
+        }
+        if (element.disabled !== state.disabled) {
+          element.disabled = state.disabled
+        }
+      }
+    }
+
+    const evaluateInSandbox = (prelude: string, expression: string): unknown =>
+      w.eval(`(function () {\n${prelude}\nreturn (${expression});\n})()`)
+
     const instance: FormInstance = {
       code,
       alerts,
@@ -264,6 +345,111 @@ export async function openOfficialForm(
           throw new Error(`Official form ${code} does not expose function ${fn}.`)
         }
         return callable.apply(w, args)
+      },
+      validate(logger) {
+        const button = findValidateButton()
+        const onclick = button.getAttribute('onclick') ?? ''
+        const handlerName = /([A-Za-z_$][\w$]*)\s*\(/.exec(onclick)?.[1]
+        const handler = handlerName ? w[handlerName] : undefined
+        if (typeof handler !== 'function') {
+          throw new Error(`Official form ${code} does not expose a validate handler.`)
+        }
+
+        const snapshot = captureFormState()
+        alerts.length = 0
+        alertFocusMarks.length = 0
+        focusLog.length = 0
+        let runError: unknown
+        try {
+          button.dispatchEvent(new (w.Event)('click', { bubbles: true }))
+        } catch (error) {
+          runError = error
+        }
+        const firstMessage = alerts[0]
+        const alertMark = alertFocusMarks[0] ?? 0
+        const nextAlertMark = alertFocusMarks[1] ?? focusLog.length
+        const formFieldIds = new Set(instance.fields().map((field) => field.id))
+        const officialFieldId =
+          [...focusLog.slice(alertMark, nextAlertMark).reverse(), ...focusLog.slice(0, alertMark).reverse()]
+            .find((id) => formFieldIds.has(id)) ?? null
+        const officialAlerts = alerts.slice()
+        restoreFormState(snapshot)
+
+        if (runError) {
+          logger?.log('warn', 'runtime.validate', 'Official validate handler threw', {
+            code,
+            error: String(runError),
+          })
+        }
+
+        const officialFirst: ValidationIssue | null =
+          firstMessage === undefined || /validation successful/i.test(firstMessage)
+            ? null
+            : { message: firstMessage, fieldId: officialFieldId, source: 'official' }
+
+        const guards = extractGuards(handler.toString())
+        const issues: ValidationIssue[] = []
+        const seen = new Set<string>()
+        let evaluated = 0
+        let failedToEvaluate = 0
+        for (const guard of guards) {
+          restoreFormState(snapshot)
+          try {
+            const result = evaluateInSandbox(
+              guard.prelude,
+              `(function () {\nif (!(${guard.test})) { return null; }\nreturn String(${guard.message});\n})()`,
+            )
+            evaluated += 1
+            if (result === null) {
+              continue
+            }
+            const message = String(result)
+            const key = `${guard.fieldId}|${message}`
+            if (seen.has(key)) {
+              continue
+            }
+            seen.add(key)
+            issues.push({
+              message,
+              fieldId: guard.fieldId,
+              source: 'guard',
+              guardIndex: guard.index,
+            })
+          } catch {
+            failedToEvaluate += 1
+          } finally {
+            restoreFormState(snapshot)
+          }
+        }
+        alerts.splice(0, alerts.length, ...officialAlerts)
+
+        if (officialFirst) {
+          const duplicate = issues.findIndex(
+            (issue) =>
+              issue.message === officialFirst.message && issue.fieldId === officialFirst.fieldId,
+          )
+          if (
+            issues[0]?.message !== officialFirst.message ||
+            issues[0]?.fieldId !== officialFirst.fieldId
+          ) {
+            logger?.log('warn', 'runtime.validate', 'Guard extraction disagrees with the official first alert', {
+              code,
+              officialMessage: officialFirst.message,
+              officialFieldId: officialFirst.fieldId,
+              extractedFirst: issues[0]?.message ?? null,
+            })
+          }
+          if (duplicate >= 0) {
+            issues.splice(duplicate, 1)
+          }
+          issues.unshift(officialFirst)
+        }
+
+        return {
+          officialFirst,
+          issues,
+          coverage: { guards: guards.length, evaluated, failedToEvaluate },
+        }
       },
       captureSaveXml() {
         const previousReadOnly = w.gIsReadOnly
