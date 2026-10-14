@@ -117,11 +117,11 @@ dialog from a Print button.
 
 Status: `[ ]` todo, `[~]` in progress, `[x]` done (gate passed).
 
-- [ ] **P0 Bootstrap.** Bun workspace, submodules, idempotent
+- [x] **P0 Bootstrap.** ([PR #3](https://github.com/hexuria/ebirforms/pull/3): CI green on Windows/Ubuntu/macOS, window verified on Windows.) Bun workspace, submodules, idempotent
   `scripts/setup-*`, CI on Windows/Linux/macOS (typecheck + `bun test`), app
   window with an empty shell.
   *Gate:* CI green; window opens on Windows (screenshot).
-- [ ] **P1 Reverse-engineering inventory.** Confirm the latest version on
+- [~] **P1 Reverse-engineering inventory.** Confirm the latest version on
   bir.gov.ph with REA; REA JS analysis of the package; generated form catalog
   (83 forms in the official `formType` list, 43 with printable sheets) and
   per-form field models taken from the official `frmMain.elements`
@@ -172,3 +172,7 @@ Status: `[ ]` todo, `[~]` in progress, `[x]` done (gate passed).
 - Switched validation, compute and serialization to the official runtime
   engine (spike verified). Confirmed v7.9.6.2.1 is still the latest via REA.
   P1 counts corrected (83 listed forms).
+- P0 gate passed. P1 started. Field-set gaps explained: 1601C `txtRDOCode` is
+  built in a `$(document).ready` handler (the sandbox must fire ready), and
+  2551Q's rules list `txtEmail` twice (serialized twice). The P1 field model is
+  therefore the captured official `saveXML()` output.
