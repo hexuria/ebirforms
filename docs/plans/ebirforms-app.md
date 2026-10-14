@@ -131,7 +131,7 @@ Status: `[ ]` todo, `[~]` in progress, `[x]` done (gate passed).
   0619E matches 59/59; 1601C differs on `txtRDOCode` and 2551Q is off by one,
   both still to explain from each form's own `saveXML`. REA evidence
   committed.
-- [ ] **P2 Profiles and library.** Taxpayer, branch, tax year, form picker,
+- [~] **P2 Profiles and library.** ([PR #5](https://github.com/hexuria/ebirforms/pull/5)) Taxpayer, branch, tax year, form picker,
   library, SQLite store, logger, job queue.
   *Gate:* unit tests; UI walkthrough creating `123-456-788` branches `00000`
   and `00002` with different years and different libraries.
@@ -180,3 +180,7 @@ Status: `[ ]` todo, `[~]` in progress, `[x]` done (gate passed).
 - P1 slice in #4: `openOfficialForm` runs official compute/validate/saveXML. Rules-vs-official
   diffs are explicit (`merged` txtAddress2, `absent` commented 2551Q txtEmail, `moved` 2551Q RDO).
   Open takes ~2.4-3.1 s (ready wait capped at 3 s); optimize in P3 if the editor needs it.
+- P2 slice in #5: SQLite store (TIN9 -> branch -> year profiles, selected-only library),
+  queue with backoff/dead-letter/crash recovery, redacting JSONL logger with live stream, GPUIX
+  screens; reserved error rows verified pixel-stable. Note: this VM has live `BIR_SFTP_*` set,
+  so tests and dev launches must keep stripping `BIR_SFTP_LIVE` until P6 adds an explicit guard.
