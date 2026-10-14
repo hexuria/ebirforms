@@ -396,7 +396,12 @@ export async function openOfficialForm(
       while ((node = direction < 0 ? previousNode(node) : nextNode(node)) && node !== mainForm) {
         if (node.nodeType === 3) {
           const value = String(node.nodeValue ?? '').replace(/\s+/g, ' ').trim()
-          if (value && !/^[\p{P}\p{S}\s]+$/u.test(value)) return value
+          if (value && !/^[\p{P}\p{S}\s]+$/u.test(value) && !/^\d+[A-Z]?$/i.test(value)) {
+            const cell = (node.parentElement as any)?.closest?.('td, th')
+            const cellText = String(cell?.textContent ?? '').replace(/\s+/g, ' ').trim()
+            if (cell && !cell.querySelector(controlSelector) && cellText) return cellText
+            return value
+          }
         } else if (node.nodeType === 1) {
           if (node.matches?.(controlSelector) && node !== element) return ''
           if (node.matches?.('option')) return ''
@@ -410,9 +415,9 @@ export async function openOfficialForm(
 
   const splitItem = (value: string): { label: string; item: string | null } => {
       const text = value.replace(/\s+/g, ' ').trim()
-      const match = /^(\d+[A-Z]?)(?:\b\s*[-.)]?\s*)?(.*)$/i.exec(text)
+      const match = /^(\d+[A-Z]?)(?:\s*[-.)]\s*|\s+|$)(.*)$/i.exec(text)
       return {
-        label: match ? match[2].trim() || match[1] : text,
+        label: match ? match[2].trim() : text,
         item: match?.[1] ?? null,
       }
   }

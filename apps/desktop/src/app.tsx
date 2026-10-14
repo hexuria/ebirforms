@@ -1102,7 +1102,7 @@ function App() {
           </div>
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4, padding: 14 }}>
-          <text style={{ color: t.fg, fontSize: 25, fontWeight: 800 }}>BIR Form No. {displayFormCode(formEntry.formCode)}</text>
+          <text style={{ color: t.fg, fontSize: 25, fontWeight: 800, whiteSpace: 'nowrap' }}>BIR Form No. {displayFormCode(formEntry.formCode)}</text>
           <text style={{ color: t.fg, fontSize: 15, textAlign: 'center' }}>{cleanFormTitle(formEntry.label)}</text>
           {revision && <text style={{ color: t.mutedFg, fontSize: 11 }}>{revision}</text>}
         </div>
@@ -1226,7 +1226,9 @@ function App() {
                     <text style={{ color: t.mutedFg, fontSize: 12 }}>⌄</text>
                     <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
                       <text style={{ color: t.fg, fontSize: 12, fontWeight: 700, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{item.name || formatTin(item.tin9)}</text>
-                      <text style={{ color: t.mutedFg, fontSize: 10 }}>TIN: {formatTin(item.tin9)}</text>
+                      <text style={{ color: t.mutedFg, fontSize: 10, whiteSpace: 'nowrap' }}>
+                        TIN: {formatTin(item.tin9).split('-').slice(0, 3).join('-')}
+                      </text>
                     </div>
                   </div>
                   {item.branches.map((branchItem) => (

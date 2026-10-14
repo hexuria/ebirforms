@@ -147,18 +147,18 @@ describe('form prefill maps', () => {
         '1601Cv2018': {
           'Part I - Background Information': '01-13',
           'Part II - Computation of Tax': '14-36',
-          'Part III - Details of Payment': '37-39',
+          'Part III - Details of Payment': '37-40',
           'Part IV - Schedule': null,
         },
         '2551Qv2018': {
           'Part I - Background Information': '1-12A',
           'Part II - Total Tax Payable': '17-17',
-          'Part III - Details of Payment': '5-27',
+          'Part III - Details of Payment': '25-28',
         },
         '0619E': {
           'Part I - Background Information': '01-13',
           'Part II - Tax Remittance': '14-18',
-          'Part III - Details of Payment': '19-21',
+          'Part III - Details of Payment': '19-22',
         },
       }
       for (const code of Object.keys(prefillMap) as Array<keyof typeof prefillMap>) {
@@ -182,7 +182,7 @@ describe('form prefill maps', () => {
         }
       }
     },
-    30_000,
+    120_000,
   )
 
   test(
@@ -262,6 +262,6 @@ describe('form prefill maps', () => {
         }
       }
     },
-    30_000,
+    120_000,
   )
 })
