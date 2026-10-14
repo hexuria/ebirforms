@@ -43,7 +43,7 @@ import {
   type PrefillFormCode,
 } from './editor-model.js'
 import { themes, type ThemeMode, type ThemeTokens } from './theme.js'
-import { beginWindowDrag, closeWindow, dragWindowTo, type DragAnchor } from './win32.js'
+import { beginWindowDrag, closeWindow, dragWindowTo, toggleMaximizeWindow, type DragAnchor } from './win32.js'
 
 const appDir = dataDir()
 mkdirSync(appDir, { recursive: true })
@@ -389,7 +389,13 @@ function App() {
   const canNavFwd = histRef.current.idx < histRef.current.stack.length - 1
 
   useEffect(() => queue.onChange(setQueueJobs), [])
-  useEffect(() => logger.subscribe((entry) => setLogs((current) => [...current.slice(-999), entry])), [])
+  // Re-read getEntries() after subscribing: entries logged between the initial
+  // useState seed and this effect's subscription would otherwise be dropped.
+  useEffect(() => {
+    const unsubscribe = logger.subscribe((entry) => setLogs((current) => [...current.slice(-999), entry]))
+    setLogs(logger.getEntries())
+    return unsubscribe
+  }, [])
   useEffect(() => {
     if (pendingSearchFocus.current && !sidebarCollapsed) {
       pendingSearchFocus.current = false
@@ -1442,7 +1448,7 @@ function App() {
           <>
             {iconButton('close', glyph('✕'), () => closeWindow(WINDOW_TITLE), { danger: true })}
             {iconButton('min', glyph('─'), () => gpuix.minimizeWindow?.())}
-            {iconButton('max', glyph('▢'), () => gpuix.zoomWindow?.())}
+            {iconButton('max', glyph('▢'), () => { if (!toggleMaximizeWindow(WINDOW_TITLE)) gpuix.zoomWindow?.() })}
             {separator}
           </>
         )}

@@ -14,6 +14,8 @@ import { dlopen, FFIType, suffix } from 'bun:ffi'
 const isWin = process.platform === 'win32'
 
 const WM_CLOSE = 0x0010
+const SW_MAXIMIZE = 3
+const SW_RESTORE = 9
 const SWP_NOSIZE = 0x0001
 const SWP_NOZORDER = 0x0004
 const SWP_NOACTIVATE = 0x0010
@@ -37,6 +39,7 @@ function loadUser32() {
       returns: FFIType.i32,
     },
     IsZoomed: { args: [FFIType.u64], returns: FFIType.i32 },
+    ShowWindow: { args: [FFIType.u64, FFIType.i32], returns: FFIType.i32 },
   })
 }
 
@@ -133,4 +136,17 @@ export function closeWindow(title: string): void {
     return
   }
   u.symbols.PostMessageW(target, WM_CLOSE, 0n, 0n)
+}
+
+/**
+ * Maximize or restore the window. GPUIX's zoomWindow only zooms, so the
+ * maximize button toggles through ShowWindow instead. Returns false when
+ * the HWND can't be found (caller may fall back to the renderer API).
+ */
+export function toggleMaximizeWindow(title: string): boolean {
+  const u = lib()
+  const target = hwnd(title)
+  if (!u || !target) return false
+  u.symbols.ShowWindow(target, u.symbols.IsZoomed(target) ? SW_RESTORE : SW_MAXIMIZE)
+  return true
 }
