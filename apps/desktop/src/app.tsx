@@ -1627,7 +1627,7 @@ function App() {
               }}
             >
               <div style={{ padding: 8, paddingLeft: 10 }}>
-                <text style={{ color: t.fg3, fontSize: F_CAP }}>Signed in as {email || 'no email set'}</text>
+                <text style={{ color: t.fg3, fontSize: F_CAP }}>{`Signed in as ${email || 'no email set'}`}</text>
               </div>
               <div
                 testId="menu-account"
@@ -1912,15 +1912,15 @@ function App() {
         }}
       >
         {dateBox(row.dueDate)}
-        <text style={{ color: t.fg3, fontSize: F_META, ...NUM_STYLE, width: 68, minWidth: 68 }}>
-          {displayFormCode(row.formCode)}
-        </text>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 1, flexGrow: 1, minWidth: 0 }}>
+        <div style={{ width: 68, minWidth: 68 }}>
+          <text style={{ color: t.fg3, fontSize: F_META, ...NUM_STYLE }}>{displayFormCode(row.formCode)}</text>
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 1, flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0 }}>
           <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 500, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
             {`${displayFormCode(row.formCode)} · ${periodLabel(row.period)}`}
           </text>
           <text style={{ color: t.fg3, fontSize: F_META, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
-            {`${cleanFormTitle(entry?.label ?? '')} — ${owner?.taxpayer.name ?? row.tin9} · ${owner?.branchName ?? row.branchCode}`}
+            {`${owner?.taxpayer.name ?? row.tin9} · ${owner?.branchName ?? row.branchCode}`}
           </text>
         </div>
         <text style={{ color: days < 0 ? t.danger : days <= 14 ? t.warning : t.fg3, fontSize: F_META, width: 88, minWidth: 88, textAlign: 'right' }}>
@@ -1956,27 +1956,26 @@ function App() {
           hover: { backgroundColor: t.hover },
         }}
       >
-        <text style={{ color: t.fg3, fontSize: F_META, ...NUM_STYLE, width: 68, minWidth: 68 }}>
-          {displayFormCode(item.formCode)}
-        </text>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 1, flexGrow: 1, minWidth: 0 }}>
+        <div style={{ width: 68, minWidth: 68 }}>
+          <text style={{ color: t.fg3, fontSize: F_META, ...NUM_STYLE }}>{displayFormCode(item.formCode)}</text>
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 1, flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0 }}>
           <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 500, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
             {`${displayFormCode(item.formCode)} · ${periodLabel(item.period)}`}
           </text>
           <text style={{ color: t.fg3, fontSize: F_META, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
-            {`${cleanFormTitle(entry?.label ?? '')} — ${owner?.taxpayer.name ?? ''} · ${owner?.branchName ?? ''}`}
+            {`${owner?.taxpayer.name ?? ''} · ${owner?.branchName ?? ''}`}
           </text>
         </div>
-        <text style={{ color: t.fg3, fontSize: F_META, width: 88, minWidth: 88, textAlign: 'right' }}>
-          {fmtDate(item.updatedAt)}
-        </text>
-        <div style={{ width: 110, minWidth: 110, display: 'flex', justifyContent: 'flex-end' }}>
-          {inLibrary ? (
-            <Btn small kind="secondary" onClick={() => useAsTemplate(item)}>Use as template</Btn>
-          ) : (
-            statusPill('filed', '✓ Filed')
-          )}
+        <div style={{ width: 88, minWidth: 88, display: 'flex', justifyContent: 'flex-end' }}>
+          <text style={{ color: t.fg3, fontSize: F_META, textAlign: 'right' }}>{fmtDate(item.updatedAt)}</text>
         </div>
+        {statusPill('filed', '✓ Filed')}
+        {inLibrary && (
+          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+            <Btn small kind="secondary" onClick={() => useAsTemplate(item)}>Use as template</Btn>
+          </div>
+        )}
       </div>
     )
   }
@@ -2953,22 +2952,24 @@ function App() {
 
     return (
       <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minHeight: 0 }}>
-        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, paddingBottom: 8 }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, paddingBottom: 8 }}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div>
               <Btn kind="ghost" icon="chevLeft" testId="form-back" small onClick={() => closeForm()}>Back</Btn>
+            </div>
+            <div>
               <text style={{ color: t.fg3, fontSize: F_META }}>
-                BIR Form {formEntry ? displayFormCode(formEntry.formCode) : ''}
-                {revision ? ` · Revision ${revision}` : ''}
+                {`BIR Form ${formEntry ? displayFormCode(formEntry.formCode) : ''}${revision ? ` · Revision ${revision}` : ''}`}
               </text>
             </div>
             <text style={{ color: t.fg, fontSize: F_PAGE, fontWeight: 600 }}>{formEntry ? cleanFormTitle(formEntry.label) : 'Return'}</text>
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
               {catalogEntry && <Chip tone="muted">{catalogEntry.frequency === 'monthly' ? 'Monthly' : catalogEntry.frequency === 'quarterly' ? 'Quarterly' : 'Annual'}</Chip>}
-              <Chip tone="muted">{visibleFieldCount} fields</Chip>
+              <Chip tone="muted">{`${visibleFieldCount} fields`}</Chip>
             </div>
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+          <div style={{ flexGrow: 1 }} />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexShrink: 0 }}>
             <Btn kind="ghost" testId="form-dismiss" small onClick={() => closeForm()}>Dismiss</Btn>
             <Btn small testId="save-return-top" onClick={saveDraft}>Save draft</Btn>
           </div>
@@ -2997,7 +2998,7 @@ function App() {
           </text>
           {branch && <text style={{ color: t.fg2, fontSize: F_META, ...NUM_STYLE }}>{branch.name}</text>}
           {periodText && <text style={{ color: t.fg3, fontSize: F_META }}>·</text>}
-          {periodText && <text style={{ color: t.fg2, fontSize: F_META }}>For {periodText}</text>}
+          {periodText && <text style={{ color: t.fg2, fontSize: F_META }}>{`For ${periodText}`}</text>}
           <div style={{ flexGrow: 1 }} />
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <text style={{ color: t.fg2, fontSize: F_META }}>Guided mode</text>
@@ -3086,7 +3087,9 @@ function App() {
                   >
                     <Icon name={open ? 'chevDown' : 'chevRight'} size={16} color={t.fg3} />
                     <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 600, flexGrow: 1, minWidth: 0 }}>{section.section ?? `Part ${index + 1}`}</text>
-                    <text style={{ color: t.fg3, fontSize: F_META }}>{section.rows.length} items · {filled} filled</text>
+                    <div style={{ minWidth: 110, display: 'flex', justifyContent: 'flex-end' }}>
+                      <text style={{ color: t.fg3, fontSize: F_META }}>{`${section.rows.length} items · ${filled} filled`}</text>
+                    </div>
                   </div>
                   {open && (
                     <div style={{ borderTopWidth: 1, borderColor: t.border, display: 'flex', flexDirection: 'column' }}>
