@@ -1,14 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { copyFileSync, mkdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { render, useGpuixRequired } from '@gpuix/react'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@gpuix/react'
+import { render, useGpuixRequired, useWindowSize } from '@gpuix/react'
 import {
   dataDir,
   describeSftpConfig,
@@ -37,14 +30,17 @@ import { openOfficialForm } from '@ebirforms/runtime'
 import type { FieldSnapshot, FormInstance, ValidationIssue } from '@ebirforms/runtime'
 import {
   autoFieldIds,
-  buildEditorModel,
   buildPrefillValues,
   cleanFormTitle,
   displayFormCode,
   mergeDraftPrefill,
+  prefillMap,
   type PrefillFormCode,
 } from './editor-model.js'
 import { seedDemo } from './seed-demo.js'
+import formSchemaJson from './form-schema.json'
+import { buildSchemaModel, type BoundField, type FormSchema, type ModelItem } from './schema-model.js'
+import { spawn } from 'node:child_process'
 import { resolveSystemTheme, resolveTheme, themes, type ResolvedTheme, type ThemeMode, type ThemeTokens } from './theme.js'
 import { beginWindowDrag, closeWindow, dragWindowTo, toggleMaximizeWindow, type DragAnchor } from './win32.js'
 
@@ -55,6 +51,27 @@ const logger: Logger = store.logger
 const queue = new JobQueue(store)
 const catalog = loadCatalog()
 const catalogByCode = new Map(catalog.map((entry) => [entry.code, entry]))
+
+/** Per-form summary from the design prototype's schema (pages, fields, Part sizes). */
+type FormMeta = { title: string; frequency: string; revision: string; pages: number; fields: number; parts: number[]; draftLayout: boolean }
+const formSchemas = formSchemaJson as Record<string, FormSchema>
+const formMeta: Record<string, FormMeta> = Object.fromEntries(
+  Object.entries(formSchemas).map(([key, schema]) => [key, { title: schema.title, frequency: schema.frequency, revision: schema.revision, pages: schema.pages, fields: schema.fields, parts: schema.parts.map((part) => part.items.length), draftLayout: schema.draftLayout }]),
+)
+const isPrefillCode = (code: string): code is PrefillFormCode => code in prefillMap
+const familyKey = (code: string) => code.replace(/v\d{4}.*$/i, '').toUpperCase()
+const versionOf = (code: string) => Number(/v(\d{4})/i.exec(code)?.[1] ?? 0)
+/** One library card per form family: the latest catalog variant that has prototype metadata. */
+const libraryCatalog: Array<{ key: string; code: string; meta: FormMeta }> = (() => {
+  const best = new Map<string, string>()
+  for (const entry of catalog) {
+    const key = familyKey(entry.code)
+    if (!formMeta[key]) continue
+    const current = best.get(key)
+    if (!current || versionOf(entry.code) > versionOf(current)) best.set(key, entry.code)
+  }
+  return [...best.entries()].map(([key, code]) => ({ key, code, meta: formMeta[key] })).sort((a, b) => a.key.localeCompare(b.key))
+})()
 if (process.env.EBIRFORMS_SEED === 'demo') {
   try {
     seedDemo(store)
@@ -85,6 +102,22 @@ function FontRegistration() {
   return null
 }
 
+/**
+ * Dev-only: with EBIRFORMS_AUTOMATION=stdio the window serves the GPUIX
+ * automation protocol on stdio, so `@gpuix/native/automation` `launch()` can
+ * click through the real app and capture screenshots (design-parity checks).
+ */
+function AutomationBridge() {
+  const renderer = useGpuixRequired()
+  useEffect(() => {
+    if (process.env.EBIRFORMS_AUTOMATION !== 'stdio') return
+    void import('@gpuix/native/automation').then(({ serveAutomationStdio, InProcessBackend, liveRendererAsTest }) => {
+      serveAutomationStdio(new InProcessBackend(liveRendererAsTest(renderer as unknown as Parameters<typeof liveRendererAsTest>[0])))
+    })
+  }, [renderer])
+  return null
+}
+
 // ---------------------------------------------------------------------------
 // Design constants (verbatim from the mockup's Components tab)
 
@@ -101,7 +134,7 @@ const WINDOW_TITLE = 'eBIRForms'
 const isWin = process.platform === 'win32'
 const isMac = process.platform === 'darwin'
 
-type Page = 'home' | 'calendar' | 'filings' | 'taxpayer' | 'settings' | 'jobs' | 'logs' | 'form'
+type Page = 'home' | 'library' | 'calendar' | 'filings' | 'taxpayer' | 'settings' | 'jobs' | 'logs' | 'form'
 type TpTab = 'profile' | 'forms' | 'templates'
 type NavState = {
   page: Page
@@ -135,6 +168,7 @@ type NewTaxpayerForm = FactsForm & {
   birthDate: string
 }
 type NewBranchForm = FactsForm & { code: string; name: string }
+type GridCell = ReactNode | { full: true; node: ReactNode }
 
 const blankFacts: FactsForm = { name: '', rdo: '', zip: '', address: '', phone: '', email: '' }
 const blankTaxpayer: NewTaxpayerForm = {
@@ -227,6 +261,10 @@ const ICON_PATHS: Record<string, string> = {
   template: '<rect x="3" y="3" width="18" height="7" rx="1"/><rect x="3" y="14" width="9" height="7" rx="1"/><rect x="16" y="14" width="5" height="7" rx="1"/>',
   info: '<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>',
   database: '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4 3 9 3s9-1.34 9-3"/>',
+  upDown: '<path d="m7 15 5 5 5-5"/><path d="m7 9 5-5 5 5"/>',
+  lock: '<rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+  logout: '<path d="m16 17 5-5-5-5"/><path d="M21 12H9"/><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>',
+  bookmark: '<path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z"/>',
   list: '<path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/>',
 }
 
@@ -244,19 +282,42 @@ function Icon({ name, size = 16, color, strokeWidth = 1.75 }: {
   strokeWidth?: number
 }) {
   const t = useTheme()
-  const stroke = color ?? t.fg2
-  const source = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="${stroke}" stroke-width="${strokeWidth}" stroke-linecap="round" stroke-linejoin="round">${ICON_PATHS[name]}</svg>`
-  return (
-    <svg
-      source={source}
-      style={{ width: size, height: size, minWidth: size }}
-    />
-  )
+  const ink = color ?? t.fg2
+  // GPUI paints an SVG as a one-colour mask tinted by the element's text
+  // colour; the markup's own stroke colour is ignored. Set both.
+  const source = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="#000000" stroke-width="${strokeWidth}" stroke-linecap="round" stroke-linejoin="round">${ICON_PATHS[name]}</svg>`
+  return <svg source={source} style={{ width: size, height: size, minWidth: size, color: ink }} />
+}
+
+/**
+ * GPUIX can deliver one click to the same element twice in a row, which made
+ * functional toggles (sidebar, disclosures, checkboxes) flip twice and do
+ * nothing, and one-shot actions run twice. Every onClick goes through this:
+ * a repeat on the same element within 40 ms is dropped.
+ */
+let lastClick = { element: -1, at: 0 }
+function once<A extends unknown[]>(handler: ((...args: A) => unknown) | undefined): (...args: A) => void {
+  return (...args: A) => {
+    const element = (args[0] as { elementId?: number } | undefined)?.elementId
+    // Nested calls (a primitive forwarding to the caller's handler) carry no event: pass through.
+    if (element === undefined) {
+      handler?.(...args)
+      return
+    }
+    const now = performance.now()
+    if (element === lastClick.element && now - lastClick.at < 40) return
+    lastClick = { element, at: now }
+    handler?.(...args)
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Primitives
+// Primitives — each one mirrors a class in the prototype's stylesheet
+// (hexuria/buwiz-ui-redesign prototype/shell-prototype.src.html).
 
+const CLEAR = 'rgba(0,0,0,0)'
+
+/** .ibtn — 28×28, radius 6, fg2 at rest; hover = hover fill + fg; pressed = selected. */
 function IBtn({ icon, onClick, size = 28, iconSize = 16, active = false, disabled = false, danger = false, testId }: {
   icon: IconName
   onClick: () => void
@@ -268,116 +329,107 @@ function IBtn({ icon, onClick, size = 28, iconSize = 16, active = false, disable
   testId?: string
 }) {
   const t = useTheme()
+  const [hot, setHot] = useState(false)
+  const ink = disabled ? t.fg3 : active || hot ? (danger && hot ? '#ffffff' : t.fg) : t.fg2
   return (
     <div
       testId={testId}
-      onClick={() => !disabled && onClick()}
+      onClick={once(() => !disabled && onClick())}
+      onMouseEnter={() => setHot(true)}
+      onMouseLeave={() => setHot(false)}
       style={{
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
         width: size,
         height: size,
-        borderRadius: 7,
+        minWidth: size,
+        borderRadius: 6,
         cursor: disabled ? 'default' : 'pointer',
-        opacity: disabled ? 0.4 : 1,
-        backgroundColor: active ? t.selected : 'rgba(0,0,0,0)',
-        hover: disabled ? {} : { backgroundColor: danger ? '#e81123' : t.hover },
+        opacity: disabled ? 0.5 : 1,
+        backgroundColor: active ? t.selected : CLEAR,
+        hover: disabled ? {} : { backgroundColor: danger ? '#c42b1c' : active ? t.selected : t.hover },
       }}
     >
-      <Icon name={icon} size={iconSize} color={disabled ? t.fg3 : active ? t.fg : t.fg2} />
+      <Icon name={icon} size={iconSize} color={ink} />
     </div>
   )
 }
 
+/** .btn — md 32 / sm 28; primary = inverted ink, secondary = bordered, ghost, danger = tinted. */
 function Btn({ children, onClick, kind = 'primary', disabled = false, small = false, icon, testId }: {
   children: ReactNode
   onClick: () => void
-  kind?: 'primary' | 'secondary' | 'ghost'
+  kind?: 'primary' | 'secondary' | 'ghost' | 'danger'
   disabled?: boolean
   small?: boolean
   icon?: IconName
   testId?: string
 }) {
   const t = useTheme()
-  const styles = {
-    primary: { bg: t.primary, fg: t.primaryFg, border: t.primary },
-    secondary: { bg: t.surface, fg: t.fg, border: t.borderStrong },
-    ghost: { bg: 'rgba(0,0,0,0)', fg: t.fg2, border: 'rgba(0,0,0,0)' },
+  const [hot, setHot] = useState(false)
+  const look = {
+    primary: { bg: t.primary, hoverBg: t.primary, fg: t.primaryFg, hoverFg: t.primaryFg, border: t.primary },
+    secondary: { bg: t.surface, hoverBg: t.hover, fg: t.fg, hoverFg: t.fg, border: t.borderStrong },
+    ghost: { bg: CLEAR, hoverBg: t.hover, fg: t.fg2, hoverFg: t.fg, border: CLEAR },
+    danger: { bg: t.dangerSoft, hoverBg: t.dangerSoft, fg: t.danger, hoverFg: t.danger, border: CLEAR },
   }[kind]
+  const ink = hot && !disabled ? look.hoverFg : look.fg
   return (
     <div
       testId={testId}
-      onClick={() => !disabled && onClick()}
+      onClick={once(() => !disabled && onClick())}
+      onMouseEnter={() => setHot(true)}
+      onMouseLeave={() => setHot(false)}
       style={{
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
         gap: 6,
-        height: small ? 26 : 32,
-        paddingLeft: small ? 10 : 14,
-        paddingRight: small ? 10 : 14,
-        borderRadius: 7,
-        borderWidth: kind === 'secondary' ? 1 : 0,
-        borderColor: styles.border,
-        backgroundColor: styles.bg,
+        height: small ? 28 : 32,
+        minHeight: small ? 28 : 32,
+        paddingLeft: small ? 10 : 12,
+        paddingRight: small ? 10 : 12,
+        borderRadius: 6,
+        borderWidth: 1,
+        borderColor: look.border,
+        backgroundColor: look.bg,
         cursor: disabled ? 'default' : 'pointer',
         opacity: disabled ? 0.45 : 1,
-        hover: disabled ? {} : { opacity: 0.85 },
+        hover: disabled ? {} : { backgroundColor: look.hoverBg, opacity: kind === 'primary' ? 0.88 : 1 },
       }}
     >
-      {icon && <Icon name={icon} size={small ? 12 : 14} color={styles.fg} />}
-      <text style={{ color: styles.fg, fontSize: small ? F_META : F_BODY, fontWeight: 500 }}>
-        {children}
-      </text>
+      {icon && <Icon name={icon} size={16} color={ink} />}
+      <text style={{ color: ink, fontSize: F_BODY, fontWeight: 500, whiteSpace: 'nowrap' }}>{children}</text>
     </div>
   )
 }
 
+/** kbd — 11/500 fg3, 1px border, radius 4, height 18. */
 function Kbd({ children }: { children: string }) {
   const t = useTheme()
   return (
-    <div
-      style={{
-        paddingLeft: 6,
-        paddingRight: 6,
-        height: 18,
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        borderRadius: 4,
-        borderWidth: 1,
-        borderColor: t.border,
-        backgroundColor: t.surface,
-      }}
-    >
-      <text style={{ color: t.fg3, fontSize: 10, ...NUM_STYLE }}>{children}</text>
+    <div style={{ paddingLeft: 4, paddingRight: 4, height: 18, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 4, borderWidth: 1, borderColor: t.border }}>
+      <text style={{ color: t.fg3, fontSize: F_CAP, fontWeight: 500 }}>{children}</text>
     </div>
   )
 }
 
+/** .switch — 32×18 track, 14 white knob, accent when on. */
 function Switch({ on, onToggle, testId }: { on: boolean; onToggle: (value: boolean) => void; testId?: string }) {
   const t = useTheme()
   return (
     <div
       testId={testId}
-      onClick={() => onToggle(!on)}
-      style={{
-        width: 32,
-        height: 18,
-        borderRadius: 9,
-        backgroundColor: on ? t.accent : t.borderStrong,
-        display: 'flex',
-        alignItems: 'center',
-        paddingLeft: on ? 16 : 2,
-        cursor: 'pointer',
-      }}
+      onClick={once(() => onToggle(!on))}
+      style={{ width: 32, minWidth: 32, height: 18, borderRadius: 9, backgroundColor: on ? t.accent : t.borderStrong, display: 'flex', alignItems: 'center', paddingLeft: on ? 16 : 2, cursor: 'pointer' }}
     >
       <div style={{ width: 14, height: 14, borderRadius: 7, backgroundColor: '#ffffff' }} />
     </div>
   )
 }
 
+/** .seg — hover track, 2px padding, 24px segments 12/500, selected = raised + shadow. */
 function Seg<T extends string>({ options, value, onChange, testId }: {
   options: Array<{ value: T; label: string; icon?: IconName }>
   value: T
@@ -386,42 +438,30 @@ function Seg<T extends string>({ options, value, onChange, testId }: {
 }) {
   const t = useTheme()
   return (
-    <div
-      testId={testId}
-      style={{
-        display: 'flex',
-        gap: 2,
-        padding: 2,
-        borderRadius: 8,
-        backgroundColor: t.hover,
-        alignSelf: 'flex-start',
-      }}
-    >
+    <div testId={testId} style={{ display: 'flex', gap: 2, padding: 2, borderRadius: 8, backgroundColor: t.hover, alignSelf: 'flex-start' }}>
       {options.map((option) => {
         const active = option.value === value
         return (
           <div
             key={option.value}
             testId={`${testId}-${option.value}`}
-            onClick={() => onChange(option.value)}
+            onClick={once(() => onChange(option.value))}
             style={{
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
-              gap: 5,
+              gap: 6,
               height: 24,
-              paddingLeft: 12,
-              paddingRight: 12,
+              paddingLeft: 10,
+              paddingRight: 10,
               borderRadius: 6,
               cursor: 'pointer',
-              backgroundColor: active ? t.raised : 'rgba(0,0,0,0)',
-              hover: { backgroundColor: active ? t.raised : t.selected },
+              backgroundColor: active ? t.raised : CLEAR,
+              boxShadow: active ? { offsetX: 0, offsetY: 1, blurRadius: 2, spreadRadius: 0, color: 'rgba(0,0,0,0.10)' } : undefined,
             }}
           >
             {option.icon && <Icon name={option.icon} size={14} color={active ? t.fg : t.fg2} />}
-            <text style={{ color: active ? t.fg : t.fg2, fontSize: F_META, fontWeight: active ? 600 : 400 }}>
-              {option.label}
-            </text>
+            <text style={{ color: active ? t.fg : t.fg2, fontSize: F_META, fontWeight: 500 }}>{option.label}</text>
           </div>
         )
       })}
@@ -429,75 +469,83 @@ function Seg<T extends string>({ options, value, onChange, testId }: {
   )
 }
 
-function Chip({ children, tone = 'plain', icon }: { children: ReactNode; tone?: 'plain' | 'accent' | 'success' | 'warning' | 'danger' | 'muted'; icon?: IconName }) {
+type ChipTone = 'plain' | 'accent' | 'success' | 'warning' | 'danger' | 'muted'
+
+/** .chip — 20 tall, full radius, 11/500, soft tint; 12px icon. */
+function Chip({ children, tone = 'plain', icon }: { children: ReactNode; tone?: ChipTone; icon?: IconName }) {
   const t = useTheme()
   const tones = {
     plain: { bg: t.hover, fg: t.fg2 },
-    muted: { bg: t.hover, fg: t.fg3 },
+    muted: { bg: t.hover, fg: t.fg2 },
     accent: { bg: t.accentSoft, fg: t.accent },
     success: { bg: t.successSoft, fg: t.success },
     warning: { bg: t.warningSoft, fg: t.warning },
     danger: { bg: t.dangerSoft, fg: t.danger },
   }[tone]
   return (
-    <div
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: 4,
-        height: 20,
-        paddingLeft: 8,
-        paddingRight: 8,
-        borderRadius: 10,
-        backgroundColor: tones.bg,
-      }}
-    >
+    <div style={{ display: 'flex', alignItems: 'center', gap: 4, height: 20, minHeight: 20, paddingLeft: 8, paddingRight: 8, borderRadius: 10, backgroundColor: tones.bg, alignSelf: 'center' }}>
       {icon && <Icon name={icon} size={12} color={tones.fg} />}
-      <text style={{ color: tones.fg, fontSize: F_CAP, fontWeight: 500 }}>{children}</text>
+      <text style={{ color: tones.fg, fontSize: F_CAP, fontWeight: 500, whiteSpace: 'nowrap' }}>{children}</text>
     </div>
   )
 }
 
+function hslHex(h: number, s: number, l: number): string {
+  const sat = s / 100
+  const lig = l / 100
+  const k = (n: number) => (n + h / 30) % 12
+  const a = sat * Math.min(lig, 1 - lig)
+  const f = (n: number) => lig - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)))
+  return `#${[f(0), f(8), f(4)].map((x) => Math.round(x * 255).toString(16).padStart(2, '0')).join('')}`
+}
+
+function nameHue(name: string): number {
+  let hash = 0
+  for (const ch of name) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0
+  return hash % 360
+}
+
+/** .av — initials from the first and last capitalised word, tinted by a hue derived from the name. */
 function Avatar({ name, size = 28 }: { name: string; size?: number }) {
   const t = useTheme()
+  const dark = t === themes.dark
+  const hue = nameHue(name)
+  const bg = dark ? hslHex(hue, 40, 26) : hslHex(hue, 55, 90)
+  const fg = dark ? hslHex(hue, 40, 84) : hslHex(hue, 55, 30)
+  const font = size <= 20 ? 9 : size <= 28 ? 11 : size <= 40 ? 14 : 19
   return (
-    <div
-      style={{
-        width: size,
-        height: size,
-        minWidth: size,
-        borderRadius: size / 2,
-        backgroundColor: t.selected,
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-      }}
-    >
-      <text style={{ color: t.fg, fontSize: size * 0.36, fontWeight: 600 }}>{initials(name)}</text>
+    <div style={{ width: size, height: size, minWidth: size, borderRadius: size / 2, backgroundColor: bg, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+      <text style={{ color: fg, fontSize: font, fontWeight: 600 }}>{initials(name)}</text>
     </div>
   )
 }
 
+/** .check — 16, radius 4; on = primary fill with a 12px check. */
 function Check({ on, disabled = false }: { on: boolean; disabled?: boolean }) {
   const t = useTheme()
   return (
-    <div
-      style={{
-        width: 16,
-        height: 16,
-        borderRadius: 4,
-        borderWidth: 1,
-        borderColor: on ? t.primary : t.borderStrong,
-        backgroundColor: on ? t.primary : t.surface,
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        opacity: disabled ? 0.5 : 1,
-      }}
-    >
-      {on && <Icon name="check" size={11} color={t.primaryFg} strokeWidth={3} />}
+    <div style={{ width: 16, height: 16, minWidth: 16, borderRadius: 4, borderWidth: 1, borderColor: on ? t.primary : t.borderStrong, backgroundColor: on ? t.primary : t.surface, display: 'flex', alignItems: 'center', justifyContent: 'center', opacity: disabled ? 0.5 : 1 }}>
+      {on && <Icon name="check" size={12} color={t.primaryFg} strokeWidth={2.5} />}
     </div>
   )
+}
+
+/** .input — 32 tall, padding 0 10, radius 8, border-strong; readonly = hover fill + fg2. */
+function inputStyle(t: ThemeTokens, opts: { locked?: boolean; error?: boolean; mono?: boolean; align?: 'left' | 'right' | 'center' } = {}) {
+  return {
+    height: 32,
+    minHeight: 32,
+    paddingLeft: 10,
+    paddingRight: 10,
+    color: opts.locked ? t.fg2 : t.fg,
+    backgroundColor: opts.locked ? t.hover : t.surface,
+    borderWidth: 1,
+    borderColor: opts.error ? t.danger : t.borderStrong,
+    borderRadius: 8,
+    fontSize: F_BODY,
+    textAlign: opts.align ?? 'left',
+    ...(opts.mono ? NUM_STYLE : {}),
+  } as const
 }
 
 function FieldInput({ label, value, onChange, placeholder, disabled = false, mono = false, hint, testId }: {
@@ -513,35 +561,75 @@ function FieldInput({ label, value, onChange, placeholder, disabled = false, mon
   const t = useTheme()
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0, flexGrow: 1 }}>
-      {label && (
-        <text style={{ color: t.fg3, fontSize: F_CAP }}>{label}</text>
-      )}
+      {label && <text style={{ color: t.fg2, fontSize: F_META }}>{label}</text>}
       <input
         testId={testId}
         value={value}
         placeholder={placeholder}
         readOnly={disabled}
         onChange={(event) => onChange?.(event.value ?? '')}
-        style={{
-          height: 32,
-          minHeight: 32,
-          padding: 7,
-          paddingLeft: 9,
-          paddingRight: 9,
-          color: disabled ? t.fg3 : t.fg,
-          backgroundColor: disabled ? t.hover : t.surface,
-          borderWidth: 1,
-          borderColor: t.borderStrong,
-          borderRadius: 7,
-          ...(mono ? NUM_STYLE : {}),
-          fontSize: F_BODY,
-        }}
+        style={inputStyle(t, { locked: disabled, mono })}
       />
-      {hint ? <text style={{ color: t.fg3, fontSize: F_CAP }}>{hint}</text> : null}
+      {hint ? <text style={{ color: t.danger, fontSize: F_META }}>{hint}</text> : null}
     </div>
   )
 }
 
+/** .select — a 32px input-looking trigger showing the option label, with an anchored menu. */
+function Dropdown({ value, options, onChange, placeholder = 'Choose…', disabled = false, error = false, width, testId }: {
+  value: string
+  options: Array<{ value: string; label: string }>
+  onChange: (value: string) => void
+  placeholder?: string
+  disabled?: boolean
+  error?: boolean
+  width?: number
+  testId?: string
+}) {
+  const t = useTheme()
+  const [open, setOpen] = useState(false)
+  const current = options.find((option) => option.value === value)
+  return (
+    <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', width, minWidth: 0 }}>
+      <div
+        testId={testId}
+        onClick={once(() => !disabled && setOpen((state) => !state))}
+        style={{ ...inputStyle(t, { locked: disabled, error }), display: 'flex', alignItems: 'center', gap: 8, cursor: disabled ? 'default' : 'pointer', hover: disabled ? {} : { borderColor: t.fg3 } }}
+      >
+        <text style={{ flexGrow: 1, minWidth: 0, color: current ? (disabled ? t.fg2 : t.fg) : t.fg3, fontSize: F_BODY, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{current?.label ?? (value || placeholder)}</text>
+        <Icon name="chevDown" size={14} color={t.fg3} />
+      </div>
+      {open && (
+        <anchored side="bottom" align="start" gap={4} fit="switch" snapMargin={8} occlude>
+          <div
+            onMouseDownOutside={() => setOpen(false)}
+            style={{ display: 'flex', flexDirection: 'column', minWidth: Math.max(width ?? 180, 160), maxHeight: 280, overflow: 'scroll', padding: 4, borderRadius: 12, borderWidth: 1, borderColor: t.border, backgroundColor: t.raised, boxShadow: { offsetX: 0, offsetY: 8, blurRadius: 24, spreadRadius: 0, color: t === themes.dark ? 'rgba(0,0,0,0.5)' : 'rgba(20,20,30,0.12)' } }}
+          >
+            {options.map((option) => {
+              const chosen = option.value === value
+              return (
+                <div
+                  key={option.value}
+                  testId={testId ? `${testId}-${option.value}` : undefined}
+                  onClick={once(() => {
+                    onChange(option.value)
+                    setOpen(false)
+                  })}
+                  style={{ display: 'flex', alignItems: 'center', gap: 8, minHeight: 32, paddingLeft: 10, paddingRight: 10, borderRadius: 8, cursor: 'pointer', backgroundColor: chosen ? t.selected : CLEAR, hover: { backgroundColor: chosen ? t.selected : t.hover } }}
+                >
+                  <text style={{ flexGrow: 1, color: t.fg, fontSize: F_BODY, whiteSpace: 'nowrap' }}>{option.label}</text>
+                  {chosen && <Icon name="check" size={14} color={t.fg2} />}
+                </div>
+              )
+            })}
+          </div>
+        </anchored>
+      )}
+    </div>
+  )
+}
+
+/** A bordered group (radius 12) — the prototype's .list / .card / .disc-group container. */
 function Card({ children, title, subtitle, aside, onToggle, open }: {
   children?: ReactNode
   title?: string
@@ -553,62 +641,126 @@ function Card({ children, title, subtitle, aside, onToggle, open }: {
   const t = useTheme()
   const disclosure = onToggle !== undefined
   return (
-    <div
-      style={{
-        display: 'flex',
-        flexDirection: 'column',
-        borderWidth: 1,
-        borderColor: t.border,
-        borderRadius: 10,
-        backgroundColor: t.surface,
-      }}
-    >
+    <div style={{ display: 'flex', flexDirection: 'column', borderWidth: 1, borderColor: t.border, borderRadius: 12, backgroundColor: t.surface, overflow: 'hidden' }}>
       {title !== undefined && (
         <div
-          onClick={disclosure ? onToggle : undefined}
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 8,
-            padding: 14,
-            paddingLeft: 16,
-            paddingRight: 16,
-            cursor: disclosure ? 'pointer' : 'default',
-            borderBottomWidth: disclosure ? (open ? 1 : 0) : 1,
-            borderColor: t.border,
-          }}
+          onClick={once(disclosure ? onToggle : undefined)}
+          style={{ display: 'flex', alignItems: 'center', gap: 8, minHeight: 44, paddingLeft: 12, paddingRight: 12, cursor: disclosure ? 'pointer' : 'default', borderBottomWidth: disclosure ? (open ? 1 : 0) : 1, borderColor: t.border }}
         >
-          {disclosure && (
-            <Icon name={open ? 'chevDown' : 'chevRight'} size={14} color={t.fg3} />
-          )}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 1, flexGrow: 1, minWidth: 0 }}>
-            <text style={{ color: t.fg, fontSize: F_EMPH, fontWeight: 600 }}>{title}</text>
+          {disclosure && <Icon name={open ? 'chevDown' : 'chevRight'} size={16} color={t.fg3} />}
+          <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
+            <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 600 }}>{title}</text>
             {subtitle && <text style={{ color: t.fg3, fontSize: F_META }}>{subtitle}</text>}
           </div>
           {aside}
         </div>
       )}
-      {(!disclosure || open) && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 16 }}>
-          {children}
-        </div>
-      )}
+      {(!disclosure || open) && <div style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 16 }}>{children}</div>}
     </div>
   )
 }
 
+/** h2.sec — 16/600, 32px above (28 for the first), 12 below. */
 function SectionLabel({ children, first = false }: { children: ReactNode; first?: boolean }) {
   const t = useTheme()
+  return <text style={{ color: t.fg, fontSize: F_TITLE, fontWeight: 600, paddingTop: first ? 28 : 32, paddingBottom: 12 }}>{children}</text>
+}
+
+/** .glabel — 12/500 fg3, padding 16 8 4. */
+function GroupLabel({ children }: { children: ReactNode }) {
+  const t = useTheme()
+  return <text style={{ color: t.fg3, fontSize: F_META, fontWeight: 500, paddingTop: 16, paddingLeft: 8, paddingRight: 8, paddingBottom: 4 }}>{children}</text>
+}
+
+/** .nav — 32 tall, padding 0 8, gap 10, radius 8, 13/500; fg2 at rest, hover fill + fg, current = selected + fg. */
+function NavRow({ icon, avatar, label, current = false, count, trail, onClick, testId, mono }: {
+  icon?: IconName
+  avatar?: ReactNode
+  label: string
+  current?: boolean
+  count?: string | number
+  trail?: ReactNode
+  onClick: () => void
+  testId?: string
+  mono?: string
+}) {
+  const t = useTheme()
+  const [hot, setHot] = useState(false)
+  const ink = current || hot ? t.fg : t.fg2
   return (
-    <text style={{ color: t.fg3, fontSize: F_CAP, fontWeight: 600, paddingTop: first ? 2 : 12, paddingBottom: 4 }}>
+    <div
+      testId={testId}
+      onClick={once(onClick)}
+      onMouseEnter={() => setHot(true)}
+      onMouseLeave={() => setHot(false)}
+      style={{ display: 'flex', alignItems: 'center', gap: 10, height: 32, minHeight: 32, paddingLeft: 8, paddingRight: 8, borderRadius: 8, cursor: 'pointer', backgroundColor: current ? t.selected : CLEAR, hover: { backgroundColor: current ? t.selected : t.hover } }}
+    >
+      {icon && <Icon name={icon} size={16} color={ink} />}
+      {avatar}
+      {mono && <text style={{ color: ink, fontSize: F_META, width: 44, minWidth: 44, ...NUM_STYLE }}>{mono}</text>}
+      <text style={{ color: ink, fontSize: F_BODY, fontWeight: 500, flexGrow: 1, flexShrink: 1, minWidth: 0, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{label}</text>
+      {count !== undefined && count !== '' && <text style={{ color: t.fg3, fontSize: F_META, ...NUM_STYLE, fontWeight: 400 }}>{String(count)}</text>}
+      {trail}
+    </div>
+  )
+}
+
+/** .list — bordered (radius 12) container; children are rows separated by hairlines. */
+function List({ children }: { children: ReactNode }) {
+  const t = useTheme()
+  return <div style={{ display: 'flex', flexDirection: 'column', borderWidth: 1, borderColor: t.border, borderRadius: 12, overflow: 'hidden', backgroundColor: t.surface }}>{children}</div>
+}
+
+/** .row — min-height 52, padding 8 16, gap 12; hairline between rows; clickable rows hover-fill. */
+function Row({ children, first, onClick, testId, dim = false }: { children: ReactNode; first: boolean; onClick?: () => void; testId?: string; dim?: boolean }) {
+  const t = useTheme()
+  return (
+    <div
+      testId={testId}
+      onClick={once(onClick)}
+      style={{ display: 'flex', alignItems: 'center', gap: 12, minHeight: 52, paddingTop: 8, paddingBottom: 8, paddingLeft: 16, paddingRight: 16, borderTopWidth: first ? 0 : 1, borderColor: t.border, cursor: onClick ? 'pointer' : 'default', opacity: dim ? 1 : 1, hover: onClick ? { backgroundColor: t.hover } : {} }}
+    >
       {children}
-    </text>
+    </div>
+  )
+}
+
+/** .ph — page title 20/600 with a lede (fg2, max ~62ch). */
+function PageHead({ title, lede, actions }: { title: string; lede?: string; actions?: ReactNode }) {
+  const t = useTheme()
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+      <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
+        <text style={{ color: t.fg, fontSize: F_PAGE, fontWeight: 600 }}>{title}</text>
+        {lede && <text style={{ color: t.fg2, fontSize: F_BODY, paddingTop: 6, maxWidth: 520, lineHeight: 19 }}>{lede}</text>}
+      </div>
+      {actions}
+    </div>
+  )
+}
+
+/** .rname — 13/500 title over a 12/fg3 line, both truncating. */
+function RName({ title, sub, dim = false }: { title: string; sub?: string; dim?: boolean }) {
+  const t = useTheme()
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0 }}>
+      <text style={{ color: dim ? t.fg3 : t.fg, fontSize: F_BODY, fontWeight: 500, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{title}</text>
+      {sub !== undefined && <text style={{ color: t.fg3, fontSize: F_META, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{sub}</text>}
+    </div>
+  )
+}
+
+/** .code — 12/600 tabular, fixed column. */
+function Code({ children, width = 68, dim = false }: { children: string; width?: number; dim?: boolean }) {
+  const t = useTheme()
+  return (
+    <div style={{ width, minWidth: width }}>
+      <text style={{ color: dim ? t.fg3 : t.fg, fontSize: F_META, ...NUM_STYLE }}>{children}</text>
+    </div>
   )
 }
 
 // ---------------------------------------------------------------------------
-
-const SUPPORTED_FORM_CODES = ['1601Cv2018', '2551Qv2018', '0619E'] as const
 
 /** Starter packs map to real catalog codes (latest variant per family). */
 const STARTER_PACKS: Record<string, string[]> = {
@@ -649,6 +801,20 @@ function App() {
   const [panel, setPanel] = useState<PanelKind>(null)
   const [overlay, setOverlay] = useState<Overlay>(null)
   const [menuOpen, setMenuOpen] = useState(false)
+  const [panelEdit, setPanelEdit] = useState<null | { name: string; bname: string; address: string }>(null)
+  const [libQuery, setLibQuery] = useState('')
+  const [libFreq, setLibFreq] = useState<'All' | 'Monthly' | 'Quarterly' | 'Annual' | 'As needed'>('All')
+  const windowSize = useWindowSize()
+  const [confirmEmails, setConfirmEmails] = useState(true)
+  const [showErrors, setShowErrors] = useState(false)
+  const [touched, setTouched] = useState<Set<string>>(new Set())
+  const [openMore, setOpenMore] = useState<Set<string>>(new Set())
+  const [guided, setGuided] = useState(false)
+  const partRefs = useRef<Array<{ scrollIntoView?: () => void } | null>>([])
+  const [lockAfter, setLockAfter] = useState(() => store.getSetting('lockAfter') ?? '15m')
+  /** Content-column width; below 640 the prototype drops secondary columns (its container queries). */
+  const contentWidth = Math.min(page === 'form' || page === 'library' ? 1120 : 880, windowSize.width - (sidebarCollapsed ? 16 : 256) - (panel ? 320 : 8) - 64)
+  const narrow = contentWidth < 640
   const [tree, setTree] = useState<TaxpayerTree[]>(() => store.listTaxpayers())
   const [selectedTin, setSelectedTin] = useState<string | undefined>(() => store.listTaxpayers()[0]?.tin9)
   const [selectedBranchId, setSelectedBranchId] = useState<string | undefined>(() => {
@@ -923,10 +1089,6 @@ function App() {
       setDraft(null)
     }
     if (next.profileId !== selectedProfileId) setPendingCodes([])
-    if (next.page === 'form' && next.formCode && !(SUPPORTED_FORM_CODES as readonly string[]).includes(next.formCode)) {
-      showToast(`${displayFormCode(next.formCode)} isn't editable yet — the editor covers 1601-C, 2551Q and 0619-E for now.`)
-      next = { ...next, page: 'taxpayer', tab: 'forms', formCode: undefined, period: undefined }
-    }
     setPage(next.page)
     setTab(next.tab)
     setSelectedTin(next.tin)
@@ -1091,8 +1253,8 @@ function App() {
   // -- Form editor (unchanged semantics) ------------------------------------
 
   async function openForm(entry: LibraryEntry, period: string, profile: Profile | undefined = selectedProfile) {
-    if (!profile || !(SUPPORTED_FORM_CODES as readonly string[]).includes(entry.formCode)) return
-    const code = entry.formCode as PrefillFormCode
+    if (!profile) return
+    const code = entry.formCode
     const ticket = ++formLoadSeq.current
     const previous = store.listDrafts(profile.id, code).find((item) => item.period === period)
     const opened = store.openDraft(profile.id, code, period)
@@ -1106,14 +1268,18 @@ function App() {
     setFormInstance(null)
     setFieldSnapshot([])
     setIssues([])
+    setShowErrors(false)
+    setTouched(new Set())
+    setOpenMore(new Set())
+    setCollapsedPartSet(new Set())
     let form: FormInstance | undefined
     try {
-      form = await openOfficialForm(code)
+      form = await openOfficialForm(code as PrefillFormCode)
       if (ticket !== formLoadSeq.current) {
         await form.close()
         return
       }
-      const prefillValues = buildPrefillValues(code, profile, form.fields(), period)
+      const prefillValues = isPrefillCode(code) ? buildPrefillValues(code, profile, form.fields(), period) : {}
       const initialValues = mergeDraftPrefill(opened.values, prefillValues)
       for (const [id, value] of Object.entries(initialValues)) form.set(id, value)
       const nextDraft = previous
@@ -1156,7 +1322,8 @@ function App() {
   }
 
   function editField(field: FieldSnapshot, value: string | boolean) {
-    if (!formInstance || !formEntry || autoFieldIds(formEntry.formCode as PrefillFormCode).has(field.id) || field.disabled) return
+    if (!formInstance || !formEntry || field.disabled) return
+    if (isPrefillCode(formEntry.formCode) && autoFieldIds(formEntry.formCode).has(field.id)) return
     formInstance.set(field.id, value)
     refreshEditor(formInstance)
   }
@@ -1200,15 +1367,12 @@ function App() {
   function openDueRow(row: { profileId: string; formCode: string; period: string }) {
     const owner = profileById(row.profileId)
     if (!owner) return
-    navTo({
-      ...navNow,
-      page: 'form',
-      tin: owner.taxpayer.tin9,
-      branchId: branchId(owner.taxpayer.tin9, owner.branchCode),
-      profileId: row.profileId,
-      formCode: row.formCode,
-      period: row.period,
-    })
+    setSelectedTin(owner.taxpayer.tin9)
+    setSelectedBranchId(branchId(owner.taxpayer.tin9, owner.branchCode))
+    setSelectedProfileId(row.profileId)
+    setStartFormCode(row.formCode)
+    setStartPeriod(row.period)
+    setOverlay({ kind: 'startReturn' })
   }
 
   /** Copy a filed draft's values into a new draft for the next period. */
@@ -1315,27 +1479,25 @@ function App() {
     return (
       <div
         testId="titlebar-pill"
-        onClick={() => setPanel(panel === 'taxpayer' ? null : 'taxpayer')}
+        onClick={once(() => setPanel(panel === 'taxpayer' ? null : 'taxpayer'))}
         style={{
           display: 'flex',
           alignItems: 'center',
-          gap: 7,
-          height: 28,
+          gap: 8,
+          height: 30,
           paddingLeft: 4,
-          paddingRight: 9,
-          borderRadius: 14,
+          paddingRight: 10,
+          borderRadius: 15,
           borderWidth: 1,
           borderColor: panel === 'taxpayer' ? t.borderStrong : t.border,
           backgroundColor: panel === 'taxpayer' ? t.selected : t.surface,
           cursor: 'pointer',
-          hover: { backgroundColor: panel === 'taxpayer' ? t.selected : t.hover },
+          hover: { borderColor: t.borderStrong },
         }}
       >
         <Avatar name={pillLabel} size={20} />
-        <text style={{ color: t.fg, fontSize: F_META, fontWeight: 600 }}>{pillLabel}</text>
-        {pillTin !== '' && (
-          <text style={{ color: t.fg3, fontSize: F_CAP, ...NUM_STYLE }}>{pillTin}</text>
-        )}
+        <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 600, whiteSpace: 'nowrap' }}>{pillLabel}</text>
+        {pillTin !== '' && <text style={{ color: t.fg2, fontSize: F_META, ...NUM_STYLE, fontWeight: 400, whiteSpace: 'nowrap' }}>{pillTin}</text>}
         <Icon name="chevDown" size={14} color={t.fg3} />
       </div>
     )
@@ -1345,7 +1507,7 @@ function App() {
     return (
       <div
         testId={testId}
-        onClick={onClick}
+        onClick={once(onClick)}
         style={{
           width: 46,
           height: 40,
@@ -1377,24 +1539,19 @@ function App() {
           alignItems: 'center',
           height: 40,
           minHeight: 40,
-          paddingLeft: isMac ? 72 : 6,
-          paddingRight: isWin ? 0 : 6,
+          paddingLeft: isMac ? 76 : 10,
+          paddingRight: isWin ? 0 : 10,
           backgroundColor: t.bg,
         }}
       >
-        <div style={{ display: 'flex', alignItems: 'center', gap: 2, flexGrow: 1, minWidth: 0 }}>
-          <IBtn
-            testId="tb-sidebar"
-            icon="panelLeft"
-            active={!sidebarCollapsed}
-            onClick={() => setSidebarCollapsed((value) => !value)}
-          />
-          <IBtn testId="tb-back" icon="arrowLeft" disabled={!canNavBack} onClick={() => navJump(-1)} />
-          <IBtn testId="tb-fwd" icon="arrowRight" disabled={!canNavFwd} onClick={() => navJump(1)} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexGrow: 1, flexBasis: 0, minWidth: 0 }}>
+          <IBtn testId="tb-sidebar" icon="panelLeft" onClick={once(() => setSidebarCollapsed((value) => !value))} />
+          <IBtn testId="tb-back" icon="arrowLeft" disabled={!canNavBack} onClick={once(() => navJump(-1))} />
+          <IBtn testId="tb-fwd" icon="arrowRight" disabled={!canNavFwd} onClick={once(() => navJump(1))} />
           {sidebarCollapsed && (
             <>
-              <IBtn testId="tb-search" icon="search" onClick={() => setOverlay({ kind: 'search' })} />
-              <IBtn testId="tb-plus" icon="plus" onClick={() => setOverlay({ kind: 'startReturn' })} />
+              <IBtn testId="tb-search" icon="search" onClick={once(() => setOverlay({ kind: 'search' }))} />
+              <IBtn testId="tb-plus" icon="plus" onClick={once(() => setOverlay({ kind: 'startReturn' }))} />
             </>
           )}
           <div
@@ -1412,7 +1569,7 @@ function App() {
           />
         </div>
         {pillButton()}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 2, flexGrow: 1, justifyContent: 'flex-end' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexGrow: 1, flexBasis: 0, justifyContent: 'flex-end', height: 40 }}>
           <div
             testId="tb-drag-right"
             onMouseDown={() => {
@@ -1431,25 +1588,26 @@ function App() {
               testId="tb-bell"
               icon="bell"
               active={panel === 'notifications'}
-              onClick={() => setPanel(panel === 'notifications' ? null : 'notifications')}
+              onClick={once(() => setPanel(panel === 'notifications' ? null : 'notifications'))}
             />
             {unreadCount > 0 && (
               <div
                 style={{
                   position: 'absolute',
-                  top: 5,
-                  right: 6,
-                  width: 7,
-                  height: 7,
-                  borderRadius: 4,
+                  top: 3,
+                  right: 3,
+                  width: 10,
+                  height: 10,
+                  borderRadius: 5,
                   backgroundColor: t.accent,
-                  borderWidth: 1,
+                  borderWidth: 2,
                   borderColor: t.bg,
+                  pointerEvents: 'none',
                 }}
               />
             )}
           </div>
-          <IBtn testId="tb-theme" icon={themeIcon()} onClick={cycleTheme} />
+          <IBtn testId="tb-theme" icon={themeIcon()} onClick={once(cycleTheme)} />
           {isWin && (
             <>
               {captionButton('─', () => gpuix.minimizeWindow?.(), false, 'tb-min')}
@@ -1464,184 +1622,101 @@ function App() {
 
   // -- Left sidebar ----------------------------------------------------------
 
-  function navRow(icon: IconName, label: string, active: boolean, onClick: () => void, testId?: string) {
-    return (
-      <div
-        testId={testId}
-        onClick={onClick}
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 9,
-          height: 32,
-          paddingLeft: 8,
-          paddingRight: 8,
-          borderRadius: 7,
-          cursor: 'pointer',
-          backgroundColor: active ? t.selected : 'rgba(0,0,0,0)',
-          hover: { backgroundColor: active ? t.selected : t.hover },
-        }}
-      >
-        <Icon name={icon} size={16} color={active ? t.fg : t.fg2} />
-        <text style={{ color: active ? t.fg : t.fg2, fontSize: F_BODY, fontWeight: active ? 600 : 400 }}>
-          {label}
-        </text>
-      </div>
-    )
-  }
-
   function sidebar() {
     if (sidebarCollapsed) return null
+    const accountName = displayName || 'Set your name'
     return (
-      <div
-        style={{
-          display: 'flex',
-          flexDirection: 'column',
-          width: 248,
-          minWidth: 248,
-          padding: 8,
-          paddingTop: 4,
-          gap: 4,
-          backgroundColor: t.bg,
-        }}
-      >
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+      <div style={{ display: 'flex', flexDirection: 'column', width: 248, minWidth: 248, paddingTop: 4, paddingLeft: 8, paddingRight: 8, paddingBottom: 8, backgroundColor: t.bg }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
           <div
             testId="sidebar-search"
-            onClick={() => setOverlay({ kind: 'search' })}
+            onClick={once(() => setOverlay({ kind: 'search' }))}
             style={{
               display: 'flex',
               alignItems: 'center',
               gap: 8,
               flexGrow: 1,
+              minWidth: 0,
               height: 32,
-              paddingLeft: 9,
-              paddingRight: 6,
-              borderRadius: 7,
+              paddingLeft: 10,
+              paddingRight: 8,
+              borderRadius: 8,
               borderWidth: 1,
-              borderColor: t.borderStrong,
+              borderColor: t.border,
               backgroundColor: t.surface,
               cursor: 'pointer',
-              hover: { borderColor: t.fg3 },
+              hover: { borderColor: t.borderStrong },
             }}
           >
-            <Icon name="search" size={14} color={t.fg3} />
+            <Icon name="search" size={16} color={t.fg3} />
             <text style={{ color: t.fg3, fontSize: F_BODY, flexGrow: 1 }}>Search</text>
-            <Kbd>Ctrl K</Kbd>
+            <Kbd>{isMac ? '⌘K' : 'Ctrl K'}</Kbd>
           </div>
-          <IBtn testId="sidebar-new" icon="plus" size={32} iconSize={16} onClick={() => setOverlay({ kind: 'startReturn' })} />
+          <IBtn testId="sidebar-new" icon="plus" onClick={once(() => setOverlay({ kind: 'startReturn' }))} />
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 1, paddingTop: 4 }}>
-          {navRow('home', 'Home', page === 'home', () => goto('home'), 'nav-home')}
-          {navRow('calendar', 'Calendar', page === 'calendar', () => goto('calendar'), 'nav-calendar')}
-          {navRow('file', 'Filings', page === 'filings', () => goto('filings'), 'nav-filings')}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 2, paddingTop: 12, flexGrow: 1, minHeight: 0, overflow: 'scroll' }}>
+          <NavRow testId="nav-home" icon="home" label="Home" current={page === 'home'} onClick={once(() => goto('home'))} />
+          <NavRow testId="nav-library" icon="file" label="Form library" current={page === 'library'} onClick={once(() => goto('library'))} />
+          <NavRow testId="nav-calendar" icon="calendar" label="Calendar" current={page === 'calendar'} onClick={once(() => goto('calendar'))} />
+          <NavRow testId="nav-filings" icon="history" label="Filings" current={page === 'filings'} onClick={once(() => goto('filings'))} />
+          {showRecent && recentDrafts.length > 0 && (
+            <>
+              <GroupLabel>Recent</GroupLabel>
+              {recentDrafts.map((item) => {
+                const owner = profileById(item.profileId)
+                return (
+                  <NavRow
+                    key={item.id}
+                    testId={`recent-${item.id}`}
+                    icon="file"
+                    label={`${displayFormCode(item.formCode)} ${periodLabel(item.period)} · ${owner?.taxpayer.name ?? ''}`}
+                    onClick={once(() => openDraftById(item))}
+                  />
+                )
+              })}
+            </>
+          )}
         </div>
-        {showRecent && recentDrafts.length > 0 && (
-          <div style={{ display: 'flex', flexDirection: 'column', paddingTop: 8 }}>
-            <text style={{ color: t.fg3, fontSize: F_CAP, fontWeight: 600, paddingLeft: 8, paddingBottom: 4 }}>
-              Recent
-            </text>
-            {recentDrafts.map((item) => {
-              const owner = profileById(item.profileId)
-              return (
-                <div
-                  key={item.id}
-                  testId={`recent-${item.id}`}
-                  onClick={() => openDraftById(item)}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 8,
-                    height: 32,
-                    paddingLeft: 8,
-                    paddingRight: 8,
-                    borderRadius: 7,
-                    cursor: 'pointer',
-                    hover: { backgroundColor: t.hover },
-                  }}
-                >
-                  <Icon name="file" size={14} color={t.fg3} />
-                  <text style={{ color: t.fg2, fontSize: F_META, ...NUM_STYLE, minWidth: 56 }}>
-                    {displayFormCode(item.formCode)}
-                  </text>
-                  <text
-                    style={{
-                      color: t.fg2,
-                      fontSize: F_META,
-                      flexGrow: 1,
-                      minWidth: 0,
-                      whiteSpace: 'nowrap',
-                      textOverflow: 'ellipsis',
-                      overflow: 'hidden',
-                    }}
-                  >
-                    {`${periodLabel(item.period)} · ${owner?.taxpayer.name ?? ''}`}
-                  </text>
-                </div>
-              )
-            })}
-          </div>
-        )}
-        <div style={{ flexGrow: 1 }} />
-        {navRow('settings', 'Settings', page === 'settings', () => goto('settings'), 'nav-settings')}
-        <div style={{ position: 'relative' }}>
-          <div
-            testId="user-card"
-            onClick={() => setMenuOpen((value) => !value)}
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 9,
-              padding: 8,
-              borderRadius: 8,
-              cursor: 'pointer',
-              hover: { backgroundColor: t.hover },
-            }}
-          >
-            <Avatar name={displayName || 'Devin'} size={28} />
-            <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
-              <text style={{ color: t.fg, fontSize: F_META, fontWeight: 600, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
-                {displayName || 'Set your name'}
-              </text>
-              <text style={{ color: t.fg3, fontSize: F_CAP, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
-                {email || 'No email set'}
-              </text>
-            </div>
-            <Icon name="chevDown" size={14} color={t.fg3} />
-          </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 2, paddingTop: 8, position: 'relative' }}>
           {menuOpen && (
             <div
               onMouseDownOutside={() => setMenuOpen(false)}
               style={{
                 position: 'absolute',
-                bottom: 46,
+                bottom: 48,
                 left: 0,
                 right: 0,
                 display: 'flex',
                 flexDirection: 'column',
                 padding: 4,
-                borderRadius: 9,
+                borderRadius: 12,
                 borderWidth: 1,
                 borderColor: t.border,
                 backgroundColor: t.raised,
+                boxShadow: { offsetX: 0, offsetY: 16, blurRadius: 44, spreadRadius: 0, color: t === themes.dark ? 'rgba(0,0,0,0.55)' : 'rgba(20,20,30,0.14)' },
               }}
             >
-              <div style={{ padding: 8, paddingLeft: 10 }}>
-                <text style={{ color: t.fg3, fontSize: F_CAP }}>{`Signed in as ${email || 'no email set'}`}</text>
+              <div style={{ paddingTop: 8, paddingBottom: 8, paddingLeft: 8, paddingRight: 8, borderBottomWidth: 1, borderColor: t.border, marginBottom: 4 }}>
+                <text style={{ color: t.fg3, fontSize: F_META }}>{`Signed in as ${email || 'no email set'}`}</text>
               </div>
-              <div
-                testId="menu-account"
-                onClick={() => {
-                  setMenuOpen(false)
-                  goto('settings')
-                }}
-                style={{ display: 'flex', alignItems: 'center', gap: 8, height: 30, paddingLeft: 8, paddingRight: 8, borderRadius: 6, cursor: 'pointer', hover: { backgroundColor: t.hover } }}
-              >
-                <Icon name="settings" size={14} color={t.fg2} />
-                <text style={{ color: t.fg, fontSize: F_META }}>Account settings</text>
-              </div>
+              <NavRow testId="menu-lock" icon="lock" label="Lock app" trail={<Kbd>{isMac ? '⌘L' : 'Ctrl L'}</Kbd>} onClick={once(() => { setMenuOpen(false); showToast('App locked. Enter your PIN to continue.') })} />
+              <NavRow testId="menu-account" icon="user" label="Account settings" onClick={once(() => { setMenuOpen(false); goto('settings') })} />
+              <NavRow testId="menu-logout" icon="logout" label="Log out" onClick={once(() => { setMenuOpen(false); showToast('Signed out.') })} />
             </div>
           )}
+          <NavRow testId="nav-settings" icon="settings" label="Settings" current={page === 'settings'} onClick={once(() => goto('settings'))} />
+          <div
+            testId="user-card"
+            onClick={once(() => setMenuOpen((value) => !value))}
+            style={{ display: 'flex', alignItems: 'center', gap: 10, paddingTop: 6, paddingBottom: 6, paddingLeft: 8, paddingRight: 8, borderRadius: 8, cursor: 'pointer', backgroundColor: menuOpen ? t.hover : CLEAR, hover: { backgroundColor: t.hover } }}
+          >
+            <Avatar name={accountName} size={28} />
+            <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
+              <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 500, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{accountName}</text>
+              <text style={{ color: t.fg3, fontSize: F_META, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{email || 'No email set'}</text>
+            </div>
+            <Icon name="upDown" size={16} color={t.fg3} />
+          </div>
         </div>
       </div>
     )
@@ -1652,64 +1727,52 @@ function App() {
   function rightPanel() {
     if (!panel) return null
     if (panel === 'notifications') {
+      const anyUnread = notifications.some((item) => item.ts > lastRead)
       return (
         <div style={{ display: 'flex', flexDirection: 'column', width: 320, minWidth: 320, backgroundColor: t.bg }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: 12, paddingLeft: 16, paddingRight: 12 }}>
-            <text style={{ color: t.fg, fontSize: F_EMPH, fontWeight: 600 }}>Notifications</text>
-            <div
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, height: 40, minHeight: 40, paddingLeft: 20, paddingRight: 12 }}>
+            <text style={{ color: t.fg, fontSize: F_EMPH, fontWeight: 600, flexGrow: 1 }}>Notifications</text>
+            <Btn
+              small
+              kind="ghost"
               testId="mark-all-read"
-              onClick={() => {
+              disabled={!anyUnread}
+              onClick={once(() => {
                 const now = String(Date.now())
                 store.setSetting('lastReadNotifs', now)
                 setLastRead(Number(now))
-              }}
-              style={{ cursor: 'pointer', padding: 4 }}
+              })}
             >
-              <text style={{ color: t.accent, fontSize: F_META }}>Mark all read</text>
-            </div>
+              Mark all read
+            </Btn>
           </div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 2, flexGrow: 1, minHeight: 0, overflow: 'scroll', paddingLeft: 8, paddingRight: 8, paddingBottom: 12 }}>
-            {notifications.length === 0 && (
-              <text style={{ color: t.fg3, fontSize: F_META, padding: 12 }}>Nothing to review.</text>
-            )}
+          <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minHeight: 0, overflow: 'scroll', paddingLeft: 12, paddingRight: 12, paddingBottom: 12 }}>
+            {notifications.length === 0 && <text style={{ color: t.fg3, fontSize: F_META, padding: 12 }}>Nothing to review.</text>}
             {notifications.map((item) => {
               const icon: IconName =
-                item.kind === 'warning' || item.kind === 'danger'
-                  ? 'alert'
-                  : item.kind === 'success'
-                    ? 'checkCircle'
-                    : item.kind === 'plain'
-                      ? 'box'
-                      : 'info'
-              const iconColor =
+                item.kind === 'warning' || item.kind === 'danger' ? 'alert' : item.kind === 'success' ? 'checkCircle' : item.kind === 'plain' ? 'upload' : 'info'
+              const tint =
                 item.kind === 'warning'
-                  ? t.warning
+                  ? { bg: t.warningSoft, fg: t.warning }
                   : item.kind === 'danger'
-                    ? t.danger
+                    ? { bg: t.dangerSoft, fg: t.danger }
                     : item.kind === 'success'
-                      ? t.success
-                      : t.fg3
+                      ? { bg: t.successSoft, fg: t.success }
+                      : { bg: t.hover, fg: t.fg2 }
               const unread = item.ts > lastRead
               return (
-                <div
-                  key={item.id}
-                  style={{
-                    display: 'flex',
-                    gap: 9,
-                    padding: 9,
-                    borderRadius: 8,
-                    hover: { backgroundColor: t.hover },
-                  }}
-                >
-                  <Icon name={icon} size={15} color={iconColor} />
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 2, flexGrow: 1, minWidth: 0 }}>
-                    <text style={{ color: t.fg, fontSize: F_META }}>{item.title}</text>
-                    <text style={{ color: t.fg3, fontSize: F_CAP, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{item.subtitle}</text>
-                    <text style={{ color: t.fg3, fontSize: 10 }}>{fmtDateTime(item.ts)}</text>
+                <div key={item.id} style={{ display: 'flex', gap: 12, paddingTop: 10, paddingBottom: 10, paddingLeft: 8, paddingRight: 8, borderRadius: 8, hover: { backgroundColor: t.hover } }}>
+                  <div style={{ width: 28, height: 28, minWidth: 28, borderRadius: 14, backgroundColor: tint.bg, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <Icon name={icon} size={16} color={tint.fg} />
                   </div>
-                  {unread && (
-                    <div style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: t.accent, marginTop: 4 }} />
-                  )}
+                  <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
+                    <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 500 }}>{item.title}</text>
+                    <text style={{ color: t.fg3, fontSize: F_META }}>{item.subtitle}</text>
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
+                    <text style={{ color: t.fg3, fontSize: F_CAP, whiteSpace: 'nowrap' }}>{fmtDateShort(new Date(item.ts).toISOString().slice(0, 10))}</text>
+                    {unread && <div style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: t.accent }} />}
+                  </div>
                 </div>
               )
             })}
@@ -1719,263 +1782,184 @@ function App() {
     }
     // panel === 'taxpayer'
     const formsCount = selectedLibrary.length
+    const templateCount = 0
     const branches = taxpayer?.branches ?? []
-    return (
-      <div style={{ display: 'flex', flexDirection: 'column', width: 320, minWidth: 320, backgroundColor: t.bg, overflow: 'scroll' }}>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 16 }}>
-          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
-            <Avatar name={taxpayer ? taxpayer.name : '?'} size={56} />
-            <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
-              <text style={{ color: t.fg, fontSize: F_EMPH, fontWeight: 600, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
-                {taxpayer?.name || 'No taxpayer'}
-              </text>
-              {taxpayer && (
-                <text style={{ color: t.fg3, fontSize: F_META, ...NUM_STYLE }}>{formatTin(taxpayer.tin9)}</text>
-              )}
-            </div>
-            {taxpayer && (
-              <IBtn
-                testId="panel-edit"
-                icon="pencil"
-                size={26}
-                iconSize={13}
-                onClick={() => {
-                  setPanel(null)
-                  goto('taxpayer', { tab: 'profile' })
-                }}
-              />
-            )}
-          </div>
-          {branch && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <Icon name="branch" size={14} color={t.fg3} />
-                <text style={{ color: t.fg2, fontSize: F_META }}>{`${branch.code} · ${branch.name}`}</text>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <Icon name="pin" size={14} color={t.fg3} />
-                <text style={{ color: t.fg2, fontSize: F_META }}>{branch.facts.address || 'No address'}</text>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <Icon name="building" size={14} color={t.fg3} />
-                <text style={{ color: t.fg2, fontSize: F_META }}>{branch.facts.rdo ? `RDO ${branch.facts.rdo}` : 'No RDO'}</text>
-              </div>
-            </div>
-          )}
-          {taxpayer && (
-            <div style={{ display: 'flex', flexDirection: 'column', borderTopWidth: 1, borderColor: t.border, paddingTop: 10 }}>
-              <text style={{ color: t.fg3, fontSize: F_CAP, fontWeight: 600, paddingBottom: 4 }}>Open</text>
-              {([['profile', 'Profile'], ['forms', `Forms${formsCount ? ` · ${formsCount}` : ''}`], ['templates', 'Templates']] as const).map(([tpTab, label]) => (
-                <div
-                  key={tpTab}
-                  testId={`panel-open-${tpTab}`}
-                  onClick={() => {
-                    setPanel(null)
-                    goto('taxpayer', { tab: tpTab })
-                  }}
-                  style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', height: 30, paddingLeft: 8, paddingRight: 8, borderRadius: 6, cursor: 'pointer', hover: { backgroundColor: t.hover } }}
-                >
-                  <text style={{ color: t.fg, fontSize: F_META }}>{label}</text>
-                  <Icon name="chevRight" size={14} color={t.fg3} />
-                </div>
-              ))}
-            </div>
-          )}
-          {branches.length > 0 && (
-            <div style={{ display: 'flex', flexDirection: 'column', borderTopWidth: 1, borderColor: t.border, paddingTop: 10 }}>
-              <text style={{ color: t.fg3, fontSize: F_CAP, fontWeight: 600, paddingBottom: 4 }}>Branches</text>
-              {branches.map((itemBranch) => {
-                const active = selectedBranchId === branchId(taxpayer!.tin9, itemBranch.code)
-                return (
-                  <div
-                    key={itemBranch.code}
-                    testId={`panel-branch-${itemBranch.code}`}
-                    onClick={() => {
-                      setPanel(null)
-                      chooseBranch(taxpayer!.tin9, itemBranch.code)
-                    }}
-                    style={{ display: 'flex', alignItems: 'center', gap: 8, height: 30, paddingLeft: 8, paddingRight: 8, borderRadius: 6, cursor: 'pointer', backgroundColor: active ? t.selected : 'rgba(0,0,0,0)', hover: { backgroundColor: active ? t.selected : t.hover } }}
-                  >
-                    <text style={{ color: t.fg, fontSize: F_META, flexGrow: 1 }}>{itemBranch.name}</text>
-                    <text style={{ color: t.fg3, fontSize: F_CAP, ...NUM_STYLE }}>{itemBranch.code}</text>
-                    {active && <Icon name="check" size={14} color={t.accent} />}
-                  </div>
-                )
-              })}
-              <div
-                testId="panel-add-branch"
-                onClick={() => {
-                  setPanel(null)
-                  setShowNewBranch(true)
-                  goto('taxpayer', { tab: 'profile' })
-                }}
-                style={{ display: 'flex', alignItems: 'center', gap: 8, height: 30, paddingLeft: 8, borderRadius: 6, cursor: 'pointer', hover: { backgroundColor: t.hover } }}
-              >
-                <Icon name="plus" size={14} color={t.fg3} />
-                <text style={{ color: t.fg3, fontSize: F_META }}>Add branch</text>
-              </div>
-            </div>
-          )}
-          {tree.length > 1 && (
-            <div style={{ display: 'flex', flexDirection: 'column', borderTopWidth: 1, borderColor: t.border, paddingTop: 10 }}>
-              <text style={{ color: t.fg3, fontSize: F_CAP, fontWeight: 600, paddingBottom: 4 }}>Switch taxpayer</text>
-              {tree.filter((item) => item.tin9 !== selectedTin).map((item) => (
-                <div
-                  key={item.tin9}
-                  testId={`panel-switch-${item.tin9}`}
-                  onClick={() => chooseTaxpayer(item.tin9)}
-                  style={{ display: 'flex', alignItems: 'center', gap: 8, height: 32, paddingLeft: 4, paddingRight: 8, borderRadius: 6, cursor: 'pointer', hover: { backgroundColor: t.hover } }}
-                >
-                  <Avatar name={item.name || item.tin9} size={20} />
-                  <text style={{ color: t.fg, fontSize: F_META, flexGrow: 1, minWidth: 0, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{item.name || formatTin(item.tin9)}</text>
-                  <text style={{ color: t.fg3, fontSize: F_CAP, ...NUM_STYLE }}>{formatTin(item.tin9).slice(0, 11)}</text>
-                </div>
-              ))}
-            </div>
-          )}
-          <div
-            testId="panel-new-taxpayer"
-            onClick={() => {
-              setPanel(null)
-              setShowNewTaxpayer(true)
-              goto('taxpayer', { tab: 'profile' })
-            }}
-            style={{ display: 'flex', alignItems: 'center', gap: 8, height: 30, paddingLeft: 8, borderTopWidth: 1, borderColor: t.border, paddingTop: 10, cursor: 'pointer' }}
+    const factRows: Array<[IconName, string, string]> = branch
+      ? [
+          ['branch', 'Branch', `${branch.code} · ${branch.name}`],
+          ['pin', 'Address', branch.facts.address || '—'],
+          ['building', 'RDO', branch.facts.rdo || '—'],
+        ]
+      : []
+    const hero = panelEdit && taxpayer && branch ? (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 12, paddingTop: 4, paddingLeft: 8, paddingRight: 8, paddingBottom: 8 }}>
+        <FieldInput label="Registered name" value={panelEdit.name} onChange={(value) => setPanelEdit({ ...panelEdit, name: value })} testId="pe-name" />
+        <FieldInput label="Branch code" value={branch.code} disabled mono />
+        <FieldInput label="Branch name" value={panelEdit.bname} onChange={(value) => setPanelEdit({ ...panelEdit, bname: value })} testId="pe-bname" />
+        <FieldInput label="Address" value={panelEdit.address} onChange={(value) => setPanelEdit({ ...panelEdit, address: value })} testId="pe-address" />
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', paddingTop: 4 }}>
+          <Btn small kind="ghost" onClick={once(() => setPanelEdit(null))}>Cancel</Btn>
+          <Btn
+            small
+            testId="pe-save"
+            onClick={once(() => {
+              const id = branchId(taxpayer.tin9, branch.code)
+              store.updateTaxpayer(taxpayer.tin9, { name: panelEdit.name.trim() || taxpayer.name, type: taxpayer.type, birthDate: taxpayer.birthDate ?? null })
+              store.updateBranch(id, {
+                name: panelEdit.bname.trim() || branch.name,
+                rdo: branch.overrides.rdo ?? null,
+                zip: branch.overrides.zip ?? null,
+                address: panelEdit.address.trim() ? panelEdit.address.trim() : branch.overrides.address ?? null,
+                phone: branch.overrides.phone ?? null,
+                email: branch.overrides.email ?? null,
+              })
+              refreshTree(taxpayer.tin9, id)
+              setPanelEdit(null)
+              showToast('Tax profile saved')
+            })}
           >
-            <Icon name="plus" size={14} color={t.fg3} />
-            <text style={{ color: t.fg3, fontSize: F_META }}>New taxpayer</text>
-          </div>
+            Save
+          </Btn>
         </div>
+      </div>
+    ) : (
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8, paddingTop: 12, paddingLeft: 8, paddingRight: 8, paddingBottom: 16, position: 'relative' }}>
+        {taxpayer && branch && (
+          <div style={{ position: 'absolute', top: 8, right: 0 }}>
+            <IBtn testId="panel-edit" icon="pencil" onClick={once(() => setPanelEdit({ name: taxpayer.name, bname: branch.name, address: branch.facts.address ?? '' }))} />
+          </div>
+        )}
+        <Avatar name={taxpayer ? taxpayer.name || taxpayer.tin9 : '?'} size={56} />
+        <text style={{ color: t.fg, fontSize: F_TITLE, fontWeight: 600, paddingTop: 4, textAlign: 'center' }}>{taxpayer?.name || 'No taxpayer'}</text>
+        {taxpayer && <text style={{ color: t.fg2, fontSize: F_META, ...NUM_STYLE, fontWeight: 400 }}>{formatTin(taxpayer.tin9, branch?.code ?? '00000')}</text>}
+      </div>
+    )
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', width: 320, minWidth: 320, backgroundColor: t.bg, overflow: 'scroll', paddingTop: 4, paddingLeft: 12, paddingRight: 12, paddingBottom: 12 }}>
+        {hero}
+        {!panelEdit && factRows.length > 0 && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginLeft: 8, marginRight: 8, marginBottom: 4, paddingTop: 12, paddingBottom: 12, borderTopWidth: 1, borderBottomWidth: 1, borderColor: t.border }}>
+            {factRows.map(([icon, label, value]) => (
+              <div key={label} style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, width: 78, minWidth: 78 }}>
+                  <Icon name={icon} size={16} color={t.fg3} />
+                  <text style={{ color: t.fg3, fontSize: F_META }}>{label}</text>
+                </div>
+                <text style={{ color: t.fg, fontSize: F_BODY, flexGrow: 1, minWidth: 0 }}>{value}</text>
+              </div>
+            ))}
+          </div>
+        )}
+        {taxpayer && (
+          <>
+            <GroupLabel>Open</GroupLabel>
+            <NavRow testId="panel-open-profile" icon="user" label="Profile" current={page === 'taxpayer' && tab === 'profile'} onClick={once(() => goto('taxpayer', { tab: 'profile' }))} />
+            <NavRow testId="panel-open-forms" icon="file" label="Forms" count={formsCount} current={page === 'taxpayer' && tab === 'forms'} onClick={once(() => goto('taxpayer', { tab: 'forms' }))} />
+            <NavRow testId="panel-open-templates" icon="template" label="Templates" count={templateCount} current={page === 'taxpayer' && tab === 'templates'} onClick={once(() => goto('taxpayer', { tab: 'templates' }))} />
+          </>
+        )}
+        {branches.length > 0 && (
+          <>
+            <GroupLabel>{branches.length > 1 ? 'Branches' : 'Branch'}</GroupLabel>
+            {branches.map((itemBranch) => {
+              const current = selectedBranchId === branchId(taxpayer!.tin9, itemBranch.code)
+              return (
+                <NavRow
+                  key={itemBranch.code}
+                  testId={`panel-branch-${itemBranch.code}`}
+                  mono={itemBranch.code}
+                  label={itemBranch.name}
+                  current={current}
+                  trail={current ? <Icon name="check" size={16} color={t.fg3} /> : undefined}
+                  onClick={once(() => chooseBranch(taxpayer!.tin9, itemBranch.code))}
+                />
+              )
+            })}
+            <NavRow testId="panel-add-branch" icon="plus" label="Add branch" onClick={once(() => { setShowNewBranch(true); goto('taxpayer', { tab: 'profile' }) })} />
+          </>
+        )}
+        <GroupLabel>Switch taxpayer</GroupLabel>
+        {tree.filter((item) => item.tin9 !== selectedTin).map((item) => (
+          <NavRow
+            key={item.tin9}
+            testId={`panel-switch-${item.tin9}`}
+            avatar={<Avatar name={item.name || item.tin9} size={20} />}
+            label={item.name || formatTin(item.tin9)}
+            count={item.tin9.slice(0, 3)}
+            onClick={once(() => chooseTaxpayer(item.tin9))}
+          />
+        ))}
+        <NavRow testId="panel-new-taxpayer" icon="plus" label="New taxpayer" onClick={once(() => { setShowNewTaxpayer(true); goto('taxpayer', { tab: 'profile' }) })} />
       </div>
     )
   }
 
-  // -- Due/filed row renderer (shared by Home, Calendar, Filings) ------------
+  // -- Due/filed rows (prototype .r-due / .r-filed) -------------------------
 
   function dateBox(iso: string) {
     const date = new Date(`${iso}T00:00:00`)
     return (
-      <div
-        style={{
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-          justifyContent: 'center',
-          width: 44,
-          minWidth: 44,
-          height: 44,
-          borderRadius: 8,
-          borderWidth: 1,
-          borderColor: t.border,
-          backgroundColor: t.surface,
-        }}
-      >
-        <text style={{ color: t.fg3, fontSize: 9, fontWeight: 600 }}>{MONTH_ABBR[date.getMonth()]}</text>
-        <text style={{ color: t.fg, fontSize: 15, fontWeight: 700 }}>{date.getDate()}</text>
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', width: 44, minWidth: 44 }}>
+        <text style={{ color: t.fg3, fontSize: F_CAP, fontWeight: 600, lineHeight: 12 }}>{MONTH_ABBR[date.getMonth()]}</text>
+        <text style={{ color: t.fg, fontSize: F_TITLE, fontWeight: 600, lineHeight: 18 }}>{String(date.getDate())}</text>
       </div>
     )
   }
 
-  function statusPill(kind: 'draft' | 'notStarted' | 'filed' | 'overdue' | 'days' | string, label: string) {
-    const tone =
-      kind === 'draft'
-        ? 'accent'
-        : kind === 'filed'
-          ? 'success'
-          : kind === 'overdue'
-            ? 'danger'
-            : kind === 'days'
-              ? 'warning'
-              : 'muted'
-    return <Chip tone={tone as 'accent'}>{label}</Chip>
+  function ownerLine(owner: ReturnType<typeof profileById>, fallbackTin = '', fallbackBranch = ''): string {
+    if (!owner) return `${fallbackTin}${fallbackBranch ? ` · ${fallbackBranch}` : ''}`
+    return owner.taxpayer.branches.length > 1 ? `${owner.taxpayer.name} · ${owner.branchName}` : owner.taxpayer.name
   }
 
-  function dueRow(row: (typeof dueRows)[number], key: string) {
+  function dueRow(row: (typeof dueRows)[number], key: string, first: boolean) {
     const owner = profileById(row.profileId)
     const days = daysUntil(row.dueDate)
-    const entry = catalogByCode.get(row.formCode)
+    const code = displayFormCode(row.formCode)
     return (
-      <div
-        key={key}
-        testId={`due-${row.formCode}-${row.period}`}
-        onClick={() => openDueRow(row)}
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 12,
-          height: 60,
-          paddingLeft: 8,
-          paddingRight: 8,
-          borderRadius: 9,
-          cursor: 'pointer',
-          hover: { backgroundColor: t.hover },
-        }}
-      >
+      <Row key={key} first={first} testId={`due-${row.formCode}-${row.period}`} onClick={once(() => openDueRow(row))}>
         {dateBox(row.dueDate)}
-        <div style={{ width: 68, minWidth: 68 }}>
-          <text style={{ color: t.fg3, fontSize: F_META, ...NUM_STYLE }}>{displayFormCode(row.formCode)}</text>
+        {!narrow && <Code>{code}</Code>}
+        <RName title={`${code} · ${periodLabel(row.period)}`} sub={ownerLine(owner, row.tin9, row.branchCode)} />
+        <div style={{ width: 88, minWidth: 88, display: narrow ? 'none' : 'flex' }}>
+          {days < 0 ? (
+            <Chip tone="danger">{`${-days} day${days === -1 ? '' : 's'} overdue`}</Chip>
+          ) : days <= 14 ? (
+            <Chip tone="warning">{days === 0 ? 'Due today' : `In ${days} day${days === 1 ? '' : 's'}`}</Chip>
+          ) : (
+            <text style={{ color: t.fg2, fontSize: F_META }}>{`In ${days} days`}</text>
+          )}
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 1, flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0 }}>
-          <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 500, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
-            {`${displayFormCode(row.formCode)} · ${periodLabel(row.period)}`}
-          </text>
-          <text style={{ color: t.fg3, fontSize: F_META, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
-            {`${owner?.taxpayer.name ?? row.tin9} · ${owner?.branchName ?? row.branchCode}`}
-          </text>
-        </div>
-        <text style={{ color: days < 0 ? t.danger : days <= 14 ? t.warning : t.fg3, fontSize: F_META, width: 88, minWidth: 88, textAlign: 'right' }}>
-          {days < 0 ? `${-days}d overdue` : days === 0 ? 'Due today' : `In ${days} day${days === 1 ? '' : 's'}`}
-        </text>
         <div style={{ width: 96, minWidth: 96, display: 'flex', justifyContent: 'flex-end' }}>
-          {row.draftStatus === 'draft' ? statusPill('draft', 'Draft') : statusPill('notStarted', 'Not started')}
+          {row.draftStatus === 'draft' ? <Chip tone="accent">Draft</Chip> : <Chip>Not started</Chip>}
         </div>
-      </div>
+      </Row>
     )
   }
 
-  function filedRow(item: Draft, key: string) {
+  function filedRow(item: Draft, key: string, first: boolean) {
     const owner = profileById(item.profileId)
-    const inLibrary = owner
-      ? store.listLibrary(item.profileId).some((entry) => entry.formCode === item.formCode)
-      : false
-    const entry = catalogByCode.get(item.formCode)
+    const inLibrary = owner ? store.listLibrary(item.profileId).some((entry) => entry.formCode === item.formCode) : false
+    const code = displayFormCode(item.formCode)
     return (
-      <div
-        key={key}
-        testId={`filed-${item.id}`}
-        onClick={() => openDraftById(item)}
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 12,
-          height: 52,
-          paddingLeft: 8,
-          paddingRight: 8,
-          borderRadius: 9,
-          cursor: 'pointer',
-          hover: { backgroundColor: t.hover },
-        }}
-      >
-        <div style={{ width: 68, minWidth: 68 }}>
-          <text style={{ color: t.fg3, fontSize: F_META, ...NUM_STYLE }}>{displayFormCode(item.formCode)}</text>
+      <Row key={key} first={first} testId={`filed-${item.id}`} onClick={once(() => openDraftById(item))}>
+        <Code>{code}</Code>
+        <RName title={`${code} · ${periodLabel(item.period)}`} sub={ownerLine(owner)} />
+        {!narrow && <text style={{ color: t.fg2, fontSize: F_META, width: 104, minWidth: 104 }}>{fmtDate(item.updatedAt)}</text>}
+        <div style={{ width: 132, minWidth: 132, display: 'flex', justifyContent: 'flex-end' }}>
+          {inLibrary ? (
+            <Btn small kind="secondary" icon="template" testId={`use-template-${item.id}`} onClick={once(() => useAsTemplate(item))}>Use as template</Btn>
+          ) : (
+            <Chip tone="success" icon="check">Filed</Chip>
+          )}
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 1, flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0 }}>
-          <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 500, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
-            {`${displayFormCode(item.formCode)} · ${periodLabel(item.period)}`}
-          </text>
-          <text style={{ color: t.fg3, fontSize: F_META, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
-            {`${owner?.taxpayer.name ?? ''} · ${owner?.branchName ?? ''}`}
-          </text>
-        </div>
-        <div style={{ width: 88, minWidth: 88, display: 'flex', justifyContent: 'flex-end' }}>
-          <text style={{ color: t.fg3, fontSize: F_META, textAlign: 'right' }}>{fmtDate(item.updatedAt)}</text>
-        </div>
-        {statusPill('filed', '✓ Filed')}
-        {inLibrary && (
-          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-            <Btn small kind="secondary" onClick={() => useAsTemplate(item)}>Use as template</Btn>
-          </div>
-        )}
+      </Row>
+    )
+  }
+
+  function emptyRow(text: string) {
+    return (
+      <div style={{ paddingTop: 40, paddingBottom: 40, display: 'flex', justifyContent: 'center' }}>
+        <text style={{ color: t.fg3, fontSize: F_BODY }}>{text}</text>
       </div>
     )
   }
@@ -1990,25 +1974,15 @@ function App() {
     const taxpayerCount = new Set(next30.map((row) => row.tin9)).size
     const today = new Date().toLocaleDateString('en', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-        <text style={{ color: t.fg, fontSize: F_PAGE, fontWeight: 700 }}>{`${greeting}, ${first}`}</text>
-        <text style={{ color: t.fg3, fontSize: F_BODY, paddingBottom: 18 }}>
-          {`${next30.length} return${next30.length === 1 ? '' : 's'} are due in the next 30 days across ${taxpayerCount} taxpayer${taxpayerCount === 1 ? '' : 's'}. ${today}.`}
-        </text>
+      <div style={{ display: 'flex', flexDirection: 'column' }}>
+        <PageHead
+          title={`${greeting}, ${first}`}
+          lede={`${next30.length} return${next30.length === 1 ? '' : 's'} ${next30.length === 1 ? 'is' : 'are'} due in the next 30 days across ${taxpayerCount} taxpayer${taxpayerCount === 1 ? '' : 's'}. ${today}.`}
+        />
         <SectionLabel first>Due in the next 30 days</SectionLabel>
-        <div style={{ display: 'flex', flexDirection: 'column' }}>
-          {next30.length === 0 && (
-            <text style={{ color: t.fg3, fontSize: F_META, padding: 14 }}>Nothing due in the next 30 days.</text>
-          )}
-          {next30.map((row) => dueRow(row, `${row.profileId}-${row.formCode}-${row.period}`))}
-        </div>
+        <List>{next30.length === 0 ? emptyRow('Nothing due in the next 30 days.') : next30.map((row, index) => dueRow(row, `${row.profileId}-${row.formCode}-${row.period}`, index === 0))}</List>
         <SectionLabel>Recently filed</SectionLabel>
-        <div style={{ display: 'flex', flexDirection: 'column' }}>
-          {filedDrafts.length === 0 && (
-            <text style={{ color: t.fg3, fontSize: F_META, padding: 14 }}>No filed returns yet.</text>
-          )}
-          {filedDrafts.slice(0, 8).map((item) => filedRow(item, item.id))}
-        </div>
+        <List>{filedDrafts.length === 0 ? emptyRow('No filed returns yet.') : filedDrafts.slice(0, 3).map((item, index) => filedRow(item, item.id, index === 0))}</List>
       </div>
     )
   }
@@ -2019,27 +1993,25 @@ function App() {
     const byMonth = new Map<string, typeof dueRows>()
     for (const row of dueRows) {
       const month = row.dueDate.slice(0, 7)
-      const list = byMonth.get(month) ?? []
-      list.push(row)
-      byMonth.set(month, list)
+      byMonth.set(month, [...(byMonth.get(month) ?? []), row])
     }
     const months = [...byMonth.keys()].sort()
+    const monthNames = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-        <text style={{ color: t.fg, fontSize: F_PAGE, fontWeight: 700 }}>Calendar</text>
-        <text style={{ color: t.fg3, fontSize: F_BODY, paddingBottom: 18 }}>
-          {`Every deadline for the forms your taxpayers file, from the ${yearLabel} BIR tax calendar.`}
-        </text>
+      <div style={{ display: 'flex', flexDirection: 'column' }}>
+        <PageHead title="Calendar" lede={`Every deadline for the forms your taxpayers file, from the ${yearLabel} BIR tax calendar.`} />
         {months.length === 0 && (
-          <text style={{ color: t.fg3, fontSize: F_META, padding: 14 }}>No pending deadlines.</text>
+          <>
+            <SectionLabel first>Upcoming</SectionLabel>
+            <List>{emptyRow('No pending deadlines.')}</List>
+          </>
         )}
-        {months.map((month) => {
+        {months.map((month, monthIndex) => {
           const [year, mm] = month.split('-')
-          const label = `${['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'][Number(mm) - 1]} ${year}`
           return (
             <div key={month} style={{ display: 'flex', flexDirection: 'column' }}>
-              <SectionLabel first={month === months[0]}>{label}</SectionLabel>
-              {byMonth.get(month)!.map((row) => dueRow(row, `${month}-${row.profileId}-${row.formCode}-${row.period}`))}
+              <SectionLabel first={monthIndex === 0}>{`${monthNames[Number(mm) - 1]} ${year}`}</SectionLabel>
+              <List>{byMonth.get(month)!.map((row, index) => dueRow(row, `${month}-${row.profileId}-${row.formCode}-${row.period}`, index === 0))}</List>
             </div>
           )
         })}
@@ -2049,22 +2021,108 @@ function App() {
 
   function filingsPage() {
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-        <text style={{ color: t.fg, fontSize: F_PAGE, fontWeight: 700 }}>Filings</text>
-        <text style={{ color: t.fg3, fontSize: F_BODY, paddingBottom: 18 }}>
-          Filed returns stay exactly as submitted. Use one as a template to prefill the next period.
-        </text>
-        {filedDrafts.length === 0 && (
-          <text style={{ color: t.fg3, fontSize: F_META, padding: 14 }}>No filed returns yet.</text>
-        )}
-        {filedDrafts.map((item) => filedRow(item, item.id))}
+      <div style={{ display: 'flex', flexDirection: 'column' }}>
+        <PageHead title="Filings" lede="Filed returns stay exactly as submitted. Use one as a template to prefill the next period." />
+        <div style={{ height: 24 }} />
+        <List>{filedDrafts.length === 0 ? emptyRow('No filed returns yet.') : filedDrafts.map((item, index) => filedRow(item, item.id, index === 0))}</List>
       </div>
     )
   }
 
-  // -- Taxpayer page ---------------------------------------------------------
+  // -- Form library (prototype .fgrid / .fcard) ------------------------------
 
-  function disclosure(id: string, title: string, subtitle: string, aside: ReactNode, body: ReactNode, first = false) {
+  const LIB_FREQS = ['All', 'Monthly', 'Quarterly', 'Annual', 'As needed'] as const
+
+  function libraryForms(): Array<{ meta: FormMeta; key: string; code: string }> {
+    const q = libQuery.trim().toLowerCase()
+    return libraryCatalog
+      .filter(({ meta }) => libFreq === 'All' || meta.frequency === libFreq)
+      .filter(({ key, meta }) => !q || `${key} ${meta.title}`.toLowerCase().includes(q))
+  }
+
+  function openFromLibrary(code: string) {
+    const profile = selectedProfile
+    if (!profile) {
+      showToast('Add a taxpayer first, then open a form for them.')
+      return
+    }
+    if (!store.listLibrary(profile.id).some((entry) => entry.formCode === code)) {
+      store.addForms(profile.id, [code])
+      refreshTree()
+    }
+    const frequency = catalogByCode.get(code)?.frequency ?? 'annual'
+    const period = dueByKey.get(`${profile.id}:${code}`)?.period ?? periodsForYear(profile.year, frequency)[0]
+    navTo({ ...navNow, page: 'form', profileId: profile.id, formCode: code, period })
+  }
+
+  function formCard(item: { meta: FormMeta; key: string; code: string }) {
+    const { meta, key, code } = item
+    return (
+      <div
+        key={code}
+        testId={`card-${key}`}
+        onClick={once(() => openFromLibrary(code))}
+        style={{ display: 'flex', flexDirection: 'column', gap: 8, paddingTop: 14, paddingBottom: 14, paddingLeft: 16, paddingRight: 16, borderWidth: 1, borderColor: t.border, borderRadius: 12, backgroundColor: t.surface, cursor: 'pointer', minWidth: 0, hover: { borderColor: t.borderStrong } }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <text style={{ color: t.fg, fontSize: F_TITLE, ...NUM_STYLE, flexGrow: 1 }}>{key}</text>
+          {meta.draftLayout && <Chip tone="warning">Draft layout</Chip>}
+        </div>
+        <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 500, lineClamp: 2, minHeight: 36, lineHeight: 18 }}>{meta.title}</text>
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+          <Chip>{meta.frequency}</Chip>
+          <Chip>{`${meta.pages}p`}</Chip>
+          <Chip>{`${meta.fields} fields`}</Chip>
+        </div>
+        <div style={{ display: 'flex', gap: 3, height: 6, marginTop: 2 }}>
+          {meta.parts.map((count, index) => (
+            <div key={index} style={{ flexGrow: Math.max(1, count), flexBasis: 0, borderRadius: 3, backgroundColor: t.selected }} />
+          ))}
+        </div>
+      </div>
+    )
+  }
+
+  function libraryTools() {
+    const list = libraryForms()
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', paddingTop: 36, paddingBottom: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, width: 320, height: 32, paddingLeft: 10, paddingRight: 8, borderRadius: 8, borderWidth: 1, borderColor: t.border, backgroundColor: t.surface }}>
+          <Icon name="search" size={16} color={t.fg3} />
+          <input
+            testId="library-search"
+            value={libQuery}
+            placeholder="Find a form, like 2550Q or VAT"
+            onChange={(event) => setLibQuery(event.value ?? '')}
+            style={{ flexGrow: 1, minWidth: 0, height: 30, color: t.fg, fontSize: F_BODY, backgroundColor: CLEAR, borderWidth: 0 }}
+          />
+        </div>
+        <Seg options={LIB_FREQS.map((value) => ({ value, label: value }))} value={libFreq} onChange={setLibFreq} testId="library-freq" />
+        <text style={{ color: t.fg2, fontSize: F_META }}>{`${list.length} of ${libraryCatalog.length}`}</text>
+      </div>
+    )
+  }
+
+  function libraryPage() {
+    const list = libraryForms()
+    const contentWidth = Math.min(1120, windowSize.width - (sidebarCollapsed ? 0 : 248) - (panel ? 320 : 0) - 16 - 64)
+    const columns = Math.max(1, Math.floor((contentWidth + 12) / (250 + 12)))
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column' }}>
+        <PageHead title="Form library" lede={`Every return eBIRForms can prepare. Open one to fill it in for ${taxpayer?.name || 'a taxpayer'}.`} />
+        {libraryTools()}
+        {list.length === 0 ? (
+          emptyRow('No form matches. Try a code like 1601C or a word like VAT.')
+        ) : (
+          <div style={{ display: 'grid', gridTemplateColumns: columns, gap: 12 }}>{list.map(formCard)}</div>
+        )}
+      </div>
+    )
+  }
+
+  // -- Taxpayer page (prototype tpHead + tabs + disclosure group) -----------
+
+  function disclosure(id: string, title: string, meta: string, aside: ReactNode, body: ReactNode, first = false) {
     const open = openSecs.has(id)
     const toggle = () =>
       setOpenSecs((current) => {
@@ -2074,265 +2132,217 @@ function App() {
         return next
       })
     return (
-      <div>
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            height: 44,
-            paddingLeft: 12,
-            paddingRight: 16,
-            borderTopWidth: first ? 0 : 1,
-            borderColor: t.border,
-          }}
-        >
-          <div
-            onClick={toggle}
-            style={{ display: 'flex', alignItems: 'center', gap: 8, flexGrow: 1, minWidth: 0, height: 44, cursor: 'pointer' }}
-          >
+      <div style={{ display: 'flex', flexDirection: 'column', borderTopWidth: first ? 0 : 1, borderColor: t.border }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, paddingRight: 12 }}>
+          <div testId={`disc-${id}`} onClick={once(toggle)} style={{ display: 'flex', alignItems: 'center', gap: 8, flexGrow: 1, minWidth: 0, height: 44, paddingLeft: 12, paddingRight: 8, cursor: 'pointer' }}>
             <Icon name={open ? 'chevDown' : 'chevRight'} size={16} color={t.fg3} />
-            <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
-              <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 600 }}>{title}</text>
-              <text style={{ color: t.fg3, fontSize: F_META }}>{subtitle}</text>
-            </div>
+            <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 600 }}>{title}</text>
+            <text style={{ color: t.fg3, fontSize: F_META, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden', minWidth: 0 }}>{meta}</text>
           </div>
           {open && aside}
         </div>
-        {open && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, paddingTop: 4, paddingRight: 20, paddingBottom: 20, paddingLeft: 36 }}>{body}</div>
-        )}
+        {open && <div style={{ display: 'flex', flexDirection: 'column', paddingTop: 4, paddingRight: 20, paddingBottom: 20, paddingLeft: 36 }}>{body}</div>}
       </div>
     )
   }
 
-  function factRow(label: string, value: string, opts: { mono?: boolean; copy?: string; hint?: string } = {}) {
+  /** .fields — two columns, gaps 16 × 32; a `full` cell takes its own row (one column when narrow). */
+  function fieldGrid(cells: GridCell[]) {
+    const rows: ReactNode[][] = []
+    let pending: ReactNode[] = []
+    for (const cell of cells) {
+      const full = typeof cell === 'object' && cell !== null && 'full' in (cell as object)
+      const node = full ? (cell as { node: ReactNode }).node : (cell as ReactNode)
+      if (full || narrow) {
+        if (pending.length) rows.push(pending)
+        pending = []
+        rows.push([node])
+      } else {
+        pending.push(node)
+        if (pending.length === 2) {
+          rows.push(pending)
+          pending = []
+        }
+      }
+    }
+    if (pending.length) rows.push(pending)
     return (
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, minHeight: 26 }}>
-        <text style={{ color: t.fg2, fontSize: F_META, width: 130, minWidth: 130 }}>{label}</text>
-        <text style={{ color: opts.hint ? t.fg2 : t.fg, fontSize: F_BODY, flexGrow: 1, minWidth: 0, ...(opts.mono ? NUM_STYLE : {}) }}>
-          {value || '—'}
-        </text>
-        {opts.hint && <Chip tone="muted">{opts.hint}</Chip>}
-        {opts.copy && (
-          <IBtn
-            icon="copy"
-            size={24}
-            iconSize={12}
-            onClick={() => showToast('TIN copied.')}
-          />
-        )}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+        {rows.map((row, index) => (
+          <div key={index} style={{ display: 'flex', gap: 32 }}>
+            {row.map((node, cellIndex) => (
+              <div key={cellIndex} style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0 }}>{node}</div>
+            ))}
+            {row.length === 1 && !narrow && !rowIsFull(cells, row[0]) ? <div style={{ flexGrow: 1, flexBasis: 0 }} /> : null}
+          </div>
+        ))}
       </div>
     )
   }
 
-  function editRow(label: string, value: string, onChange: (value: string) => void, opts: { mono?: boolean; disabled?: boolean } = {}) {
-    return (
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, minHeight: 30 }}>
-        <text style={{ color: t.fg2, fontSize: F_META, width: 130, minWidth: 130 }}>{label}</text>
-        <input
-          value={value}
-          readOnly={opts.disabled}
-          onChange={(event) => onChange(event.value ?? '')}
-          style={{
-            height: 30,
-            padding: 6,
-            paddingLeft: 8,
-            flexGrow: 1,
-            minWidth: 0,
-            color: opts.disabled ? t.fg3 : t.fg,
-            backgroundColor: opts.disabled ? t.hover : t.surface,
-            borderWidth: 1,
-            borderColor: t.borderStrong,
-            borderRadius: 6,
-            fontSize: F_BODY,
-            ...(opts.mono ? NUM_STYLE : {}),
-          }}
-        />
+  function rowIsFull(cells: GridCell[], node: ReactNode): boolean {
+    return cells.some((cell) => typeof cell === 'object' && cell !== null && 'full' in (cell as object) && (cell as { node: ReactNode }).node === node)
+  }
+
+  /** .field — label 12 fg2 over value 13; inherited = fg2 value + "Head office" chip. */
+  function factCell(label: string, value: string, opts: { mono?: boolean; inherited?: boolean; full?: boolean; key?: string } = {}): GridCell {
+    const node = (
+      <div key={opts.key ?? label} style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, minHeight: 20 }}>
+          <text style={{ color: t.fg2, fontSize: F_META, flexGrow: 1 }}>{label}</text>
+          {opts.inherited && <Chip icon="branch">Head office</Chip>}
+        </div>
+        <text style={{ color: value ? (opts.inherited ? t.fg2 : t.fg) : t.fg3, fontSize: F_BODY, ...(opts.mono && value ? NUM_STYLE : {}), fontWeight: 400 }}>{value || 'Not set'}</text>
       </div>
     )
+    return opts.full ? { full: true, node } : node
+  }
+
+  function editCell(label: string, value: string, onChange: (value: string) => void, opts: { mono?: boolean; full?: boolean; locked?: boolean; inherit?: { on: boolean; toggle: (value: boolean) => void } } = {}): GridCell {
+    const locked = opts.locked || opts.inherit?.on
+    const node = (
+      <div key={label} style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, minHeight: 20 }}>
+          <text style={{ color: t.fg2, fontSize: F_META, flexGrow: 1 }}>{label}</text>
+          {opts.inherit && (
+            <>
+              <text style={{ color: t.fg3, fontSize: F_CAP }}>Same as head office</text>
+              <Switch on={opts.inherit.on} onToggle={opts.inherit.toggle} />
+            </>
+          )}
+        </div>
+        <input value={value} readOnly={locked} onChange={(event) => onChange(event.value ?? '')} style={inputStyle(t, { locked, mono: opts.mono })} />
+      </div>
+    )
+    return opts.full ? { full: true, node } : node
   }
 
   function editActions(onSave: () => void, section: string) {
     if (editSec !== section) return null
     return (
-      <div style={{ display: 'flex', gap: 8, paddingTop: 4, justifyContent: 'flex-end' }}>
-        <Btn small kind="ghost" onClick={() => setEditSec(null)}>Cancel</Btn>
-        <Btn small onClick={onSave}>Save changes</Btn>
-      </div>
-    )
-  }
-
-  function inheritEditRow(label: string, key: 'rdo' | 'zip' | 'address' | 'phone' | 'email', resolvedValue: string) {
-    const inheriting = branchInherit[key] !== false
-    return (
-      <div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, minHeight: 30 }}>
-          <text style={{ color: t.fg2, fontSize: F_META, width: 130, minWidth: 130 }}>{label}</text>
-          <input
-            value={inheriting ? resolvedValue : String(branchEdit[key] ?? '')}
-            readOnly={inheriting}
-            onChange={(event) => setBranchEdit((current) => ({ ...current, [key]: event.value ?? '' }))}
-            style={{
-              height: 30,
-              padding: 6,
-              paddingLeft: 8,
-              flexGrow: 1,
-              minWidth: 0,
-              color: inheriting ? t.fg3 : t.fg,
-              backgroundColor: inheriting ? t.hover : t.surface,
-              borderWidth: 1,
-              borderColor: t.borderStrong,
-              borderRadius: 6,
-              fontSize: F_BODY,
-            }}
-          />
-        </div>
-        <div
-          style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 140, minHeight: 24 }}
-        >
-          <Switch on={inheriting} onToggle={(value) => setBranchInherit((current) => ({ ...current, [key]: value }))} />
-          <text style={{ color: t.fg3, fontSize: F_META }}>Same as head office</text>
-        </div>
+      <div style={{ display: 'flex', gap: 8, paddingTop: 20, justifyContent: 'flex-end' }}>
+        <Btn small kind="ghost" onClick={once(() => setEditSec(null))}>Cancel</Btn>
+        <Btn small testId={`save-${section}`} onClick={once(onSave)}>Save changes</Btn>
       </div>
     )
   }
 
   function taxpayerProfileTab() {
-    if (!taxpayer || !branch) {
-      return (
-        <Card title="No taxpayer selected" subtitle="Choose a taxpayer from the taxpayer menu or add a new one.">
-          <Btn kind="secondary" onClick={() => setShowNewTaxpayer(true)}>New taxpayer</Btn>
-        </Card>
-      )
-    }
+    if (!taxpayer || !branch) return null
     const facts = branch.facts
     const inherited = facts.inherited
-    const editBtn = (sec: string) => (
-      <IBtn
-        testId={`edit-${sec}`}
-        icon="pencil"
-        size={26}
-        iconSize={13}
-        onClick={() => setEditSec(editSec === sec ? null : sec)}
-      />
-    )
-    const sections = (
-      <div style={{ borderWidth: 1, borderColor: t.border, borderRadius: 12, backgroundColor: t.surface, overflow: 'hidden' }}>
-        {disclosure(
-          'taxpayer',
-          'Taxpayer',
-          'Shared by every branch',
-          editBtn('taxpayer'),
-          editSec === 'taxpayer' ? (
-            <>
-              {editRow('Registered name', taxpayerEdit.name, (value) => setTaxpayerEdit((current) => ({ ...current, name: value })))}
-              {factRow('TIN', formatTin(taxpayer.tin9), { mono: true })}
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10, minHeight: 30 }}>
-                <text style={{ color: t.fg2, fontSize: F_META, width: 130, minWidth: 130 }}>Type</text>
-                <Seg<'individual' | 'non-individual'>
-                  options={[
-                    { value: 'individual', label: 'Individual' },
-                    { value: 'non-individual', label: 'Non-individual' },
-                  ]}
-                  value={taxpayerEdit.type}
-                  onChange={(value) => setTaxpayerEdit((current) => ({ ...current, type: value }))}
-                />
-              </div>
-              {editRow('Birth date', taxpayerEdit.birthDate, (value) => setTaxpayerEdit((current) => ({ ...current, birthDate: value })))}
-              {editActions(saveTaxpayerDetails, 'taxpayer')}
-            </>
-          ) : (
-            <>
-              {factRow('Registered name', taxpayer.name)}
-              {factRow('TIN', formatTin(taxpayer.tin9), { mono: true, copy: formatTin(taxpayer.tin9) })}
-              {factRow('Type', taxpayer.type === 'individual' ? 'Individual' : 'Non-individual')}
-              {factRow('Birth date', taxpayer.birthDate ?? '')}
-            </>
-          ),
-          true,
-        )}
-        {disclosure(
-          'branch',
-          `Branch · ${branch.name}`,
-          `${branch.code === '00000' ? 'Head office' : `Branch ${branch.code}`}`,
-          editBtn('branch'),
-          editSec === 'branch' ? (
-            <>
-              {factRow('Branch code', branch.code, { mono: true })}
-              {editRow('Branch name', branchEdit.name, (value) => setBranchEdit((current) => ({ ...current, name: value })))}
-              {branch.code === '00000'
-                ? editRow('RDO', branchEdit.rdo, (value) => setBranchEdit((current) => ({ ...current, rdo: value })))
-                : inheritEditRow('RDO', 'rdo', facts.rdo)}
-              {editActions(saveBranchDetails, 'branch')}
-            </>
-          ) : (
-            <>
-              {factRow('Branch code', branch.code, { mono: true })}
-              {factRow('Branch name', branch.name)}
-              {factRow('RDO', facts.rdo, { hint: inherited.rdo ? 'Head office' : undefined })}
-            </>
-          ),
-        )}
-        {disclosure(
-          'contact',
-          'Address and contact',
-          'Used on every return',
-          editBtn('contact'),
-          editSec === 'contact' ? (
-            <>
-              {branch.code === '00000' ? (
-                <>
-                  {editRow('Registered address', branchEdit.address, (value) => setBranchEdit((current) => ({ ...current, address: value })))}
-                  {editRow('ZIP', branchEdit.zip, (value) => setBranchEdit((current) => ({ ...current, zip: value })))}
-                  {editRow('Phone', branchEdit.phone, (value) => setBranchEdit((current) => ({ ...current, phone: value })))}
-                  {editRow('Email', branchEdit.email, (value) => setBranchEdit((current) => ({ ...current, email: value })))}
-                </>
-              ) : (
-                <>
-                  {inheritEditRow('Registered address', 'address', facts.address)}
-                  {inheritEditRow('ZIP', 'zip', facts.zip)}
-                  {inheritEditRow('Phone', 'phone', facts.phone)}
-                  {inheritEditRow('Email', 'email', facts.email)}
-                </>
-              )}
-              {editActions(saveBranchDetails, 'contact')}
-            </>
-          ) : (
-            <>
-              {factRow('Registered address', facts.address, { hint: inherited.address ? 'Head office' : undefined })}
-              {factRow('ZIP', facts.zip, { hint: inherited.zip ? 'Head office' : undefined })}
-              {factRow('Phone', facts.phone, { hint: inherited.phone ? 'Head office' : undefined })}
-              {factRow('Email', facts.email, { hint: inherited.email ? 'Head office' : undefined })}
-            </>
-          ),
-        )}
-        {disclosure(
-          'email',
-          'Email, security and export',
-          'Set once for the taxpayer',
-          null,
-          <text style={{ color: t.fg3, fontSize: F_META }}>eBIR notification email, signing and export options arrive with the filing pipeline.</text>,
-        )}
-      </div>
-    )
+    const isHO = branch.code === '00000'
+    const editBtn = (sec: string) => <Btn small kind="ghost" icon="pencil" testId={`edit-${sec}`} onClick={once(() => setEditSec(sec))}>Edit</Btn>
+    const inheritOf = (key: 'rdo' | 'zip' | 'address' | 'phone' | 'email') =>
+      isHO ? undefined : { on: branchInherit[key] !== false, toggle: (value: boolean) => setBranchInherit((current) => ({ ...current, [key]: value })) }
+    const inheritCount = (['address', 'zip', 'phone', 'email'] as const).filter((key) => inherited[key]).length
+    const valueFor = (key: 'rdo' | 'zip' | 'address' | 'phone' | 'email') => (!isHO && branchInherit[key] !== false ? facts[key] ?? '' : String(branchEdit[key] ?? ''))
+    const setBranchField = (key: keyof NewBranchForm) => (value: string) => setBranchEdit((current) => ({ ...current, [key]: value }))
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-        {sections}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', borderWidth: 1, borderColor: t.border, borderRadius: 12, overflow: 'hidden', backgroundColor: t.surface }}>
+          {disclosure(
+            'taxpayer',
+            'Taxpayer',
+            'Shared by every branch',
+            editSec === 'taxpayer' ? null : editBtn('taxpayer'),
+            editSec === 'taxpayer' ? (
+              <>
+                {fieldGrid([
+                  editCell('Registered name', taxpayerEdit.name, (value) => setTaxpayerEdit((current) => ({ ...current, name: value })), { full: true }),
+                  factCell('TIN', formatTin(taxpayer.tin9), { mono: true }),
+                  <div key="type" style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    <text style={{ color: t.fg2, fontSize: F_META, minHeight: 20 }}>Taxpayer type</text>
+                    <Seg<'individual' | 'non-individual'>
+                      options={[{ value: 'individual', label: 'Individual' }, { value: 'non-individual', label: 'Non-individual' }]}
+                      value={taxpayerEdit.type}
+                      onChange={(value) => setTaxpayerEdit((current) => ({ ...current, type: value }))}
+                    />
+                  </div>,
+                  editCell('Birth date', taxpayerEdit.birthDate, (value) => setTaxpayerEdit((current) => ({ ...current, birthDate: value }))),
+                ])}
+                {editActions(saveTaxpayerDetails, 'taxpayer')}
+              </>
+            ) : (
+              fieldGrid([
+                factCell('Registered name', taxpayer.name, { full: true }),
+                factCell('TIN', formatTin(taxpayer.tin9), { mono: true }),
+                factCell('Taxpayer type', taxpayer.type === 'individual' ? 'Individual' : 'Non-individual'),
+                ...(taxpayer.type === 'individual' ? [factCell('Birth date', taxpayer.birthDate ?? '')] : []),
+              ])
+            ),
+            true,
+          )}
+          {disclosure(
+            'branch',
+            'Branch',
+            isHO ? 'Head office' : `Branch ${branch.code}`,
+            editSec === 'branch' ? null : editBtn('branch'),
+            editSec === 'branch' ? (
+              <>
+                {fieldGrid([
+                  factCell('Branch code', branch.code, { mono: true }),
+                  editCell('Branch name', branchEdit.name, setBranchField('name')),
+                  editCell('RDO', valueFor('rdo'), setBranchField('rdo'), { inherit: inheritOf('rdo') }),
+                ])}
+                {editActions(saveBranchDetails, 'branch')}
+              </>
+            ) : (
+              fieldGrid([
+                factCell('Branch code', branch.code, { mono: true }),
+                factCell('Branch name', branch.name),
+                factCell('RDO', facts.rdo ?? '', { inherited: inherited.rdo }),
+              ])
+            ),
+          )}
+          {disclosure(
+            'contact',
+            'Address and contact',
+            isHO ? 'Used on every return' : inheritCount ? `${inheritCount} of 4 from head office` : 'All set for this branch',
+            editSec === 'contact' ? null : editBtn('contact'),
+            editSec === 'contact' ? (
+              <>
+                {fieldGrid([
+                  editCell('Registered address', valueFor('address'), setBranchField('address'), { full: true, inherit: inheritOf('address') }),
+                  editCell('ZIP code', valueFor('zip'), setBranchField('zip'), { mono: true, inherit: inheritOf('zip') }),
+                  editCell('Phone', valueFor('phone'), setBranchField('phone'), { inherit: inheritOf('phone') }),
+                  editCell('Email', valueFor('email'), setBranchField('email'), { full: true, inherit: inheritOf('email') }),
+                ])}
+                {editActions(saveBranchDetails, 'contact')}
+              </>
+            ) : (
+              fieldGrid([
+                factCell('Registered address', facts.address ?? '', { full: true, inherited: inherited.address }),
+                factCell('ZIP code', facts.zip ?? '', { mono: true, inherited: inherited.zip }),
+                factCell('Phone', facts.phone ?? '', { inherited: inherited.phone }),
+                factCell('Email', facts.email ?? '', { full: true, inherited: inherited.email }),
+              ])
+            ),
+          )}
+          {disclosure(
+            'email',
+            'Email, security and export',
+            'Set once for the taxpayer',
+            null,
+            <div style={{ display: 'flex', flexDirection: 'column' }}>
+              {settingsRow('Filing confirmation emails', 'Match BIR confirmation emails to filed returns', <Switch on={confirmEmails} onToggle={setConfirmEmails} />, undefined, true)}
+              {settingsRow('Profile PIN', 'Ask for a PIN before opening this taxpayer', <Btn small kind="secondary" onClick={once(() => showToast('PIN setup opens here.'))}>Set PIN</Btn>)}
+              {settingsRow('Export', lastBackup ? `Last export ${fmtDate(Number(lastBackup))}` : 'Not exported yet', <Btn small kind="secondary" onClick={once(backupNow)}>Export</Btn>)}
+            </div>,
+          )}
+        </div>
         {showNewBranch && (
-          <Card title="New branch" subtitle="Branches inherit head-office facts until overridden.">
-            <div style={{ display: 'flex', gap: 10 }}>
-              <FieldInput label="Branch code" value={newBranch.code} placeholder="00001" onChange={(value) => setNewBranch((current) => ({ ...current, code: value.replace(/\D/g, '').slice(0, 5) }))} />
-              <FieldInput label="Branch name" value={newBranch.name} placeholder="Cebu" onChange={(value) => setNewBranch((current) => ({ ...current, name: value }))} />
-            </div>
-            <div style={{ display: 'flex', gap: 10 }}>
-              <FieldInput label="RDO override" value={newBranch.rdo} onChange={(value) => setNewBranch((current) => ({ ...current, rdo: value }))} />
-              <FieldInput label="ZIP override" value={newBranch.zip} onChange={(value) => setNewBranch((current) => ({ ...current, zip: value }))} />
-            </div>
-            <FieldInput label="Address override" value={newBranch.address} onChange={(value) => setNewBranch((current) => ({ ...current, address: value }))} />
-            {branchError && <text style={{ color: t.danger, fontSize: F_META }}>{branchError}</text>}
-            <div style={{ display: 'flex', gap: 8 }}>
-              <Btn small onClick={addBranch} testId="add-branch-save">Create branch</Btn>
-              <Btn small kind="ghost" onClick={() => setShowNewBranch(false)}>Cancel</Btn>
+          <Card title="New branch" subtitle="Branches inherit head-office details until you change them.">
+            {fieldGrid([
+              <FieldInput key="code" label="Branch code" value={newBranch.code} placeholder="00001" mono onChange={(value) => setNewBranch((current) => ({ ...current, code: value.replace(/\D/g, '').slice(0, 5) }))} hint={branchError || undefined} />,
+              <FieldInput key="name" label="Branch name" value={newBranch.name} placeholder="Cebu branch" onChange={(value) => setNewBranch((current) => ({ ...current, name: value }))} />,
+              <FieldInput key="rdo" label="RDO" value={newBranch.rdo} placeholder="Same as head office" onChange={(value) => setNewBranch((current) => ({ ...current, rdo: value }))} />,
+              <FieldInput key="zip" label="ZIP code" value={newBranch.zip} placeholder="Same as head office" onChange={(value) => setNewBranch((current) => ({ ...current, zip: value }))} />,
+            ])}
+            <FieldInput label="Registered address" value={newBranch.address} placeholder="Same as head office" onChange={(value) => setNewBranch((current) => ({ ...current, address: value }))} />
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <Btn small kind="ghost" onClick={once(() => setShowNewBranch(false))}>Cancel</Btn>
+              <Btn small onClick={once(addBranch)} testId="add-branch-save">Create branch</Btn>
             </div>
           </Card>
         )}
@@ -2340,220 +2350,149 @@ function App() {
     )
   }
 
+  /** Library rows: one per form family, included forms first (prototype viewForms). */
+  function familyIncluded(key: string): boolean {
+    return selectedLibrary.some((entry) => familyKey(entry.formCode) === key)
+  }
+
+  function toggleFamily(key: string, code: string) {
+    if (!selectedProfile) return
+    const owned = selectedLibrary.filter((entry) => familyKey(entry.formCode) === key)
+    if (owned.length) owned.forEach((entry) => store.removeForm(selectedProfile.id, entry.formCode))
+    else store.addForms(selectedProfile.id, [code])
+    refreshTree()
+  }
+
   function taxpayerFormsTab() {
-    if (!taxpayer || !branch) {
-      return <text style={{ color: t.fg3, fontSize: F_META, padding: 14 }}>Select a taxpayer first.</text>
-    }
+    if (!taxpayer || !branch) return null
     if (!selectedProfile) {
       return (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-          <Card title="No tax year yet" subtitle="A year opens the form library for this branch.">
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-              <FieldInput label="Tax year" value={yearInput} onChange={(value) => setYearInput(value.replace(/\D/g, '').slice(0, 4))} />
-              <Btn small onClick={addYear} testId="add-year-save">Create year</Btn>
-            </div>
-          </Card>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', padding: 12, paddingLeft: 16, paddingRight: 16, borderRadius: 12, backgroundColor: t.accentSoft }}>
+          <text style={{ color: t.fg, fontSize: F_BODY, flexGrow: 1, minWidth: 200 }}>No tax year yet. A year opens the form checklist for this branch.</text>
+          <input value={yearInput} onChange={(event) => setYearInput((event.value ?? '').replace(/\D/g, '').slice(0, 4))} style={{ ...inputStyle(t, { mono: true }), width: 84 }} />
+          <Btn small testId="add-year-save" onClick={once(addYear)}>Create year</Btn>
         </div>
       )
     }
-    const catalogFiltered = catalog.filter((entry) => {
-      const needle = formSearch.trim().toLowerCase()
-      if (!needle) return true
-      return entry.code.toLowerCase().includes(needle) || entry.label.toLowerCase().includes(needle)
-    })
+    const rows = [...libraryCatalog].sort((a, b) => Number(familyIncluded(b.key)) - Number(familyIncluded(a.key)))
+    const years = branch.years.map((profile) => profile.year)
+    const nextYear = Math.max(...years) + 1
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          {branch.years.map((profile) => (
-            <div
-              key={profile.id}
-              testId={`year-${profile.year}`}
-              onClick={() => navTo({ ...navNow, profileId: profile.id })}
-              style={{ display: 'flex', alignItems: 'center', height: 24, paddingLeft: 10, paddingRight: 10, borderRadius: 12, cursor: 'pointer', backgroundColor: profile.id === selectedProfile.id ? t.accentSoft : t.hover }}
-            >
-              <text style={{ color: profile.id === selectedProfile.id ? t.accent : t.fg2, fontSize: F_META, fontWeight: 500 }}>{profile.year}</text>
-            </div>
-          ))}
-          <Btn small kind="ghost" icon="plus" testId="add-year-toggle" onClick={() => setShowNewYear((value) => !value)}>Add year</Btn>
-          {showNewYear && (
-            <>
-              <input
-                value={yearInput}
-                onChange={(event) => setYearInput((event.value ?? '').replace(/\D/g, '').slice(0, 4))}
-                style={{ width: 76, height: 28, padding: 5, color: t.fg, backgroundColor: t.surface, borderWidth: 1, borderColor: t.borderStrong, borderRadius: 6, fontSize: F_META }}
-              />
-              <Btn small kind="secondary" testId="add-year-save" onClick={addYear}>Create</Btn>
-            </>
-          )}
-          <div style={{ flexGrow: 1 }} />
-          <input
-            testId="form-filter"
-            value={formSearch}
-            placeholder="Filter forms"
-            onChange={(event) => setFormSearch(event.value ?? '')}
-            style={{ width: 190, height: 32, paddingLeft: 9, color: t.fg, backgroundColor: t.surface, borderWidth: 1, borderColor: t.borderStrong, borderRadius: 7, fontSize: F_BODY }}
-          />
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-          <text style={{ color: t.fg3, fontSize: F_CAP }}>Starter packs</text>
-          {Object.keys(STARTER_PACKS).map((pack) => (
-            <div
-              key={pack}
-              testId={`pack-${pack}`}
-              onClick={() => applyPack(pack)}
-              style={{ display: 'flex', alignItems: 'center', height: 24, paddingLeft: 10, paddingRight: 10, borderRadius: 12, borderWidth: 1, borderColor: t.border, backgroundColor: t.surface, cursor: 'pointer', hover: { backgroundColor: t.hover } }}
-            >
-              <text style={{ color: t.fg2, fontSize: F_META }}>{pack}</text>
-            </div>
-          ))}
-        </div>
-        <Card>
-          <div style={{ display: 'flex', flexDirection: 'column' }}>
-            {catalogFiltered.map((entry) => {
-              const inLibrary = selectedLibrary.some((item) => item.formCode === entry.code)
-              const pending = pendingCodes.includes(entry.code)
-              const due = dueByKey.get(`${selectedProfile.id}:${entry.code}`)
-              const checked = inLibrary || pending
-              return (
-                <div
-                  key={entry.code}
-                  testId={`lib-${entry.code}`}
-                  onClick={() => toggleLibraryForm(entry.code)}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 10,
-                    minHeight: 38,
-                    borderBottomWidth: 1,
-                    borderColor: t.border,
-                    cursor: 'pointer',
-                    hover: { backgroundColor: t.hover },
-                  }}
-                >
-                  <Check on={checked} />
-                  <text style={{ color: t.fg3, fontSize: F_META, ...NUM_STYLE, width: 76, minWidth: 76 }}>
-                    {displayFormCode(entry.code)}
-                  </text>
-                  <text style={{ color: t.fg, fontSize: F_BODY, flexGrow: 1, minWidth: 0, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
-                    {cleanFormTitle(entry.label)}
-                  </text>
-                  <text style={{ color: t.fg2, fontSize: F_META, width: 130, minWidth: 130 }}>
-                    {due ? `Next: ${periodLabel(due.period)}` : 'Not filed this year'}
-                  </text>
-                  <Chip tone="muted">{freqLabel(entry.frequency)}</Chip>
-                  <text style={{ color: t.fg3, fontSize: F_META, width: 86, minWidth: 86, textAlign: 'right' }}>
-                    {due ? fmtDateShort(due.dueDate) : '—'}
-                  </text>
-                </div>
-              )
-            })}
-          </div>
-        </Card>
-        {pendingCodes.length > 0 && (
-          <div style={{ display: 'flex', gap: 8 }}>
-            <Btn small testId="add-selected-forms" onClick={() => {
-              if (!selectedProfile) return
-              store.addForms(selectedProfile.id, pendingCodes)
-              setPendingCodes([])
-            }}>{`Add selected (${pendingCodes.length})`}</Btn>
+      <div style={{ display: 'flex', flexDirection: 'column' }}>
+        {showNewYear && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', paddingTop: 12, paddingBottom: 12, paddingLeft: 16, paddingRight: 16, borderRadius: 12, backgroundColor: t.accentSoft, marginBottom: 16 }}>
+            <text style={{ color: t.fg, fontSize: F_BODY, flexGrow: 1, minWidth: 200 }}>{`Copy ${Math.max(...years)} forms to ${yearInput}? ${selectedLibrary.length} forms and their templates carry over. Amounts never do.`}</text>
+            <Btn small kind="ghost" onClick={once(() => setShowNewYear(false))}>Not now</Btn>
+            <Btn small testId="add-year-save" onClick={once(addYear)}>Copy forms</Btn>
           </div>
         )}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', marginBottom: 16 }}>
+          <Seg<string>
+            testId="year-seg"
+            options={[...years.map((year) => ({ value: String(year), label: String(year) })), { value: 'next', label: String(nextYear) }]}
+            value={showNewYear ? 'next' : String(selectedProfile.year)}
+            onChange={(value) => {
+              if (value === 'next') {
+                setYearInput(String(nextYear))
+                setShowNewYear(true)
+                return
+              }
+              setShowNewYear(false)
+              const profile = branch.years.find((item) => String(item.year) === value)
+              if (profile) navTo({ ...navNow, profileId: profile.id })
+            }}
+          />
+          <div style={{ flexGrow: 1 }} />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+            <text style={{ color: t.fg3, fontSize: F_META, marginRight: 2 }}>Starter packs</text>
+            {Object.keys(STARTER_PACKS).map((pack) => (
+              <Btn key={pack} small kind="secondary" testId={`pack-${pack}`} onClick={once(() => applyPack(pack))}>{pack}</Btn>
+            ))}
+          </div>
+        </div>
+        <List>
+          {rows.map(({ key, code, meta }, index) => {
+            const on = familyIncluded(key)
+            const owned = selectedLibrary.find((entry) => familyKey(entry.formCode) === key)
+            const due = owned ? dueByKey.get(`${selectedProfile.id}:${owned.formCode}`) : undefined
+            return (
+              <Row key={key} first={index === 0} testId={`lib-${key}`}>
+                <div onClick={once(() => toggleFamily(key, code))} style={{ cursor: 'pointer' }}><Check on={on} /></div>
+                <Code dim={!on}>{key}</Code>
+                <RName title={meta.title} sub={on ? (due ? `Next: ${periodLabel(due.period)}` : 'Every period filed') : 'Not filed this year'} dim={!on} />
+                {!narrow && <div style={{ width: 84, minWidth: 84, display: 'flex' }}>{on && <Chip>{meta.frequency}</Chip>}</div>}
+                {!narrow && <text style={{ color: t.fg2, fontSize: F_META, width: 104, minWidth: 104 }}>{on && due ? `Due ${fmtDateShort(due.dueDate)}` : ''}</text>}
+                <div style={{ width: 112, minWidth: 112, display: 'flex' }}>{on && <Chip>No template</Chip>}</div>
+              </Row>
+            )
+          })}
+        </List>
       </div>
     )
   }
 
   function taxpayerTemplatesTab() {
-    if (!taxpayer || !selectedProfile) {
-      return <text style={{ color: t.fg3, fontSize: F_META, padding: 14 }}>Select a taxpayer and year first.</text>
-    }
+    if (!taxpayer || !selectedProfile) return null
+    const owned = libraryCatalog.filter(({ key }) => familyIncluded(key))
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-        <text style={{ color: t.fg3, fontSize: F_META }}>
-          One template per form for this taxpayer and branch — a saved return becomes the starting point for the next period.
+      <div style={{ display: 'flex', flexDirection: 'column' }}>
+        <text style={{ color: t.fg2, fontSize: F_BODY, maxWidth: 520, lineHeight: 19, marginBottom: 16 }}>
+          One template per form for this branch. A template keeps setup answers and marks the fields to fill each period. It never keeps amounts.
         </text>
-        <Card>
-          <div style={{ display: 'flex', flexDirection: 'column' }}>
-            {selectedLibrary.length === 0 && (
-              <text style={{ color: t.fg3, fontSize: F_META, padding: 10 }}>Add forms to the library first.</text>
-            )}
-            {selectedLibrary.map((entry) => {
-              const item = catalogByCode.get(entry.formCode)
-              return (
-                <div
-                  key={entry.formCode}
-                  style={{ display: 'flex', alignItems: 'center', gap: 10, minHeight: 40, borderBottomWidth: 1, borderColor: t.border }}
-                >
-                  <Icon name="template" size={15} color={t.fg3} />
-                  <text style={{ color: t.fg3, fontSize: F_META, ...NUM_STYLE, width: 76, minWidth: 76 }}>
-                    {displayFormCode(entry.formCode)}
-                  </text>
-                  <text style={{ color: t.fg, fontSize: F_BODY, flexGrow: 1, minWidth: 0, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
-                    {cleanFormTitle(item?.label ?? '')}
-                  </text>
-                  <text style={{ color: t.fg3, fontSize: F_META, width: 110, minWidth: 110 }}>No template yet</text>
-                  <Btn
-                    small
-                    kind="secondary"
-                    onClick={() => showToast('Templates arrive with the guided-mode phase.')}
-                  >
-                    + Create
-                  </Btn>
-                </div>
-              )
-            })}
-          </div>
-        </Card>
+        <List>
+          {owned.length === 0 && emptyRow('Add forms under the Forms tab first.')}
+          {owned.map(({ key, meta }, index) => (
+            <Row key={key} first={index === 0} dim>
+              <Code dim>{key}</Code>
+              <RName title={meta.title} sub="No template yet" dim />
+              {!narrow && <text style={{ color: t.fg2, fontSize: F_META, width: 140, minWidth: 140 }} />}
+              <div style={{ width: 96, minWidth: 96, display: 'flex', justifyContent: 'flex-end' }}>
+                <Btn small kind="secondary" icon="plus" onClick={once(() => showToast(`${key} template created. Click fields on the blank form to mark them.`))}>Create</Btn>
+              </div>
+            </Row>
+          ))}
+        </List>
       </div>
     )
   }
 
   function newTaxpayerPage() {
-    const setNew = (field: keyof NewTaxpayerForm, value: string) =>
-      setNewTaxpayer((current) => ({ ...current, [field]: value }))
+    const setNew = (field: keyof NewTaxpayerForm, value: string) => setNewTaxpayer((current) => ({ ...current, [field]: value }))
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-        <text style={{ color: t.fg, fontSize: F_PAGE, fontWeight: 700 }}>New taxpayer</text>
-        <text style={{ color: t.fg3, fontSize: F_BODY, paddingBottom: 18 }}>Add a taxpayer and its head-office facts.</text>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+        <PageHead title="New taxpayer" lede="Add a taxpayer and its head-office details. Branches and tax years come next." />
         <Card>
-          <div style={{ display: 'flex', gap: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'flex-end', gap: 6 }}>
             {(['tin1', 'tin2', 'tin3'] as const).map((part, index) => (
-              <FieldInput
-                key={part}
-                label={`TIN ${index + 1}`}
-                value={newTaxpayer[part]}
-                placeholder={['123', '456', '788'][index]}
-                mono
-                onChange={(value) => setNew(part, (value ?? '').replace(/\D/g, '').slice(0, 3))}
-                hint={index === 0 ? newTaxpayerErrors.tin : undefined}
-                testId={`new-taxpayer-${part}`}
-              />
+              <div key={part} style={{ display: 'flex', alignItems: 'flex-end', gap: 6 }}>
+                {index > 0 && <text style={{ color: t.fg3, fontSize: F_META, paddingBottom: 8 }}>-</text>}
+                <div style={{ width: 72 }}>
+                  <FieldInput label={index === 0 ? 'TIN' : ' '} value={newTaxpayer[part]} placeholder={['123', '456', '788'][index]} mono onChange={(value) => setNew(part, (value ?? '').replace(/\D/g, '').slice(0, 3))} testId={`new-taxpayer-${part}`} />
+                </div>
+              </div>
             ))}
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <text style={{ color: t.fg2, fontSize: F_META, width: 130, minWidth: 130 }}>Type</text>
+          {newTaxpayerErrors.tin && <text style={{ color: t.danger, fontSize: F_META }}>{newTaxpayerErrors.tin}</text>}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <text style={{ color: t.fg2, fontSize: F_META }}>Taxpayer type</text>
             <Seg<'individual' | 'non-individual'>
-              options={[
-                { value: 'individual', label: 'Individual' },
-                { value: 'non-individual', label: 'Non-individual' },
-              ]}
+              options={[{ value: 'individual', label: 'Individual' }, { value: 'non-individual', label: 'Non-individual' }]}
               value={newTaxpayer.type}
               onChange={(value) => setNewTaxpayer((current) => ({ ...current, type: value }))}
             />
           </div>
-          <FieldInput label="Taxpayer name" value={newTaxpayer.name} onChange={(value) => setNew('name', value)} hint={newTaxpayerErrors.name} />
-          <FieldInput label="Birth date" value={newTaxpayer.birthDate} placeholder="YYYY-MM-DD (individuals)" onChange={(value) => setNew('birthDate', value)} />
-          <div style={{ display: 'flex', gap: 10 }}>
-            <FieldInput label="Head-office RDO" value={newTaxpayer.rdo} onChange={(value) => setNew('rdo', value)} />
-            <FieldInput label="ZIP" value={newTaxpayer.zip} onChange={(value) => setNew('zip', value)} />
-          </div>
+          {fieldGrid([
+            <FieldInput key="name" label="Registered name" value={newTaxpayer.name} onChange={(value) => setNew('name', value)} hint={newTaxpayerErrors.name} />,
+            <FieldInput key="birth" label="Birth date" value={newTaxpayer.birthDate} placeholder="YYYY-MM-DD (individuals)" onChange={(value) => setNew('birthDate', value)} />,
+            <FieldInput key="rdo" label="RDO" value={newTaxpayer.rdo} onChange={(value) => setNew('rdo', value)} />,
+            <FieldInput key="zip" label="ZIP code" value={newTaxpayer.zip} onChange={(value) => setNew('zip', value)} />,
+            <FieldInput key="phone" label="Phone" value={newTaxpayer.phone} onChange={(value) => setNew('phone', value)} />,
+            <FieldInput key="email" label="Email" value={newTaxpayer.email} onChange={(value) => setNew('email', value)} />,
+          ])}
           <FieldInput label="Registered address" value={newTaxpayer.address} onChange={(value) => setNew('address', value)} />
-          <div style={{ display: 'flex', gap: 10 }}>
-            <FieldInput label="Telephone" value={newTaxpayer.phone} onChange={(value) => setNew('phone', value)} />
-            <FieldInput label="Email" value={newTaxpayer.email} onChange={(value) => setNew('email', value)} />
-          </div>
-          <div style={{ display: 'flex', gap: 8 }}>
-            <Btn testId="new-taxpayer-save" onClick={saveNewTaxpayer}>Add taxpayer</Btn>
-            <Btn kind="ghost" onClick={() => setShowNewTaxpayer(false)}>Cancel</Btn>
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+            <Btn kind="ghost" onClick={once(() => setShowNewTaxpayer(false))}>Cancel</Btn>
+            <Btn testId="new-taxpayer-save" onClick={once(saveNewTaxpayer)}>Add taxpayer</Btn>
           </div>
         </Card>
       </div>
@@ -2561,75 +2500,64 @@ function App() {
   }
 
   function taxpayerPage() {
-    if (showNewTaxpayer) return newTaxpayerPage()
-    if (!taxpayer) return newTaxpayerPage()
+    if (showNewTaxpayer || !taxpayer) return newTaxpayerPage()
     const formsCount = selectedLibrary.length
-    const tabItem = (id: TpTab, label: string) => (
-      <div
-        key={id}
-        testId={`tab-${id}`}
-        onClick={() => navTo({ ...navNow, tab: id })}
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          height: 34,
-          paddingLeft: 2,
-          paddingRight: 2,
-          marginRight: 16,
-          cursor: 'pointer',
-          borderBottomWidth: 2,
-          borderColor: tab === id ? t.fg : 'rgba(0,0,0,0)',
-        }}
-      >
-        <text style={{ color: tab === id ? t.fg : t.fg3, fontSize: F_BODY, fontWeight: tab === id ? 600 : 400 }}>
-          {label}
-        </text>
-      </div>
-    )
+    const tabs: Array<[TpTab, string, number | null]> = [
+      ['profile', 'Profile', null],
+      ['forms', 'Forms', formsCount],
+      ['templates', 'Templates', 0],
+    ]
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minHeight: 0 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12, paddingBottom: 14 }}>
-          <Avatar name={taxpayer.name || '?'} size={40} />
+      <div style={{ display: 'flex', flexDirection: 'column' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
+          <Avatar name={taxpayer.name || taxpayer.tin9} size={40} />
           <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
-            <text style={{ color: t.fg, fontSize: F_PAGE, fontWeight: 700, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
-              {taxpayer.name || formatTin(taxpayer.tin9)}
-            </text>
-            <text style={{ color: t.fg3, fontSize: F_META, ...NUM_STYLE }}>{formatTin(taxpayer.tin9, branch?.code ?? '00000')}</text>
+            <text style={{ color: t.fg, fontSize: F_PAGE, fontWeight: 600, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{taxpayer.name || formatTin(taxpayer.tin9)}</text>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', paddingTop: 2 }}>
+              <text style={{ color: t.fg2, fontSize: F_META, ...NUM_STYLE, fontWeight: 400 }}>{formatTin(taxpayer.tin9, branch?.code ?? '00000')}</text>
+              <div style={{ width: 3, height: 3, borderRadius: 2, backgroundColor: t.fg3 }} />
+              <text style={{ color: t.fg2, fontSize: F_META }}>{branch?.name ?? 'Head office'}</text>
+              <div style={{ width: 3, height: 3, borderRadius: 2, backgroundColor: t.fg3 }} />
+              <text style={{ color: t.fg2, fontSize: F_META }}>{taxpayer.type === 'individual' ? 'Individual' : 'Non-individual'}</text>
+            </div>
           </div>
-          <Btn
-            testId="copy-tin"
-            kind="secondary"
-            icon="copy"
-            onClick={() => showToast('TIN copied.')}
-          >
-            Copy TIN
-          </Btn>
-          <Btn testId="new-return" icon="plus" onClick={() => setOverlay({ kind: 'startReturn' })}>New return</Btn>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <Btn small testId="copy-tin" kind="secondary" icon="copy" onClick={once(() => showToast(`Copied ${formatTin(taxpayer.tin9, branch?.code ?? '00000')}`))}>Copy TIN</Btn>
+            <Btn small testId="new-return" icon="plus" onClick={once(() => setOverlay({ kind: 'startReturn' }))}>New return</Btn>
+          </div>
         </div>
-        <div style={{ display: 'flex', borderBottomWidth: 1, borderColor: t.border, marginBottom: 14 }}>
-          {tabItem('profile', 'Profile')}
-          {tabItem('forms', `Forms${formsCount ? ` ${formsCount}` : ''}`)}
-          {tabItem('templates', 'Templates')}
+        <div style={{ display: 'flex', gap: 4, borderBottomWidth: 1, borderColor: t.border, marginTop: 20, marginBottom: 24 }}>
+          {tabs.map(([id, label, count]) => (
+            <div
+              key={id}
+              testId={`tab-${id}`}
+              onClick={once(() => navTo({ ...navNow, tab: id }))}
+              style={{ display: 'flex', alignItems: 'center', gap: 6, height: 36, paddingLeft: 10, paddingRight: 10, marginBottom: -1, borderBottomWidth: 2, borderColor: tab === id ? t.fg : CLEAR, cursor: 'pointer' }}
+            >
+              <text style={{ color: tab === id ? t.fg : t.fg2, fontSize: F_BODY, fontWeight: 500 }}>{label}</text>
+              {count !== null && (
+                <div style={{ paddingLeft: 6, paddingRight: 6, height: 18, borderRadius: 9, backgroundColor: t.hover, display: 'flex', alignItems: 'center' }}>
+                  <text style={{ color: t.fg2, fontSize: F_CAP }}>{String(count)}</text>
+                </div>
+              )}
+            </div>
+          ))}
         </div>
-        <div style={{ flexGrow: 1, minHeight: 0, overflow: 'scroll' }}>
-          {tab === 'profile' && taxpayerProfileTab()}
-          {tab === 'forms' && taxpayerFormsTab()}
-          {tab === 'templates' && taxpayerTemplatesTab()}
-        </div>
+        {tab === 'profile' && taxpayerProfileTab()}
+        {tab === 'forms' && taxpayerFormsTab()}
+        {tab === 'templates' && taxpayerTemplatesTab()}
       </div>
     )
   }
 
-  // -- Settings / jobs / logs -------------------------------------------------
+  // -- Settings (prototype viewSettings) --------------------------------------
 
-  function settingsRow(title: string, subtitle: string, control: ReactNode, testId?: string) {
+  /** .srow — 14px vertical padding, hairline above; title 13/500 over a 12/fg3 line. */
+  function settingsRow(title: string, subtitle: string, control: ReactNode, testId?: string, first = false) {
     return (
-      <div
-        testId={testId}
-        style={{ display: 'flex', alignItems: 'center', gap: 12, minHeight: 40, borderBottomWidth: 1, borderColor: t.border }}
-      >
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 1, flexGrow: 1, minWidth: 0 }}>
-          <text style={{ color: t.fg, fontSize: F_BODY }}>{title}</text>
+      <div testId={testId} style={{ display: 'flex', alignItems: 'center', gap: 16, paddingTop: 14, paddingBottom: 14, borderTopWidth: first ? 0 : 1, borderColor: t.border }}>
+        <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
+          <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 500 }}>{title}</text>
           <text style={{ color: t.fg3, fontSize: F_META }}>{subtitle}</text>
         </div>
         {control}
@@ -2637,126 +2565,106 @@ function App() {
     )
   }
 
+  function settingsCard(children: ReactNode) {
+    return <div style={{ display: 'flex', flexDirection: 'column', borderWidth: 1, borderColor: t.border, borderRadius: 12, paddingTop: 4, paddingBottom: 4, paddingLeft: 16, paddingRight: 16, backgroundColor: t.surface }}>{children}</div>
+  }
+
   function settingsPage() {
-    const stateChip = (state: Job['state']) =>
-      state === 'running' ? 'Running' : state === 'dead' ? 'Failed' : state === 'succeeded' ? 'Done' : 'Queued'
+    const stateChip = (job: Job) =>
+      job.state === 'running' ? <Chip tone="success">Running</Chip> : job.state === 'dead' ? <Chip tone="danger">Failed</Chip> : job.state === 'succeeded' ? <Chip tone="success">Done</Chip> : <Chip>Queued</Chip>
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-        <text style={{ color: t.fg, fontSize: F_PAGE, fontWeight: 700, paddingBottom: 8 }}>Settings</text>
-        <Card title="Appearance">
-          {settingsRow(
-            'Theme',
-            'Light, dark, or match Windows.',
-            <Seg<ThemeMode>
-              testId="theme-seg"
-              options={[
-                { value: 'light', label: 'Light', icon: 'sun' },
-                { value: 'dark', label: 'Dark', icon: 'moon' },
-                { value: 'system', label: 'System', icon: 'monitor' },
-              ]}
-              value={themeMode}
-              onChange={setThemeMode}
-            />,
-          )}
-          {settingsRow(
-            'Show recent returns in the sidebar',
-            'Last four returns you opened.',
-            <Switch testId="show-recent" on={showRecent} onToggle={toggleRecent} />,
-          )}
-          {settingsRow('Display name', 'Used for the greeting on Home.', <div style={{ width: 200 }}><FieldInput value={displayName} onChange={setDisplayName} /></div>)}
-          {settingsRow('Email', 'Shown on the account card.', <div style={{ width: 200 }}><FieldInput value={email} onChange={setEmail} /></div>)}
-          <div style={{ display: 'flex', justifyContent: 'flex-end', paddingTop: 6 }}>
-            <Btn small kind="secondary" onClick={() => {
-              store.setSetting('displayName', displayName.trim())
-              store.setSetting('email', email.trim())
-              showToast('Account details saved.')
-            }}>Save</Btn>
-          </div>
-        </Card>
-        <Card title="Returns">
-          {settingsRow(
-            'Ask to update the template on save',
-            'When a return is saved, offer to keep it as the branch template.',
-            <Switch testId="ask-template" on={askTemplate} onToggle={toggleAskTemplate} />,
-          )}
-        </Card>
-        <Card title="Data">
-          {settingsRow(
-            'Import data',
-            'Bring in returns saved by the official eBIRForms app.',
-            <Btn small kind="secondary" onClick={() => showToast('Import arrives with the filing pipeline.')}>Import</Btn>,
-            'import-row',
-          )}
-          {settingsRow(
-            'Back up now',
-            lastBackup ? `Last backup ${fmtDateTime(Number(lastBackup))}` : 'No backup yet — copies the database next to itself.',
-            <Btn small kind="secondary" onClick={backupNow} testId="backup-now">Back up</Btn>,
-            'backup-row',
-          )}
-          {settingsRow('Jobs', 'Background task queue.', <Btn small kind="ghost" onClick={() => goto('jobs')}>Open</Btn>)}
-          {settingsRow('Logs', 'Application log entries.', <Btn small kind="ghost" onClick={() => goto('logs')}>Open</Btn>)}
-          <text style={{ color: t.fg3, fontSize: F_CAP, paddingTop: 6 }}>{sftpMode}</text>
-        </Card>
-        <Card title="Background tasks" subtitle="Live rows from the job queue.">
-          <div style={{ display: 'flex', flexDirection: 'column' }}>
-            {queueJobs.length === 0 && (
-              <text style={{ color: t.fg3, fontSize: F_META, padding: 6 }}>No background tasks queued.</text>
+      <div style={{ display: 'flex', flexDirection: 'column' }}>
+        <PageHead title="Settings" lede="App-wide preferences for this computer. Taxpayer details live in each tax profile." />
+        <SectionLabel first>Appearance</SectionLabel>
+        {settingsCard(
+          <>
+            {settingsRow(
+              'Theme',
+              `System follows your ${isMac ? 'macOS' : 'Windows'} setting`,
+              <Seg<ThemeMode>
+                testId="theme-seg"
+                options={[
+                  { value: 'light', label: 'Light' },
+                  { value: 'dark', label: 'Dark' },
+                  { value: 'system', label: 'System' },
+                ]}
+                value={themeMode}
+                onChange={setThemeMode}
+              />,
+              undefined,
+              true,
             )}
-            {queueJobs.map((job) => (
-              <div key={job.id} style={{ display: 'flex', alignItems: 'center', gap: 10, minHeight: 34, borderBottomWidth: 1, borderColor: t.border }}>
-                <Icon name={job.state === 'running' ? 'history' : job.state === 'dead' ? 'alert' : job.state === 'succeeded' ? 'checkCircle' : 'box'} size={14} color={job.state === 'dead' ? t.danger : job.state === 'succeeded' ? t.success : t.fg3} />
-                <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
-                  <text style={{ color: t.fg, fontSize: F_META }}>{job.kind}</text>
-                  <text style={{ color: t.fg3, fontSize: F_CAP }}>{`attempts ${job.attempts}/${job.maxAttempts}${job.lastError ? ` · ${job.lastError}` : ''}`}</text>
-                </div>
-                <Chip tone={job.state === 'running' ? 'accent' : job.state === 'dead' ? 'danger' : 'muted'}>{stateChip(job.state)}</Chip>
-              </div>
-            ))}
-          </div>
-        </Card>
+            {settingsRow('Show recent returns in the sidebar', 'The last four returns you opened', <Switch testId="show-recent" on={showRecent} onToggle={toggleRecent} />)}
+          </>,
+        )}
+        <SectionLabel>Returns</SectionLabel>
+        {settingsCard(settingsRow('Ask to update the template on save', 'When a saved return differs from its template', <Switch testId="ask-template" on={askTemplate} onToggle={toggleAskTemplate} />, undefined, true))}
+        <SectionLabel>Data</SectionLabel>
+        {settingsCard(
+          <>
+            {settingsRow('Import data', 'Bring in returns saved by the official eBIRForms app', <Btn small kind="secondary" icon="upload" onClick={once(() => showToast('Choose an eBIRForms savefile folder.'))}>Import</Btn>, 'import-row', true)}
+            {settingsRow('Back up now', lastBackup ? `Last backup ${fmtDateTime(Number(lastBackup))}` : 'No backup yet', <Btn small kind="secondary" onClick={once(backupNow)} testId="backup-now">Back up</Btn>, 'backup-row')}
+            {settingsRow('Logs', sftpMode, <Btn small kind="ghost" onClick={once(() => goto('logs'))}>Open</Btn>)}
+          </>,
+        )}
+        <SectionLabel>Background tasks</SectionLabel>
+        {settingsCard(
+          queueJobs.length === 0
+            ? settingsRow('No background tasks', 'Filing and reminder jobs appear here while they run', <Chip>Idle</Chip>, undefined, true)
+            : queueJobs.map((job, index) => (
+                <div key={job.id}>{settingsRow(job.kind, `Attempt ${job.attempts} of ${job.maxAttempts}${job.lastError ? ` · ${job.lastError}` : ''}`, stateChip(job), undefined, index === 0)}</div>
+              )),
+        )}
+        <SectionLabel>Security</SectionLabel>
+        {settingsCard(
+          settingsRow(
+            'Lock after inactivity',
+            'Asks for your account PIN',
+            <Seg<string> testId="lock-seg" options={['5m', '15m', 'Never'].map((value) => ({ value, label: value }))} value={lockAfter} onChange={(value) => { setLockAfter(value); store.setSetting('lockAfter', value) }} />,
+            undefined,
+            true,
+          ),
+        )}
+        <SectionLabel>Account</SectionLabel>
+        {settingsCard(
+          <>
+            {settingsRow('Display name', 'Used for the greeting on Home', <div style={{ width: 220 }}><FieldInput value={displayName} onChange={setDisplayName} testId="display-name" /></div>, undefined, true)}
+            {settingsRow('Email', 'Shown on the account card', <div style={{ width: 220 }}><FieldInput value={email} onChange={setEmail} testId="account-email" /></div>)}
+            <div style={{ display: 'flex', justifyContent: 'flex-end', paddingTop: 4, paddingBottom: 10 }}>
+              <Btn small kind="secondary" onClick={once(() => { store.setSetting('displayName', displayName.trim()); store.setSetting('email', email.trim()); showToast('Account details saved.') })}>Save</Btn>
+            </div>
+          </>,
+        )}
       </div>
     )
   }
 
   function jobsPage() {
-    return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-        <text style={{ color: t.fg, fontSize: F_PAGE, fontWeight: 700 }}>Jobs</text>
-        {queueJobs.length === 0 && <text style={{ color: t.fg3, fontSize: F_META }}>No background tasks queued.</text>}
-        {queueJobs.map((job) => (
-          <Card key={job.id} title={`${job.kind} · ${job.state}`} subtitle={`Attempts ${job.attempts}/${job.maxAttempts}`}>
-            <text style={{ color: job.lastError ? t.danger : t.fg3, fontSize: F_META }}>{job.lastError ?? JSON.stringify(job.payload)}</text>
-          </Card>
-        ))}
-      </div>
-    )
+    return settingsPage()
   }
 
   function logsPage() {
     const shownLogs = logFilter === 'all' ? logs : logs.filter((entry) => entry.level === logFilter)
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 10, flexGrow: 1, minHeight: 0 }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <text style={{ color: t.fg, fontSize: F_PAGE, fontWeight: 700 }}>Logs</text>
-          <Select value={logFilter} onValueChange={(value) => setLogFilter(value as LogFilter)}>
-            <SelectTrigger style={{ width: 130, height: 30 }}><SelectValue /></SelectTrigger>
-            <SelectContent>
-              {(['all', 'debug', 'info', 'warn', 'error'] as LogFilter[]).map((level) => (
-                <SelectItem key={level} value={level}>{level}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 2, overflow: 'scroll' }}>
-          {shownLogs.map((entry, index) => (
-            <div key={`${entry.ts}-${index}`} style={{ display: 'flex', gap: 10, padding: 7, borderRadius: 6, hover: { backgroundColor: t.hover } }}>
-              <text style={{ color: t.fg3, fontSize: F_CAP }}>{new Date(entry.ts).toLocaleTimeString()}</text>
-              <text style={{ color: entry.level === 'error' ? t.danger : entry.level === 'warn' ? t.warning : t.fg2, fontSize: F_CAP, width: 44 }}>{entry.level}</text>
-              <text style={{ color: t.fg3, fontSize: F_CAP, width: 70 }}>{entry.scope}</text>
-              <text style={{ color: t.fg, fontSize: F_META, flexGrow: 1 }}>{entry.msg}</text>
-            </div>
+      <div style={{ display: 'flex', flexDirection: 'column' }}>
+        <PageHead
+          title="Logs"
+          lede="What the app recorded on this computer, newest last."
+          actions={<Seg<LogFilter> testId="log-filter" options={(['all', 'debug', 'info', 'warn', 'error'] as LogFilter[]).map((value) => ({ value, label: value === 'all' ? 'All' : value[0].toUpperCase() + value.slice(1) }))} value={logFilter} onChange={setLogFilter} />}
+        />
+        <div style={{ height: 24 }} />
+        <List>
+          {shownLogs.length === 0 && emptyRow('Nothing logged yet.')}
+          {shownLogs.slice(-400).map((entry, index) => (
+            <Row key={`${entry.ts}-${index}`} first={index === 0}>
+              <text style={{ color: t.fg3, fontSize: F_META, width: 84, minWidth: 84 }}>{new Date(entry.ts).toLocaleTimeString()}</text>
+              <div style={{ width: 64, minWidth: 64, display: 'flex' }}>
+                <Chip tone={entry.level === 'error' ? 'danger' : entry.level === 'warn' ? 'warning' : 'plain'}>{entry.level}</Chip>
+              </div>
+              <RName title={entry.msg} sub={entry.scope} />
+            </Row>
           ))}
-        </div>
+        </List>
       </div>
     )
   }
@@ -2764,384 +2672,289 @@ function App() {
   // -- Form page (editor logic unchanged, restyled to the tokens) ------------
 
   function formPage() {
-    const currentStatus = draft?.status ?? 'draft'
+    const key = formEntry ? familyKey(formEntry.formCode) : ''
+    const schema = formSchemas[key]
+    const title = schema?.title ?? (formEntry ? cleanFormTitle(formEntry.label) : 'Return')
+    const status = draft?.status ?? 'draft'
     const stages: DraftStatus[] = ['draft', 'queued', 'submitted', 'confirmed', 'paid']
-    const currentIndex = stages.indexOf(currentStatus)
-    const trackerDots = [
-      { left: 12, top: 0 }, { left: 20, top: 4 }, { left: 24, top: 12 }, { left: 20, top: 20 },
-      { left: 12, top: 24 }, { left: 4, top: 20 }, { left: 0, top: 12 }, { left: 4, top: 4 },
-    ]
-    const revision =
-      formEntry?.formCode === '1601Cv2018' || formEntry?.formCode === '2551Qv2018'
-        ? 'January 2018 (ENCS)'
-        : formEntry?.formCode === '0619E'
-          ? 'January 2018'
-          : ''
-    const isMoneyLabel = (label: string) =>
-      /amount|tax due|taxable|sales|receipts|income|compensation|withheld|remittance|premium|cost|payment|proceeds|balance|total/i.test(label)
-    const isPctLabel = (label: string) => /%|rate\b/i.test(label)
+    const statusTone: ChipTone = status === 'draft' ? 'accent' : status === 'queued' ? 'plain' : 'success'
+    const periodText = draft ? periodLabel(draft.period) : ''
+    const showFor = (item: ModelItem) => showErrors || touched.has(item.id)
 
-    function fieldLocked(field: FieldSnapshot) {
-      return (
-        editorModel.sections.some((section) =>
-          section.rows.some((row) => row.fields.some((entry) => entry.id === field.id && row.locked)),
-        ) || field.disabled
-      )
+    function fieldValue(field: FieldSnapshot | null): string {
+      return field ? String(editorValues[field.id] ?? '') : ''
     }
 
-    function input(field: FieldSnapshot, width: number, money = false, pct = false) {
-      const locked = fieldLocked(field)
-      const el = (
-        <input
-          testId={`field-${field.id}`}
-          value={String(editorValues[field.id] ?? '')}
-          readOnly={locked}
-          onChange={(event) => editField(field, event.value ?? '')}
-          style={{
-            width,
-            height: 32,
-            padding: 7,
-            paddingLeft: money ? 24 : 8,
-            paddingRight: pct ? 24 : 8,
-            textAlign: money || pct ? 'right' : 'left',
-            color: locked ? t.fg3 : t.fg,
-            backgroundColor: locked ? t.hover : t.surface,
-            borderWidth: 1,
-            borderColor: t.borderStrong,
-            borderRadius: 6,
-            fontSize: F_BODY,
-            ...(money || pct ? NUM_STYLE : {}),
-          }}
-        />
-      )
-      if (!money && !pct) return el
-      return (
-        <div style={{ position: 'relative', width }}>
-          <text
-            style={{
-              position: 'absolute',
-              top: 8,
-              ...(money ? { left: 10 } : { right: 10 }),
-              color: t.fg3,
-              fontSize: F_META,
-            }}
-          >
-            {money ? '₱' : '%'}
-          </text>
-          {el}
-        </div>
-      )
+    function fieldIsLocked(item: ModelItem, bound: BoundField): boolean {
+      return item.auto || Boolean(bound.spec.c) || !bound.field || Boolean(bound.field.disabled)
     }
 
-    function control(field: FieldSnapshot, subLabel?: string) {
-      const locked = fieldLocked(field)
-      const labelWidth =
-        field.type === 'select-one' ? 220 : isMoneyLabel(field.label) ? 230 : field.maxLength && field.maxLength <= 4 ? 88 : field.label.length > 30 ? 300 : 220
-      const body =
-        field.type === 'select-one' ? (
-          <Select value={String(editorValues[field.id] ?? '')} onValueChange={(value) => editField(field, value)} disabled={locked}>
-            <SelectTrigger style={{ width: labelWidth, height: 32 }}><SelectValue placeholder="Select" /></SelectTrigger>
-            <SelectContent>{field.options?.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
-          </Select>
-        ) : field.type === 'checkbox' ? (
-          <div onClick={() => !locked && editField(field, !Boolean(editorValues[field.id]))} style={{ width: 28, height: 28, display: 'flex', justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: t.borderStrong, borderRadius: 6, backgroundColor: locked ? t.hover : t.surface, cursor: locked ? 'default' : 'pointer' }}>
-            {Boolean(editorValues[field.id]) && <Icon name="check" size={14} color={t.fg} strokeWidth={2.5} />}
-          </div>
-        ) : field.type === 'textarea' ? (
-          <input
-            testId={`field-${field.id}`}
-            value={String(editorValues[field.id] ?? '')}
-            readOnly={locked}
-            onChange={(event) => editField(field, event.value ?? '')}
-            style={{ width: Math.max(labelWidth, 320), height: 56, padding: 8, color: locked ? t.fg3 : t.fg, backgroundColor: locked ? t.hover : t.surface, borderWidth: 1, borderColor: t.borderStrong, borderRadius: 6, fontSize: F_BODY }}
-          />
-        ) : (
-          input(field, labelWidth, isMoneyLabel(field.label), !isMoneyLabel(field.label) && isPctLabel(field.label))
-        )
-      if (!subLabel) return body
-      return (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-          <text style={{ color: t.fg2, fontSize: F_META }}>{subLabel}</text>
+    function setField(item: ModelItem, field: FieldSnapshot | null, value: string | boolean) {
+      if (!field) return
+      setTouched((current) => (current.has(item.id) ? current : new Set(current).add(item.id)))
+      editField(field, value)
+    }
+
+    function control(item: ModelItem, bound: BoundField, multi: boolean) {
+      const { spec, field } = bound
+      const locked = fieldIsLocked(item, bound)
+      const error = item.errorText !== '' && showFor(item) && !locked && fieldValue(field) === ''
+      const showSub = multi && spec.l && spec.l !== item.label && !/^\d+[A-Z]?$/.test(spec.l)
+      const sub = showSub ? <text style={{ color: t.fg2, fontSize: F_META }}>{spec.l}</text> : null
+      const value = spec.c && !fieldValue(field) && spec.t === 'money' ? '0.00' : fieldValue(field)
+      const wrap = (basis: number, grow: number, body: ReactNode) => (
+        <div key={spec.k ?? spec.l} style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0, flexBasis: narrow ? undefined : basis, flexGrow: narrow ? 1 : grow, flexShrink: 1, width: narrow ? '100%' : undefined }}>
+          {sub}
           {body}
         </div>
       )
+      const box = (opts: { align?: 'left' | 'right'; prefix?: string; suffix?: string } = {}) => (
+        <div style={{ position: 'relative', display: 'flex' }}>
+          <input
+            testId={field ? `field-${field.id}` : undefined}
+            value={value}
+            readOnly={locked}
+            placeholder={spec.t === 'money' ? '0.00' : spec.t === 'date' ? 'MM/DD/YYYY' : undefined}
+            onChange={(event) => setField(item, field, event.value ?? '')}
+            style={{ ...inputStyle(t, { locked, error, mono: spec.t === 'money' || spec.t === 'pct', align: opts.align }), flexGrow: 1, minWidth: 0, paddingLeft: opts.prefix ? 24 : 10, paddingRight: opts.suffix ? 24 : 10 }}
+          />
+          {opts.prefix && <text style={{ position: 'absolute', left: 10, top: 8, color: t.fg3, fontSize: F_META, pointerEvents: 'none' }}>{opts.prefix}</text>}
+          {opts.suffix && <text style={{ position: 'absolute', right: 10, top: 8, color: t.fg3, fontSize: F_META, pointerEvents: 'none' }}>{opts.suffix}</text>}
+        </div>
+      )
+      switch (spec.t) {
+        case 'money':
+          return wrap(230, 0, box({ align: 'right', prefix: '₱' }))
+        case 'pct':
+          return wrap(88, 0, box({ align: 'right', suffix: '%' }))
+        case 'date':
+          return wrap(140, 0, box())
+        case 'int':
+          return wrap(spec.m && spec.m <= 4 ? 88 : 140, 0, box())
+        case 'chk':
+          return (
+            <div key={spec.k ?? spec.l} onClick={once(() => !locked && setField(item, field, !Boolean(field && editorValues[field.id])))} style={{ display: 'flex', alignItems: 'center', gap: 8, minHeight: 28, cursor: locked ? 'default' : 'pointer' }}>
+              <Check on={Boolean(field && editorValues[field.id])} disabled={locked} />
+              <text style={{ color: t.fg, fontSize: F_BODY }}>{spec.l || item.label}</text>
+            </div>
+          )
+        case 'sel': {
+          const options = field?.options?.length ? field.options : (spec.o ?? []).map((option) => ({ value: option, label: option }))
+          return wrap(
+            180,
+            1,
+            <Dropdown testId={field ? `field-${field.id}` : undefined} value={value} options={options} onChange={(next) => setField(item, field, next)} disabled={locked} error={error} />,
+          )
+        }
+        default:
+          return wrap(220, 1, box())
+      }
     }
 
-    function rowControls(row: (typeof editorModel.sections)[number]['rows'][number]) {
-      const fields = row.fields
-      if (row.kind === 'tin') {
+    function itemControls(item: ModelItem) {
+      if (item.tin) {
         return (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            {fields.map((field, fieldIndex) => (
-              <div key={field.id} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                {fieldIndex > 0 && <text style={{ color: t.fg3, fontSize: F_META }}>-</text>}
-                <input
-                  testId={`field-${field.id}`}
-                  value={String(editorValues[field.id] ?? '')}
-                  readOnly
-                  style={{
-                    width: fieldIndex === 3 ? 76 : 58,
-                    height: 32,
-                    padding: 6,
-                    textAlign: 'center',
-                    color: t.fg2,
-                    backgroundColor: t.hover,
-                    borderWidth: 1,
-                    borderColor: t.borderStrong,
-                    borderRadius: 6,
-                    fontSize: F_META,
-                    ...NUM_STYLE,
-                  }}
-                />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+            {item.fields.map(({ field }, index) => (
+              <div key={index} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                {index > 0 && <text style={{ color: t.fg3, fontSize: F_META }}>-</text>}
+                <input value={fieldValue(field)} readOnly style={{ ...inputStyle(t, { locked: true, mono: true, align: 'center' }), width: index === 3 ? 76 : 58, paddingLeft: 6, paddingRight: 6 }} />
               </div>
             ))}
           </div>
         )
       }
-      if (row.kind === 'radio' || (row.kind === 'period' && fields.some((field) => field.type === 'radio'))) {
-        return (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-            {fields.map((field) => {
-              if (field.type === 'radio') {
-                const checked = Boolean(editorValues[field.id])
+      const radios = item.fields.filter(({ spec }) => spec.t === 'radio')
+      const others = item.fields.filter(({ spec }) => spec.t !== 'radio')
+      const multi = item.fields.length > 1
+      return (
+        <>
+          {radios.length > 0 && (
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+              {radios.map((bound) => {
+                const checked = Boolean(bound.field && editorValues[bound.field.id])
+                const locked = fieldIsLocked(item, bound)
                 return (
                   <div
-                    key={field.id}
-                    testId={`radio-${field.id}`}
-                    onClick={() => editField(field, true)}
-                    style={{
-                      display: 'flex', alignItems: 'center', height: 28, paddingLeft: 12, paddingRight: 12,
-                      borderWidth: 1,
-                      borderColor: checked ? t.primary : t.borderStrong,
-                      borderRadius: 999,
-                      backgroundColor: checked ? t.primary : t.surface,
-                      cursor: 'pointer',
-                    }}
+                    key={bound.spec.k ?? bound.spec.l}
+                    testId={bound.field ? `radio-${bound.field.id}` : undefined}
+                    onClick={once(() => !locked && setField(item, bound.field, true))}
+                    style={{ display: 'flex', alignItems: 'center', height: 28, paddingLeft: 12, paddingRight: 12, borderWidth: 1, borderColor: checked ? t.primary : t.borderStrong, borderRadius: 14, backgroundColor: checked ? t.primary : t.surface, cursor: locked ? 'default' : 'pointer', opacity: locked && !checked ? 0.6 : 1, hover: locked || checked ? {} : { borderColor: t.fg3 } }}
                   >
-                    <text style={{ color: checked ? t.primaryFg : t.fg2, fontSize: F_META, fontWeight: 500, whiteSpace: 'nowrap' }}>
-                      {field.optionLabel || 'Option'}
-                    </text>
+                    <text style={{ color: checked ? t.primaryFg : t.fg2, fontSize: F_META, fontWeight: 500, whiteSpace: 'nowrap' }}>{bound.spec.l}</text>
                   </div>
                 )
-              }
-              return <div key={field.id}>{control(field, field.label)}</div>
-            })}
-          </div>
-        )
-      }
-      if (row.kind === 'period') {
-        return (
-          <div style={{ display: 'flex', alignItems: 'flex-end', gap: 12, flexWrap: 'wrap' }}>
-            {fields.map((field) => <div key={field.id}>{control(field, field.label)}</div>)}
-          </div>
-        )
-      }
-      if (fields.length > 1) {
-        return (
-          <div style={{ display: 'flex', alignItems: 'flex-end', gap: 12, flexWrap: 'wrap' }}>
-            {fields.map((field) => <div key={field.id}>{control(field, field.label)}</div>)}
-          </div>
-        )
-      }
-      return control(fields[0])
+              })}
+            </div>
+          )}
+          {others.map((bound) => control(item, bound, multi || radios.length > 0))}
+        </>
+      )
     }
 
-    const periodText = draft ? periodLabel(draft.period) : ''
-    const catalogEntry = formEntry ? catalogByCode.get(formEntry.formCode) : undefined
-    const visibleFieldCount = fieldSnapshot.filter((field) => field.visible !== false).length
-
-    return (
-      <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minHeight: 0 }}>
-        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, paddingBottom: 8 }}>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
-            <div>
-              <Btn kind="ghost" icon="chevLeft" testId="form-back" small onClick={() => closeForm()}>Back</Btn>
-            </div>
-            <div>
-              <text style={{ color: t.fg3, fontSize: F_META }}>
-                {`BIR Form ${formEntry ? displayFormCode(formEntry.formCode) : ''}${revision ? ` · Revision ${revision}` : ''}`}
-              </text>
-            </div>
-            <text style={{ color: t.fg, fontSize: F_PAGE, fontWeight: 600 }}>{formEntry ? cleanFormTitle(formEntry.label) : 'Return'}</text>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-              {catalogEntry && <Chip tone="muted">{catalogEntry.frequency === 'monthly' ? 'Monthly' : catalogEntry.frequency === 'quarterly' ? 'Quarterly' : 'Annual'}</Chip>}
-              <Chip tone="muted">{`${visibleFieldCount} fields`}</Chip>
-            </div>
-          </div>
-          <div style={{ flexGrow: 1 }} />
-          <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexShrink: 0 }}>
-            <Btn kind="ghost" testId="form-dismiss" small onClick={() => closeForm()}>Dismiss</Btn>
-            <Btn small testId="save-return-top" onClick={saveDraft}>Save draft</Btn>
-          </div>
-        </div>
-
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 10,
-            flexWrap: 'wrap',
-            padding: 10,
-            paddingLeft: 12,
-            paddingRight: 12,
-            borderWidth: 1,
-            borderColor: t.border,
-            borderRadius: 12,
-            backgroundColor: t.bg,
-            marginBottom: 14,
-          }}
-        >
-          <Avatar name={taxpayer?.name ?? '?'} size={20} />
-          <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 600 }}>{taxpayer?.name ?? ''}</text>
-          <text style={{ color: t.fg2, fontSize: F_META, ...NUM_STYLE }}>
-            {selectedProfile ? formatTin(selectedProfile.tin9, selectedProfile.branch) : ''}
-          </text>
-          {branch && <text style={{ color: t.fg2, fontSize: F_META, ...NUM_STYLE }}>{branch.name}</text>}
-          {periodText && <text style={{ color: t.fg3, fontSize: F_META }}>·</text>}
-          {periodText && <text style={{ color: t.fg2, fontSize: F_META }}>{`For ${periodText}`}</text>}
-          <div style={{ flexGrow: 1 }} />
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <text style={{ color: t.fg2, fontSize: F_META }}>Guided mode</text>
-            <Switch on={false} onToggle={() => showToast('Templates arrive with the guided-mode phase.')} />
-          </div>
-        </div>
-
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, paddingBottom: 12 }}>
-          {stages.map((stage, index) => (
-            <div key={stage} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <div
-                testId={`stage-${stage}`}
-                onClick={() => updateDraftStatus(stage)}
-                style={{
-                  width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  position: 'relative', cursor: 'pointer',
-                  borderWidth: index > currentIndex ? 0 : 2,
-                  borderColor: index < currentIndex ? t.success : index === currentIndex ? t.fg : t.border,
-                  borderRadius: 13,
-                  backgroundColor: index < currentIndex ? t.success : index === currentIndex ? t.primary : t.hover,
-                }}
-              >
-                {index > currentIndex && trackerDots.map((dot, dotIndex) => (
-                  <div key={dotIndex} style={{ position: 'absolute', left: dot.left, top: dot.top, width: 4, height: 4, borderRadius: 2, backgroundColor: t.borderStrong }} />
-                ))}
-                <text style={{ color: index < currentIndex ? '#ffffff' : index === currentIndex ? t.primaryFg : t.fg3, fontSize: 11, fontWeight: 700 }}>
-                  {index < currentIndex ? '✓' : String(index + 1)}
-                </text>
+    function tableBlock(item: ModelItem) {
+      return (
+        <div style={{ display: 'flex', flexDirection: 'column', borderWidth: 1, borderColor: t.border, borderRadius: 8, overflowX: 'scroll' }}>
+          <div style={{ display: 'flex', backgroundColor: t.bg }}>
+            <div style={{ width: 36, minWidth: 36, paddingTop: 9, paddingBottom: 9, display: 'flex', justifyContent: 'center' }}><text style={{ color: t.fg3, fontSize: F_META, fontWeight: 500 }}>#</text></div>
+            {item.cols.map((col, index) => (
+              <div key={index} style={{ minWidth: 136, flexGrow: 1, flexBasis: 0, paddingTop: 9, paddingBottom: 9, paddingLeft: 8, paddingRight: 8 }}>
+                <text style={{ color: t.fg3, fontSize: F_META, fontWeight: 500 }}>{col.l}</text>
               </div>
-              <text style={{ color: index <= currentIndex ? t.fg : t.fg3, fontSize: F_CAP }}>{stage[0].toUpperCase() + stage.slice(1)}</text>
-              {index < stages.length - 1 && <div style={{ width: 26, height: 2, backgroundColor: index < currentIndex ? t.success : t.border }} />}
+            ))}
+          </div>
+          {item.cells.map((row, rowIndex) => (
+            <div key={rowIndex} style={{ display: 'flex', alignItems: 'center', borderTopWidth: 1, borderColor: t.border }}>
+              <div style={{ width: 36, minWidth: 36, display: 'flex', justifyContent: 'center' }}><text style={{ color: t.fg3, fontSize: F_META }}>{String(rowIndex + 1)}</text></div>
+              {item.cols.map((col, colIndex) => {
+                const cell = row[colIndex] ?? null
+                const locked = Boolean(col.c) || !cell || Boolean(cell.disabled)
+                return (
+                  <div key={colIndex} style={{ minWidth: 136, flexGrow: 1, flexBasis: 0, paddingTop: 6, paddingBottom: 6, paddingLeft: 8, paddingRight: 8 }}>
+                    {col.t === 'radio' || col.t === 'chk' ? (
+                      <div onClick={once(() => !locked && setField(item, cell, !Boolean(cell && editorValues[cell.id])))} style={{ cursor: locked ? 'default' : 'pointer' }}><Check on={Boolean(cell && editorValues[cell.id])} disabled={locked} /></div>
+                    ) : (
+                      <input
+                        value={col.c && col.t === 'money' && !fieldValue(cell) ? '0.00' : fieldValue(cell)}
+                        readOnly={locked}
+                        placeholder={col.t === 'money' ? '0.00' : undefined}
+                        onChange={(event) => setField(item, cell, event.value ?? '')}
+                        style={{ ...inputStyle(t, { locked, mono: col.t === 'money', align: col.t === 'money' ? 'right' : 'left' }), height: 30, minHeight: 30, width: '100%' }}
+                      />
+                    )}
+                  </div>
+                )
+              })}
             </div>
           ))}
         </div>
+      )
+    }
 
-        {editorModel.bannerErrorText && (
-          <div style={{ padding: 10, paddingLeft: 14, borderRadius: 10, backgroundColor: t.dangerSoft, marginBottom: 12 }}>
-            <text style={{ color: t.danger, fontSize: F_META }}>{editorModel.bannerErrorText}</text>
+    function itemRow(item: ModelItem, first: boolean) {
+      const errorLine = showFor(item) ? item.errorText.split('\n').filter(Boolean).join(' · ') : ''
+      const numberChip = (
+        <div style={{ minWidth: 30, height: 22, paddingLeft: 6, paddingRight: 6, borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'center', backgroundColor: item.no ? t.hover : CLEAR, marginTop: 1 }}>
+          {item.no !== '' && <text style={{ color: t.fg2, fontSize: F_META, ...NUM_STYLE }}>{item.no}</text>}
+        </div>
+      )
+      if (item.kind === 'more') {
+        const open = openMore.has(item.id)
+        return (
+          <div key={item.id} style={{ display: 'flex', gap: 12, paddingTop: 14, paddingRight: 20, paddingBottom: 16, paddingLeft: 12, borderTopWidth: first ? 0 : 1, borderColor: t.border }}>
+            <div style={{ width: 44, minWidth: 44 }} />
+            <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
+              <div onClick={once(() => setOpenMore((current) => { const next = new Set(current); if (next.has(item.id)) next.delete(item.id); else next.add(item.id); return next }))} style={{ display: 'flex', alignItems: 'center', gap: 6, height: 28, cursor: 'pointer' }}>
+                <Icon name={open ? 'chevDown' : 'chevRight'} size={16} color={t.fg3} />
+                <text style={{ color: t.fg2, fontSize: F_META, fontWeight: 500 }}>{`${item.fields.length} more field${item.fields.length === 1 ? '' : 's'} not yet placed on the paper layout`}</text>
+              </div>
+              {open && <div style={{ display: 'flex', flexWrap: 'wrap', columnGap: 16, rowGap: 12, alignItems: 'flex-end', paddingTop: 10 }}>{item.fields.map((bound) => control(item, bound, true))}</div>}
+            </div>
           </div>
-        )}
-        {formLoading && <text style={{ color: t.fg3, paddingBottom: 8 }}>Opening official form…</text>}
-
-        <div style={{ display: 'flex', flexGrow: 1, minHeight: 0, gap: 16 }}>
-          <div style={{ display: 'flex', flexDirection: 'column', width: 208, minWidth: 208, gap: 2 }}>
-            <text style={{ color: t.fg3, fontSize: F_META, fontWeight: 500, paddingLeft: 8, paddingBottom: 6 }}>On this form</text>
-            {editorModel.sections.map((section, index) => {
-              const key = section.section ?? 'other'
-              const open = !(collapsedPartSet?.has(key))
-              return (
-                <div
-                  key={key}
-                  onClick={() => togglePart(key)}
-                  style={{
-                    display: 'flex', alignItems: 'flex-start', gap: 8, padding: 6, paddingLeft: 8, paddingRight: 8,
-                    borderRadius: 8, cursor: 'pointer', minHeight: 32,
-                    backgroundColor: open ? t.selected : 'rgba(0,0,0,0)',
-                    hover: { backgroundColor: open ? t.selected : t.hover },
-                  }}
-                >
-                  <text style={{ color: t.fg, fontSize: F_META, flexGrow: 1, minWidth: 0 }}>{section.section ?? `Part ${index + 1}`}</text>
-                  <text style={{ color: t.fg3, fontSize: F_CAP }}>{section.rows.length}</text>
-                </div>
-              )
-            })}
+        )
+      }
+      return (
+        <div key={item.id} testId={`item-${item.no || item.id}`} style={{ display: 'flex', gap: 12, paddingTop: 14, paddingRight: 20, paddingBottom: 12, paddingLeft: 12, borderTopWidth: first ? 0 : 1, borderColor: t.border, backgroundColor: item.computed ? t.bg : CLEAR }}>
+          <div style={{ width: 44, minWidth: 44, display: 'flex' }}>{numberChip}</div>
+          <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, flexWrap: 'wrap', minHeight: 22, marginBottom: 10 }}>
+              <div style={{ display: 'flex', flexGrow: 1, flexShrink: 1, flexBasis: 240, minWidth: 0, gap: 2 }}>
+                <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 500, lineHeight: 19 }}>{item.label}</text>
+                {item.required && <text style={{ color: t.danger, fontSize: F_BODY, fontWeight: 500 }}>*</text>}
+              </div>
+              {item.kind === 'table' && <Chip>{`${item.cells.length} rows`}</Chip>}
+              {item.auto && <Chip icon="user">From tax profile</Chip>}
+              {item.computed && <Chip icon="lock">Computed</Chip>}
+            </div>
+            {item.kind === 'table' ? tableBlock(item) : <div style={{ display: 'flex', flexWrap: 'wrap', columnGap: 16, rowGap: 12, alignItems: 'flex-end' }}>{itemControls(item)}</div>}
+            <div style={{ height: 18, minHeight: 18, paddingTop: 4, display: 'flex' }}>
+              {errorLine !== '' && <text testId={`error-${item.no || item.id}`} style={{ color: t.danger, fontSize: F_META, lineClamp: 1, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{errorLine}</text>}
+            </div>
           </div>
+        </div>
+      )
+    }
 
-          <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0, minHeight: 0, overflow: 'scroll', gap: 16, paddingBottom: 20 }}>
-            {editorModel.sections.map((section, index) => {
-              const key = section.section ?? `part-${index}`
-              const open = !collapsedPartSet?.has(key)
-              const filled = section.rows.filter((row) =>
-                row.fields.some((field) => {
-                  const value = editorValues[field.id]
-                  return value !== undefined && value !== '' && value !== false
-                }),
-              ).length
-              return (
-                <div
-                  key={key}
-                  testId={`part-${key}`}
-                  style={{ borderWidth: 1, borderColor: t.border, borderRadius: 12, backgroundColor: t.surface, overflow: 'hidden', flexShrink: 0 }}
-                >
-                  <div
-                    onClick={() => togglePart(key)}
-                    style={{ display: 'flex', alignItems: 'center', gap: 8, minHeight: 48, paddingLeft: 12, paddingRight: 16, cursor: 'pointer' }}
-                  >
-                    <Icon name={open ? 'chevDown' : 'chevRight'} size={16} color={t.fg3} />
-                    <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 600, flexGrow: 1, minWidth: 0 }}>{section.section ?? `Part ${index + 1}`}</text>
-                    <div style={{ minWidth: 110, display: 'flex', justifyContent: 'flex-end' }}>
-                      <text style={{ color: t.fg3, fontSize: F_META }}>{`${section.rows.length} items · ${filled} filled`}</text>
-                    </div>
-                  </div>
-                  {open && (
-                    <div style={{ borderTopWidth: 1, borderColor: t.border, display: 'flex', flexDirection: 'column' }}>
-                      {section.rows.map((row, rowIndex) => (
-                        <div
-                          key={row.id}
-                          style={{
-                            display: 'flex',
-                            gap: 12,
-                            paddingTop: 14, paddingRight: 20, paddingBottom: 16, paddingLeft: 12,
-                            borderTopWidth: rowIndex > 0 ? 1 : 0,
-                            borderColor: t.border,
-                          }}
-                        >
-                          <div
-                            style={{
-                              minWidth: 30,
-                              height: 22,
-                              paddingLeft: 6,
-                              paddingRight: 6,
-                              borderRadius: 6,
-                              display: 'flex',
-                              alignItems: 'center',
-                              justifyContent: 'center',
-                              backgroundColor: row.item ? t.hover : 'rgba(0,0,0,0)',
-                            }}
-                          >
-                            {row.item && <text style={{ color: t.fg2, fontSize: F_META, ...NUM_STYLE }}>{row.item}</text>}
-                          </div>
-                          <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0, gap: 10 }}>
-                            <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, flexWrap: 'wrap', minHeight: 22 }}>
-                              <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 500, flexGrow: 1, minWidth: 0 }}>{row.label || 'Return field'}</text>
-                              {row.locked && <Chip tone="muted" icon="user">From tax profile</Chip>}
-                            </div>
-                            {rowControls(row)}
-                            {row.errorText !== '' && (
-                              <text style={{ color: t.danger, fontSize: F_META }}>{row.errorText}</text>
-                            )}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )
+    const partNav = (
+      <div style={{ display: 'flex', flexDirection: narrow ? 'row' : 'column', gap: narrow ? 4 : 2, width: narrow ? undefined : 208, minWidth: narrow ? undefined : 208, overflowX: narrow ? 'scroll' : undefined, paddingBottom: narrow ? 4 : 0 }}>
+        {!narrow && <text style={{ color: t.fg3, fontSize: F_META, fontWeight: 500, paddingLeft: 8, paddingBottom: 6 }}>On this form</text>}
+        {schemaParts.map((part, index) => (
+          <div
+            key={index}
+            testId={`part-nav-${index}`}
+            onClick={once(() => {
+              setCollapsedPartSet((current) => { const next = new Set(current); next.delete(String(index)); return next })
+              partRefs.current[index]?.scrollIntoView?.()
             })}
+            style={{ display: 'flex', alignItems: 'flex-start', gap: 8, minHeight: narrow ? 28 : 32, paddingTop: narrow ? 4 : 6, paddingBottom: narrow ? 4 : 6, paddingLeft: narrow ? 10 : 8, paddingRight: narrow ? 10 : 8, borderRadius: narrow ? 14 : 8, borderWidth: narrow ? 1 : 0, borderColor: t.border, cursor: 'pointer', hover: { backgroundColor: t.hover } }}
+          >
+            <text style={{ color: t.fg2, fontSize: F_BODY, fontWeight: 500, flexGrow: 1, minWidth: 0, lineHeight: 18, whiteSpace: narrow ? 'nowrap' : 'normal' }}>{part.name}</text>
+            <text style={{ color: t.fg3, fontSize: F_META, paddingTop: 1 }}>{String(part.items.length)}</text>
+          </div>
+        ))}
+      </div>
+    )
+
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minHeight: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, paddingBottom: 4 }}>
+              <text style={{ color: t.fg2, fontSize: F_META, ...NUM_STYLE }}>{`BIR Form ${key}`}</text>
+              <div style={{ width: 3, height: 3, borderRadius: 2, backgroundColor: t.fg3 }} />
+              <text style={{ color: t.fg2, fontSize: F_META }}>{`Revision ${schema?.revision ?? ''}`}</text>
+            </div>
+            <text style={{ color: t.fg, fontSize: F_PAGE, fontWeight: 600 }}>{title}</text>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', paddingTop: 8 }}>
+              <Chip>{schema?.frequency ?? freqLabel(catalogByCode.get(formEntry?.formCode ?? '')?.frequency ?? 'annual')}</Chip>
+              {schema && <Chip>{`${schema.pages} page${schema.pages === 1 ? '' : 's'}`}</Chip>}
+              {schema && <Chip>{`${schema.fields} fields`}</Chip>}
+              {schema?.draftLayout && <Chip tone="warning" icon="alert">Draft layout</Chip>}
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <Btn small kind="secondary" icon="file" testId="print-preview" onClick={once(openPrintPreview)}>Print preview</Btn>
+            <Btn small testId="save-return-top" onClick={once(() => { saveDraft(); setShowErrors(true); showToast('Draft saved.') })}>Save draft</Btn>
           </div>
         </div>
 
-        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, paddingTop: 10, borderTopWidth: 1, borderColor: t.border }}>
-          <Btn kind="secondary" testId="validate-return" onClick={() => formInstance && refreshEditor(formInstance)}>Validate</Btn>
-          <Btn testId="save-return" onClick={saveDraft}>Save draft</Btn>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', marginTop: 20, marginBottom: 20, paddingTop: 10, paddingBottom: 10, paddingLeft: 12, paddingRight: 12, borderWidth: 1, borderColor: t.border, borderRadius: 12, backgroundColor: t.bg }}>
+          <Avatar name={taxpayer?.name || '?'} size={20} />
+          <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 600 }}>{taxpayer?.name ?? ''}</text>
+          <text style={{ color: t.fg2, fontSize: F_META, ...NUM_STYLE, fontWeight: 400 }}>{selectedProfile ? formatTin(selectedProfile.tin9, selectedProfile.branch) : ''}</text>
+          {branch && <text style={{ color: t.fg2, fontSize: F_META }}>{branch.name}</text>}
+          {periodText && <div style={{ width: 3, height: 3, borderRadius: 2, backgroundColor: t.fg3 }} />}
+          {periodText && <text style={{ color: t.fg2, fontSize: F_META }}>{`For ${periodText}`}</text>}
+          <div testId="status-chip" onClick={once(() => { const next = stages[(stages.indexOf(status) + 1) % stages.length]; updateDraftStatus(next); showToast(`Marked ${next}.`) })} style={{ cursor: 'pointer' }}>
+            <Chip tone={statusTone}>{status[0].toUpperCase() + status.slice(1)}</Chip>
+          </div>
+          <div style={{ flexGrow: 1 }} />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <text style={{ color: t.fg2, fontSize: F_META }}>Guided mode</text>
+            <Switch on={guided} onToggle={(value) => { setGuided(value); if (value) showToast('Guided mode stops at marked fields once this form has a template.') }} />
+          </div>
+        </div>
+
+        {formLoading && <text style={{ color: t.fg3, fontSize: F_BODY, paddingBottom: 8 }}>Opening official form…</text>}
+        {!schema && !formLoading && <text style={{ color: t.fg3, fontSize: F_BODY }}>This form's screen layout isn't available yet. Use Print preview to see the official sheet.</text>}
+
+        <div style={{ display: 'flex', flexDirection: narrow ? 'column' : 'row', gap: narrow ? 16 : 28, flexGrow: 1, minHeight: 0 }}>
+          {partNav}
+          <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0, minHeight: 0, overflow: 'scroll', gap: 16, paddingBottom: 40 }}>
+            {schemaParts.map((part, index) => {
+              const open = !collapsedPartSet.has(String(index))
+              return (
+                <div key={index} ref={(node: unknown) => { partRefs.current[index] = node as { scrollIntoView?: () => void } | null }} testId={`part-${index}`} style={{ display: 'flex', flexDirection: 'column', borderWidth: 1, borderColor: t.border, borderRadius: 12, backgroundColor: t.surface, overflow: 'hidden', flexShrink: 0 }}>
+                  <div onClick={once(() => togglePart(String(index)))} style={{ display: 'flex', alignItems: 'center', gap: 8, minHeight: 48, paddingLeft: 12, paddingRight: 16, cursor: 'pointer' }}>
+                    <Icon name={open ? 'chevDown' : 'chevRight'} size={16} color={t.fg3} />
+                    <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 600, flexGrow: 1, minWidth: 0 }}>{part.name}</text>
+                    <text style={{ color: t.fg3, fontSize: F_META }}>{`${part.items.length} item${part.items.length === 1 ? '' : 's'}`}</text>
+                  </div>
+                  {open && <div style={{ display: 'flex', flexDirection: 'column', borderTopWidth: 1, borderColor: t.border }}>{part.items.map((item, itemIndex) => itemRow(item, itemIndex === 0))}</div>}
+                </div>
+              )
+            })}
+          </div>
         </div>
       </div>
     )
@@ -3150,26 +2963,47 @@ function App() {
   // -- Overlays (search palette, start-a-return) ------------------------------
 
   function scrim(content: ReactNode, testId: string) {
+    const dark = t === themes.dark
     return (
       <div
         testId={testId}
         onMouseDown={() => setOverlay(null)}
-        style={{
-          position: 'absolute',
-          top: 0,
-          left: 0,
-          right: 0,
-          bottom: 0,
-          backgroundColor: 'rgba(10,10,12,0.32)',
-          display: 'flex',
-          alignItems: 'flex-start',
-          justifyContent: 'center',
-          paddingTop: 110,
-        }}
+        style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: dark ? 'rgba(0,0,0,0.55)' : 'rgba(24,24,27,0.30)', display: 'flex', alignItems: 'flex-start', justifyContent: 'center', paddingTop: 64, paddingLeft: 16, paddingRight: 16 }}
       >
-        <div onMouseDownOutside={() => setOverlay(null)} style={{ display: 'flex' }}>
+        <div
+          onMouseDownOutside={() => setOverlay(null)}
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            width: 560,
+            maxWidth: '100%',
+            borderRadius: 14,
+            borderWidth: 1,
+            borderColor: t.border,
+            backgroundColor: t.surface,
+            overflow: 'hidden',
+            boxShadow: { offsetX: 0, offsetY: 18, blurRadius: 44, spreadRadius: 0, color: dark ? 'rgba(0,0,0,0.55)' : 'rgba(20,20,30,0.14)' },
+          }}
+        >
           {content}
         </div>
+      </div>
+    )
+  }
+
+  /** .opt — 36 tall, padding 6 10, gap 10, radius 8; hover/keyboard = hover fill, chosen = selected. */
+  function optRow(opts: { key: string; testId?: string; lead: ReactNode; label: string; hint?: string; chosen?: boolean; on?: boolean; onClick: () => void; onHover?: () => void }) {
+    return (
+      <div
+        key={opts.key}
+        testId={opts.testId}
+        onClick={once(opts.onClick)}
+        onMouseEnter={opts.onHover}
+        style={{ display: 'flex', alignItems: 'center', gap: 10, minHeight: 36, paddingTop: 6, paddingBottom: 6, paddingLeft: 10, paddingRight: 10, borderRadius: 8, cursor: 'pointer', backgroundColor: opts.chosen ? t.selected : opts.on ? t.hover : CLEAR, hover: { backgroundColor: opts.chosen ? t.selected : t.hover } }}
+      >
+        {opts.lead}
+        <text style={{ color: t.fg, fontSize: F_BODY, flexGrow: 1, minWidth: 0, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{opts.label}</text>
+        {opts.hint && <text style={{ color: t.fg3, fontSize: F_META, ...NUM_STYLE, fontWeight: 400 }}>{opts.hint}</text>}
       </div>
     )
   }
@@ -3178,166 +3012,109 @@ function App() {
     const profile = selectedProfile
     const forms = profile ? store.listLibrary(profile.id) : []
     const chosen = forms.find((entry) => entry.formCode === startFormCode) ?? forms[0]
-    const periods = chosen && profile
-      ? periodsForYear(profile.year, catalogByCode.get(chosen.formCode)?.frequency ?? 'annual')
-      : []
-    const defaultPeriod = chosen && profile
-      ? dueByKey.get(`${profile.id}:${chosen.formCode}`)?.period ?? periods[0] ?? ''
-      : ''
-    const activePeriod = startPeriod || defaultPeriod
+    const frequency = catalogByCode.get(chosen?.formCode ?? '')?.frequency ?? 'annual'
+    const periods = chosen && profile ? periodsForYear(profile.year, frequency) : []
+    const defaultPeriod = chosen && profile ? dueByKey.get(`${profile.id}:${chosen.formCode}`)?.period ?? periods[0] ?? '' : ''
+    const activePeriod = startPeriod && periods.includes(startPeriod) ? startPeriod : defaultPeriod
     return scrim(
-      <div
-        style={{
-          display: 'flex',
-          flexDirection: 'column',
-          width: 520,
-          borderRadius: 12,
-          borderWidth: 1,
-          borderColor: t.border,
-          backgroundColor: t.surface,
-        }}
-      >
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 2, padding: 16, borderBottomWidth: 1, borderColor: t.border }}>
-          <text style={{ color: t.fg, fontSize: F_TITLE, fontWeight: 700 }}>Start a return</text>
-          <text style={{ color: t.fg3, fontSize: F_META }}>
-            {taxpayer && branch ? `${taxpayer.name} · ${formatTin(taxpayer.tin9, branch.code)} · ${branch.name}` : 'Pick a form below.'}
+      <>
+        <div style={{ display: 'flex', flexDirection: 'column', paddingTop: 16, paddingLeft: 20, paddingRight: 20, paddingBottom: 4 }}>
+          <text style={{ color: t.fg, fontSize: F_TITLE, fontWeight: 600 }}>Start a return</text>
+          <text style={{ color: t.fg2, fontSize: F_META, paddingTop: 2 }}>
+            {taxpayer && branch ? `${taxpayer.name} · ${formatTin(taxpayer.tin9, branch.code)} ${branch.name}` : 'Choose a taxpayer first.'}
           </text>
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', maxHeight: 320, overflow: 'scroll', padding: 8 }}>
-          {forms.length === 0 && (
-            <text style={{ color: t.fg3, fontSize: F_META, padding: 14 }}>No forms in this library yet — add them under Forms.</text>
-          )}
+        <div style={{ display: 'flex', flexDirection: 'column', maxHeight: 360, overflow: 'scroll', padding: 12 }}>
+          {forms.length === 0 && <text style={{ color: t.fg3, fontSize: F_BODY, padding: 14 }}>No forms on this year's list yet. Add them under Forms or open one from the Form library.</text>}
           {forms.map((entry) => {
-            const item = catalogByCode.get(entry.formCode)
-            const active = chosen?.formCode === entry.formCode
-            return (
-              <div
-                key={entry.formCode}
-                testId={`start-${entry.formCode}`}
-                onClick={() => {
-                  setStartFormCode(entry.formCode)
-                  setStartPeriod('')
-                }}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 10,
-                  height: 36,
-                  paddingLeft: 10,
-                  paddingRight: 10,
-                  borderRadius: 7,
-                  cursor: 'pointer',
-                  backgroundColor: active ? t.selected : 'rgba(0,0,0,0)',
-                  hover: { backgroundColor: active ? t.selected : t.hover },
-                }}
-              >
-                <text style={{ color: t.fg3, fontSize: F_META, ...NUM_STYLE, width: 72, minWidth: 72 }}>{displayFormCode(entry.formCode)}</text>
-                <text style={{ color: t.fg, fontSize: F_BODY, flexGrow: 1, minWidth: 0, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{cleanFormTitle(item?.label ?? '')}</text>
-                <text style={{ color: t.fg3, fontSize: F_META }}>{freqLabel(item?.frequency ?? 'annual')}</text>
-              </div>
-            )
+            const key = familyKey(entry.formCode)
+            return optRow({
+              key: entry.formCode,
+              testId: `start-${entry.formCode}`,
+              lead: <text style={{ color: t.fg, fontSize: F_META, ...NUM_STYLE, width: 60, minWidth: 60 }}>{key}</text>,
+              label: formMeta[key]?.title ?? cleanFormTitle(catalogByCode.get(entry.formCode)?.label ?? ''),
+              hint: formMeta[key]?.frequency ?? freqLabel(catalogByCode.get(entry.formCode)?.frequency ?? 'annual'),
+              chosen: chosen?.formCode === entry.formCode,
+              onClick: () => {
+                setStartFormCode(entry.formCode)
+                setStartPeriod('')
+              },
+            })
           })}
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: 12, borderTopWidth: 1, borderColor: t.border }}>
-          <text style={{ color: t.fg3, fontSize: F_META }}>Period</text>
-          <Select value={activePeriod} onValueChange={setStartPeriod}>
-            <SelectTrigger style={{ width: 150, height: 30 }}><SelectValue placeholder="Period" /></SelectTrigger>
-            <SelectContent>
-              {periods.map((period) => <SelectItem key={period} value={period}>{periodLabel(period)}</SelectItem>)}
-            </SelectContent>
-          </Select>
-          <div style={{ flexGrow: 1 }} />
-          <Btn kind="ghost" onClick={() => setOverlay(null)}>Cancel</Btn>
-          <Btn
-            testId="start-open"
-            disabled={!chosen || !activePeriod}
-            onClick={() => {
-              if (!chosen || !activePeriod) return
-              setOverlay(null)
-              setStartFormCode(null)
-              setStartPeriod('')
-              navOpenForm(chosen, activePeriod)
-            }}
-          >
-            Open form
-          </Btn>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap', paddingTop: 12, paddingLeft: 20, paddingRight: 20, paddingBottom: 16, borderTopWidth: 1, borderColor: t.border }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Dropdown testId="start-period" width={170} value={activePeriod} options={periods.map((period) => ({ value: period, label: periodLabel(period) }))} onChange={setStartPeriod} placeholder="Period" />
+            {chosen && <Chip>No template</Chip>}
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <Btn kind="ghost" onClick={once(() => setOverlay(null))}>Cancel</Btn>
+            <Btn
+              testId="start-open"
+              disabled={!chosen || !activePeriod}
+              onClick={once(() => {
+                if (!chosen || !activePeriod) return
+                setOverlay(null)
+                setStartFormCode(null)
+                setStartPeriod('')
+                navOpenForm(chosen, activePeriod)
+              })}
+            >
+              Open form
+            </Btn>
+          </div>
         </div>
-      </div>,
+      </>,
       'overlay-start-return',
     )
   }
 
   function searchOverlay() {
     const query = paletteQuery.trim().toLowerCase()
-    type Item = { id: string; group: string; title: string; sub: string; icon: IconName; run: () => void }
+    type Item = { id: string; group: string; title: string; hint: string; lead: ReactNode; run: () => void }
     const items: Item[] = []
+    const icon = (name: IconName) => <Icon name={name} size={16} color={t.fg2} />
     for (const item of tree) {
-      if (query && !item.name.toLowerCase().includes(query) && !formatTin(item.tin9).includes(query)) continue
-      items.push({
-        id: `tp-${item.tin9}`,
-        group: 'Taxpayers',
-        title: item.name || formatTin(item.tin9),
-        sub: formatTin(item.tin9),
-        icon: 'user',
-        run: () => chooseTaxpayer(item.tin9),
-      })
+      const label = item.name || formatTin(item.tin9)
+      if (query && !`${label} ${formatTin(item.tin9)}`.toLowerCase().includes(query)) continue
+      items.push({ id: `tp-${item.tin9}`, group: 'Taxpayers', title: label, hint: formatTin(item.tin9), lead: <Avatar name={item.name || item.tin9} size={20} />, run: () => chooseTaxpayer(item.tin9) })
     }
-    const gos: Array<[Page | string, string, IconName]> = [
-      ['home', 'Home', 'home'],
-      ['calendar', 'Calendar', 'calendar'],
-      ['filings', 'Filings', 'file'],
-      ['taxpayer', 'Tax profile', 'user'],
-      ['settings', 'Settings', 'settings'],
-      ['logs', 'Logs', 'list'],
-      ['jobs', 'Jobs', 'box'],
+    const gos: Array<[string, string, IconName, () => void]> = [
+      ['home', 'Home', 'home', () => goto('home')],
+      ['library', 'Form library', 'file', () => goto('library')],
+      ['calendar', 'Calendar', 'calendar', () => goto('calendar')],
+      ['filings', 'Filings', 'history', () => goto('filings')],
+      ['profile', 'Tax profile', 'user', () => goto('taxpayer', { tab: 'profile' })],
+      ['forms', 'Forms', 'file', () => goto('taxpayer', { tab: 'forms' })],
+      ['templates', 'Templates', 'template', () => goto('taxpayer', { tab: 'templates' })],
+      ['settings', 'Settings', 'settings', () => goto('settings')],
     ]
-    for (const [target, label, icon] of gos) {
+    for (const [id, label, name, run] of gos) {
       if (query && !label.toLowerCase().includes(query)) continue
-      items.push({ id: `go-${target}`, group: 'Go to', title: label, sub: '', icon, run: () => goto(target as Page) })
+      items.push({ id: `go-${id}`, group: 'Go to', title: label, hint: '', lead: icon(name), run })
     }
-    for (const entry of selectedLibrary) {
-      const item = catalogByCode.get(entry.formCode)
-      const label = `${displayFormCode(entry.formCode)} ${cleanFormTitle(item?.label ?? '')}`
-      if (query && !label.toLowerCase().includes(query)) continue
-      items.push({
-        id: `form-${entry.formCode}`,
-        group: 'Forms',
-        title: displayFormCode(entry.formCode),
-        sub: cleanFormTitle(item?.label ?? ''),
-        icon: 'file',
-        run: () => {
-          setStartFormCode(entry.formCode)
-          setOverlay({ kind: 'startReturn' })
-        },
-      })
+    if (query) {
+      for (const { key, code, meta } of libraryCatalog) {
+        const label = `${key} · ${meta.title}`
+        if (!label.toLowerCase().includes(query)) continue
+        items.push({ id: `form-${key}`, group: 'Forms', title: label, hint: '', lead: icon('file'), run: () => openFromLibrary(code) })
+      }
     }
-    const actions: Array<[string, string, IconName, () => void]> = [
-      ['new-taxpayer', 'New taxpayer', 'plus', () => { setShowNewTaxpayer(true); goto('taxpayer', { tab: 'profile' }) }],
-      ['backup', 'Back up database', 'database', backupNow],
-      ['theme', 'Cycle theme', themeIcon(), cycleTheme],
+    const actions: Array<[string, string, IconName, string, () => void]> = [
+      ['sidebar', 'Toggle sidebar', 'panelLeft', isMac ? '⌘B' : 'Ctrl B', () => setSidebarCollapsed((value) => !value)],
+      ['theme', 'Change theme', 'moon', '', cycleTheme],
     ]
-    for (const [id, label, icon, run] of actions) {
+    for (const [id, label, name, hint, run] of actions) {
       if (query && !label.toLowerCase().includes(query)) continue
-      items.push({ id: `act-${id}`, group: 'Actions', title: label, sub: '', icon, run })
+      items.push({ id: `act-${id}`, group: 'Actions', title: label, hint, lead: icon(name), run })
     }
-    const clampedIdx = Math.min(paletteIdx, items.length - 1)
+    const clampedIdx = Math.max(0, Math.min(paletteIdx, items.length - 1))
     const groups = [...new Set(items.map((item) => item.group))]
     let itemIdx = -1
     return scrim(
-      <div
-        style={{
-          display: 'flex',
-          flexDirection: 'column',
-          width: 540,
-          maxHeight: 420,
-          borderRadius: 12,
-          borderWidth: 1,
-          borderColor: t.border,
-          backgroundColor: t.surface,
-        }}
-      >
-        <div style={{ display: 'flex', alignItems: 'center', gap: 9, padding: 12, borderBottomWidth: 1, borderColor: t.border }}>
-          <Icon name="search" size={15} color={t.fg3} />
+      <>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, height: 48, minHeight: 48, paddingLeft: 16, paddingRight: 16, borderBottomWidth: 1, borderColor: t.border }}>
+          <Icon name="search" size={16} color={t.fg3} />
           <input
             testId="palette-input"
             value={paletteQuery}
@@ -3348,59 +3125,76 @@ function App() {
               setPaletteIdx(0)
             }}
             onKeyDown={(event) => {
-              if (event.key === 'ArrowDown') setPaletteIdx((value) => Math.min(value + 1, items.length - 1))
-              if (event.key === 'ArrowUp') setPaletteIdx((value) => Math.max(value - 1, 0))
-              if (event.key === 'Enter' && items[clampedIdx]) {
+              if (event.key === 'ArrowDown' || event.key === 'down') setPaletteIdx((value) => Math.min(value + 1, items.length - 1))
+              if (event.key === 'ArrowUp' || event.key === 'up') setPaletteIdx((value) => Math.max(value - 1, 0))
+              if ((event.key === 'Enter' || event.key === 'enter') && items[clampedIdx]) {
                 const run = items[clampedIdx].run
                 setOverlay(null)
                 run()
               }
             }}
-            style={{ flexGrow: 1, height: 30, color: t.fg, fontSize: F_BODY, backgroundColor: 'rgba(0,0,0,0)', borderWidth: 0 }}
+            style={{ flexGrow: 1, minWidth: 0, height: 30, color: t.fg, fontSize: F_EMPH, backgroundColor: CLEAR, borderWidth: 0 }}
           />
           <Kbd>Esc</Kbd>
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', overflow: 'scroll', padding: 6 }}>
-          {items.length === 0 && <text style={{ color: t.fg3, fontSize: F_META, padding: 14 }}>No results.</text>}
+        <div style={{ display: 'flex', flexDirection: 'column', overflow: 'scroll', maxHeight: 420, padding: 12 }}>
+          {items.length === 0 && <text style={{ color: t.fg3, fontSize: F_BODY, paddingTop: 40, paddingBottom: 40, textAlign: 'center' }}>No matches. Try a form code like 2550Q.</text>}
           {groups.map((group) => (
-            <div key={group}>
-              <text style={{ color: t.fg3, fontSize: F_CAP, fontWeight: 600, paddingLeft: 8, paddingTop: 6, paddingBottom: 2 }}>{group.toUpperCase()}</text>
+            <div key={group} style={{ display: 'flex', flexDirection: 'column' }}>
+              <text style={{ color: t.fg3, fontSize: F_CAP, fontWeight: 600, paddingTop: 10, paddingLeft: 10, paddingRight: 10, paddingBottom: 4 }}>{group.toUpperCase()}</text>
               {items.filter((item) => item.group === group).map((item) => {
                 itemIdx += 1
                 const idx = itemIdx
-                const active = idx === clampedIdx
-                return (
-                  <div
-                    key={item.id}
-                    onClick={() => {
-                      setOverlay(null)
-                      item.run()
-                    }}
-                    onMouseEnter={() => setPaletteIdx(idx)}
-                    style={{ display: 'flex', alignItems: 'center', gap: 9, height: 34, paddingLeft: 8, paddingRight: 8, borderRadius: 7, cursor: 'pointer', backgroundColor: active ? t.selected : 'rgba(0,0,0,0)' }}
-                  >
-                    <Icon name={item.icon} size={15} color={t.fg2} />
-                    <text style={{ color: t.fg, fontSize: F_BODY, flexGrow: 1, minWidth: 0, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{item.title}</text>
-                    {item.sub !== '' && <text style={{ color: t.fg3, fontSize: F_META, ...NUM_STYLE }}>{item.sub}</text>}
-                  </div>
-                )
+                return optRow({
+                  key: item.id,
+                  lead: item.lead,
+                  label: item.title,
+                  hint: item.hint,
+                  on: idx === clampedIdx,
+                  onHover: () => setPaletteIdx(idx),
+                  onClick: () => {
+                    setOverlay(null)
+                    item.run()
+                  },
+                })
               })}
             </div>
           ))}
         </div>
-      </div>,
+      </>,
       'overlay-search',
     )
   }
 
   // -- Root ------------------------------------------------------------------
 
-  const editorModel = buildEditorModel(fieldSnapshot, issues, formEntry ? autoFieldIds(formEntry.formCode as PrefillFormCode) : new Set())
+  const formSchemaNow = formEntry ? formSchemas[familyKey(formEntry.formCode)] : undefined
+  const schemaParts = formSchemaNow
+    ? buildSchemaModel(formSchemaNow, fieldSnapshot, issues, formEntry && isPrefillCode(formEntry.formCode) ? autoFieldIds(formEntry.formCode) : new Set())
+    : []
+
+  /** gpuix has no web view; the official frozen sheet opens in the default browser. */
+  function openPrintPreview() {
+    const dir = formEntry ? catalogByCode.get(formEntry.formCode)?.printable : null
+    if (!dir) {
+      showToast('No official print sheet is bundled for this form yet.')
+      return
+    }
+    const file = join(dir, 'index.html')
+    const [command, args] = isWin ? ['cmd', ['/c', 'start', '', file]] : isMac ? ['open', [file]] : ['xdg-open', [file]]
+    try {
+      spawn(command, args as string[], { detached: true, stdio: 'ignore' }).unref()
+      showToast(`Opened the official ${displayFormCode(formEntry!.formCode)} sheet.`)
+    } catch (error) {
+      showToast(`Couldn't open the print sheet: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
   const sftpMode = describeSftpConfig(loadSftpConfig())
 
   function mainContent() {
     if (page === 'form') return formPage()
     if (page === 'home') return homePage()
+    if (page === 'library') return libraryPage()
     if (page === 'calendar') return calendarPage()
     if (page === 'filings') return filingsPage()
     if (page === 'taxpayer') return taxpayerPage()
@@ -3426,13 +3220,13 @@ function App() {
             marginTop: 0,
             marginBottom: 8,
             marginLeft: sidebarCollapsed ? 8 : 0,
-            marginRight: 8,
+            marginRight: panel ? 0 : 8,
             borderWidth: 1,
             borderColor: t.border,
           }}
         >
-          <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minHeight: 0, padding: 28, paddingLeft: 32, paddingRight: 32, overflow: 'scroll' }}>
-            <div style={{ width: '100%', maxWidth: 880 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', flexGrow: 1, minHeight: 0, paddingTop: 28, paddingBottom: page === 'form' ? 0 : 56, paddingLeft: narrow ? 16 : 32, paddingRight: narrow ? 16 : 32, overflow: page === 'form' ? 'hidden' : 'scroll' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', width: '100%', maxWidth: page === 'form' || page === 'library' ? 1120 : 880, flexShrink: 0, flexGrow: page === 'form' ? 1 : 0, minHeight: page === 'form' ? 0 : undefined }}>
               {mainContent()}
             </div>
           </div>
@@ -3466,6 +3260,7 @@ function App() {
 render(
   <>
     <FontRegistration />
+    <AutomationBridge />
     <App />
   </>,
   {
