@@ -123,7 +123,7 @@ Status: `[ ]` todo, `[~]` in progress, `[x]` done (gate passed).
   *Gate:* CI green; window opens on Windows (screenshot).
 - [~] **P1 Reverse-engineering inventory.** Confirm the latest version on
   bir.gov.ph with REA; REA JS analysis of the package; generated form catalog
-  (83 forms in the official `formType` list, 43 with printable sheets) and
+  (79 active forms in the official `formType` list, 43 with printable sheets) and
   per-form field models taken from the official `frmMain.elements`
   serialization order (ids, types, maxlength, options, item labels).
   *Gate:* serializable field sets match
@@ -171,7 +171,8 @@ Status: `[ ]` todo, `[~]` in progress, `[x]` done (gate passed).
 - Initial plan.
 - Switched validation, compute and serialization to the official runtime
   engine (spike verified). Confirmed v7.9.6.2.1 is still the latest via REA.
-  P1 counts corrected (83 listed forms).
+  P1 counts corrected (79 active forms; 0620, 1621, 1709 and 2550DS are
+  commented out in `BIRForms.hta`, and 1709 has no HTA).
 - P0 gate passed. P1 started. Field-set gaps explained: 1601C `txtRDOCode` is
   built in a `$(document).ready` handler (the sandbox must fire ready), and
   2551Q's rules list `txtEmail` twice (serialized twice). The P1 field model is
