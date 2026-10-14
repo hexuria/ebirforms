@@ -1,0 +1,7 @@
+[submodule "vendor/buwiz-validation"]
+	path = vendor/buwiz-validation
+	url = https://github.com/hexuria/buwiz-validation
+
+[submodule "vendor/buwiz-forms-html"]
+	path = vendor/buwiz-forms-html
+	url = https://github.com/hexuria/buwiz-forms-html
