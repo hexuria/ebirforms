@@ -53,6 +53,18 @@ export interface LibraryEntry {
   addedAt: number
 }
 
+export type DraftValues = Record<string, string | boolean>
+
+export interface Draft {
+  id: string
+  profileId: string
+  formCode: string
+  values: DraftValues
+  status: 'draft'
+  createdAt: number
+  updatedAt: number
+}
+
 export function parseTin(input: string): ParsedTin {
   const digits = input.replace(/[\s-]/g, '')
   if (/^\d{9}$/.test(digits)) {
@@ -164,6 +176,21 @@ function migrate(db: Database): void {
       db.exec('ALTER TABLE jobs_v2 RENAME TO jobs')
       db.exec('CREATE INDEX jobs_due_order ON jobs (state, created_at, id)')
       db.exec('PRAGMA user_version = 2')
+    }
+    if (version < 3) {
+      db.exec(`
+        CREATE TABLE drafts (
+          id TEXT PRIMARY KEY,
+          profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+          form_code TEXT NOT NULL,
+          "values" JSON NOT NULL,
+          status TEXT NOT NULL CHECK (status = 'draft'),
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        )
+      `)
+      db.exec('CREATE INDEX drafts_profile_form_updated ON drafts (profile_id, form_code, updated_at)')
+      db.exec('PRAGMA user_version = 3')
     }
   })
   migration()
@@ -373,6 +400,88 @@ export class Store {
           addedAt,
         }
       })
+    })
+  }
+
+  createDraft(profileId: string, formCode: string, values: DraftValues = {}): Draft {
+    return this.withErrorLogging('createDraft', () => {
+      const latest = this.db
+        .query(
+          'SELECT MAX(updated_at) AS updatedAt FROM drafts WHERE profile_id = ? AND form_code = ?',
+        )
+        .get(profileId, formCode) as { updatedAt: number | null }
+      const now = Math.max(Date.now(), (latest.updatedAt ?? 0) + 1)
+      const draft: Draft = {
+        id: randomUUID(),
+        profileId,
+        formCode,
+        values,
+        status: 'draft',
+        createdAt: now,
+        updatedAt: now,
+      }
+      this.db
+        .query(
+          'INSERT INTO drafts (id, profile_id, form_code, "values", status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        )
+        .run(draft.id, profileId, formCode, JSON.stringify(values), draft.status, now, now)
+      this.logger.log('info', 'store', 'Draft created', { draftId: draft.id, formCode })
+      return draft
+    })
+  }
+
+  saveDraft(id: string, values: DraftValues): Draft {
+    return this.withErrorLogging('saveDraft', () => {
+      const current = this.db
+        .query('SELECT updated_at AS updatedAt FROM drafts WHERE id = ?')
+        .get(id) as { updatedAt: number } | null
+      if (!current) {
+        throw new Error(`Draft not found: ${id}.`)
+      }
+      const updatedAt = Math.max(Date.now(), current.updatedAt + 1)
+      const result = this.db
+        .query('UPDATE drafts SET "values" = ?, updated_at = ? WHERE id = ?')
+        .run(JSON.stringify(values), updatedAt, id)
+      if (!result.changes) {
+        throw new Error(`Draft not found: ${id}.`)
+      }
+      this.logger.log('info', 'store', 'Draft saved', { draftId: id })
+      return this.getDraft(id)!
+    })
+  }
+
+  listDrafts(profileId: string, formCode?: string): Draft[] {
+    return this.withErrorLogging('listDrafts', () => {
+      const rows = formCode
+        ? this.db
+            .query(
+              'SELECT id, profile_id AS profileId, form_code AS formCode, "values" AS valuesJson, status, created_at AS createdAt, updated_at AS updatedAt FROM drafts WHERE profile_id = ? AND form_code = ? ORDER BY updated_at DESC, created_at DESC, rowid DESC',
+            )
+            .all(profileId, formCode)
+        : this.db
+            .query(
+              'SELECT id, profile_id AS profileId, form_code AS formCode, "values" AS valuesJson, status, created_at AS createdAt, updated_at AS updatedAt FROM drafts WHERE profile_id = ? ORDER BY updated_at DESC, created_at DESC, rowid DESC',
+            )
+            .all(profileId)
+      return (rows as Array<Omit<Draft, 'values'> & { valuesJson: string }>).map(
+        ({ valuesJson, ...row }) => ({
+          ...row,
+          values: JSON.parse(valuesJson) as DraftValues,
+        }),
+      )
+    })
+  }
+
+  getDraft(id: string): Draft | null {
+    return this.withErrorLogging('getDraft', () => {
+      const row = this.db
+        .query(
+          'SELECT id, profile_id AS profileId, form_code AS formCode, "values" AS valuesJson, status, created_at AS createdAt, updated_at AS updatedAt FROM drafts WHERE id = ?',
+        )
+        .get(id) as (Omit<Draft, 'values'> & { valuesJson: string }) | null
+      if (!row) return null
+      const { valuesJson, ...draft } = row
+      return { ...draft, values: JSON.parse(valuesJson) as DraftValues }
     })
   }
 

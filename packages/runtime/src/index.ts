@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs'
-import { join, resolve, sep } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { Window } from 'happy-dom'
 import { extractGuards } from './validation.js'
 import type { ValidationIssue, ValidationLogger, ValidationResult } from './validation.js'
@@ -15,8 +15,11 @@ export { extractGuards } from './validation.js'
 
 export interface FieldSnapshot {
   id: string
+  name: string
   type: 'text' | 'select-one' | 'radio' | 'checkbox' | 'textarea'
   value: string
+  label: string
+  item: string | null
   checked?: boolean
   disabled: boolean
   maxLength?: number
@@ -31,6 +34,7 @@ export interface FormInstance {
   call(fn: string, ...args: unknown[]): unknown
   validate(logger?: ValidationLogger): ValidationResult
   readonly alerts: string[]
+  readonly errors: string[]
   captureSaveXml(): string
   close(): Promise<void>
 }
@@ -42,7 +46,6 @@ interface OpenOfficialFormOptions {
 
 const repositoryRoot = resolve(import.meta.dir, '../../..')
 const defaultPackageDir = join(repositoryRoot, 'vendor', 'buwiz-validation', 'package')
-const dependencies = ['jq/jquery-1.7.1.min.js', 'js/environment.js', 'js/string-util.js']
 
 export async function openOfficialForm(
   code: string,
@@ -53,6 +56,7 @@ export async function openOfficialForm(
   const formPath = join(formsDir, `BIR-Form${code}.hta`)
   const html = readFileSync(formPath, 'utf8').replace(/^\uFEFF/, '')
   const alerts: string[] = []
+  const errors: string[] = []
   const now = opts.now ?? new Date()
   const window = new Window({
     url: pathToFileURL(`${formsDir}${sep}`).href,
@@ -60,10 +64,20 @@ export async function openOfficialForm(
       disableJavaScriptFileLoading: true,
       disableCSSFileLoading: true,
       disableIframePageLoading: true,
-      errorCapture: 'processLevel',
+      errorCapture: 'tryAndCatch',
     } as any,
   })
   const w = window as any
+  w.d = window.document
+  const tableSectionPrototype = w.HTMLTableSectionElement?.prototype
+  if (tableSectionPrototype && !('rows' in tableSectionPrototype)) {
+    Object.defineProperty(tableSectionPrototype, 'rows', {
+      configurable: true,
+      get(this: any) {
+        return Array.from(this.children).filter((child: any) => child.tagName === 'TR')
+      },
+    })
+  }
   let saveXml = ''
 
   const focusLog: string[] = []
@@ -73,6 +87,18 @@ export async function openOfficialForm(
     alerts.push(String(message))
   }
   w.confirm = () => true
+  w.onerror = (message: unknown, _source: unknown, _line: unknown, _column: unknown, error: unknown) => {
+    errors.push(error instanceof Error ? `${error.name}: ${error.message}` : String(message))
+    return true
+  }
+  window.addEventListener('error', (event: any) => {
+    const error = event.error
+    errors.push(error instanceof Error ? `${error.name}: ${error.message}` : String(event.message ?? error))
+  })
+  window.addEventListener('unhandledrejection', (event: any) => {
+    const reason = event.reason
+    errors.push(reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason))
+  })
 
   const trackFocusTarget = (prototype: any, method: string) => {
     if (!prototype || typeof prototype[method] !== 'function') {
@@ -121,11 +147,46 @@ export async function openOfficialForm(
     Close: () => {},
     close: () => {},
   }
-  w.ActiveXObject = function () {
+  const openPackageTextFile = (fileLocation: string, ioMode = 1) => {
+    if (ioMode !== 1 || isAbsolute(fileLocation)) {
+      throw new Error(`Unsupported file access: ${fileLocation}`)
+    }
+    const filePath = resolve(packageDir, fileLocation)
+    const relativePath = relative(packageDir, filePath)
+    if (
+      relativePath === '..' ||
+      relativePath.startsWith(`..${sep}`) ||
+      isAbsolute(relativePath)
+    ) {
+      throw new Error(`File access is outside the official package: ${fileLocation}`)
+    }
+    const contents = readFileSync(filePath, 'utf8').replace(/^\uFEFF/, '')
+    let consumed = false
+    let closed = false
+    return {
+      get AtEndOfStream() {
+        return !contents.length || consumed || closed
+      },
+      ReadAll() {
+        if (consumed || closed) {
+          return ''
+        }
+        consumed = true
+        return contents
+      },
+      Close() {
+        closed = true
+      },
+    }
+  }
+  w.ActiveXObject = function (programId: string) {
     return new Proxy(
       {},
       {
         get: (_target, property) => {
+          if (property === 'OpenTextFile' && programId === 'Scripting.FileSystemObject') {
+            return openPackageTextFile
+          }
           if (property === 'CreateTextFile' || property === 'OpenTextFile') {
             return () => writer
           }
@@ -166,23 +227,35 @@ export async function openOfficialForm(
   }
 
   try {
-    for (const dependency of dependencies) {
-      w.eval(readFileSync(join(packageDir, dependency), 'utf8'))
-    }
-
-    const inlineScripts: string[] = []
+    const scripts: string[] = []
     const documentHtml = html.replace(
-      /<script([^>]*)>([\s\S]*?)<\/script>/gi,
+      /<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi,
       (_match, attributes: string, content: string) => {
-        if (!/\bsrc\s*=/i.test(attributes) && !/vbscript/i.test(attributes)) {
-          inlineScripts.push(content)
+        const isVBScript =
+          /\blanguage\s*=\s*["']?\s*vbscript\b/i.test(attributes) ||
+          /\btype\s*=\s*["']?\s*text\/vbscript\b/i.test(attributes)
+        if (isVBScript) {
+          return ''
+        }
+        const src = /\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(attributes)
+        if (src) {
+          const scriptSrc = (src[1] ?? src[2] ?? src[3] ?? '').trim()
+          if (scriptSrc.startsWith('//')) {
+            return ''
+          }
+          const scriptUrl = new URL(scriptSrc, pathToFileURL(formPath))
+          if (scriptUrl.protocol === 'file:') {
+            scripts.push(readFileSync(fileURLToPath(scriptUrl), 'utf8'))
+          }
+        } else {
+          scripts.push(content)
         }
         return ''
       },
     )
     window.document.write(documentHtml)
 
-    for (const script of inlineScripts) {
+    for (const script of scripts) {
       w.eval(script)
     }
 
@@ -278,9 +351,58 @@ export async function openOfficialForm(
     const evaluateInSandbox = (prelude: string, expression: string): unknown =>
       w.eval(`(function () {\n${prelude}\nreturn (${expression});\n})()`)
 
+    const textContent = (node: any): string => {
+      const clone = node.cloneNode(true) as any
+      clone.querySelectorAll?.('input, select, textarea, button, script, style, option').forEach(
+        (child: any) => child.remove(),
+      )
+      const text = String(clone.textContent ?? '').replace(/\s+/g, ' ').trim()
+      return /[\p{L}\p{N}]/u.test(text) ? text : ''
+    }
+
+    const precedingText = (node: any, boundary: any): string => {
+      let current = node
+      while (current && current !== boundary) {
+        let sibling = current.previousSibling
+        while (sibling) {
+          const text = textContent(sibling)
+          if (text) {
+            return text
+          }
+          sibling = sibling.previousSibling
+        }
+        current = current.parentNode
+      }
+      return ''
+    }
+
+    const fieldLabel = (element: any): { label: string; item: string | null } => {
+      const cell = element.closest('td, th')
+      const row = element.closest('tr')
+      let label = cell ? precedingText(element, cell) : precedingText(element, row)
+      if (!label && cell && row) {
+        let previousCell = cell.previousElementSibling
+        while (previousCell && !label) {
+          label = textContent(previousCell)
+          previousCell = previousCell.previousElementSibling
+        }
+      }
+      const itemFromLabel = /^(\d+[A-Z]?)\b/.exec(label)?.[1] ?? null
+      let item = itemFromLabel
+      if (!item && cell && row) {
+        let previousCell = cell.previousElementSibling
+        while (previousCell && !item) {
+          item = /^(\d+[A-Z]?)\b/.exec(textContent(previousCell))?.[1] ?? null
+          previousCell = previousCell.previousElementSibling
+        }
+      }
+      return { label: label || element.id, item }
+    }
+
     const instance: FormInstance = {
       code,
       alerts,
+      errors,
       fields() {
         return (Array.from((mainForm as any).elements) as any[])
           .filter((element) => element.type !== 'button' && element.type !== 'hidden')
@@ -295,10 +417,14 @@ export async function openOfficialForm(
             ) {
               return []
             }
+            const text = fieldLabel(element)
             const field: FieldSnapshot = {
               id: element.id,
+              name: element.name ?? '',
               type,
               value: element.value,
+              label: text.label,
+              item: text.item,
               disabled: element.disabled,
             }
             if (type === 'radio' || type === 'checkbox') {

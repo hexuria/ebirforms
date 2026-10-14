@@ -4,6 +4,8 @@ import { render } from '@gpuix/react'
 import {
   dataDir,
   describeSftpConfig,
+  type Draft,
+  type DraftValues,
   formatTin,
   JobQueue,
   loadSftpConfig,
@@ -18,6 +20,16 @@ import {
   type TaxpayerTree,
 } from '@ebirforms/core'
 import { loadCatalog, type CatalogEntry } from '@ebirforms/forms'
+import { openOfficialForm } from '@ebirforms/runtime'
+import type { FieldSnapshot, FormInstance, ValidationIssue } from '@ebirforms/runtime'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@gpuix/react'
+import { buildEditorModel, buildPrefillValues, type PrefillFormCode } from './editor-model.js'
 
 const store = openStore(join(dataDir(), 'ebirforms.sqlite'))
 const logger: Logger = store.logger
@@ -31,13 +43,17 @@ const sections = [
   { id: 'logs', title: 'Logs' },
 ] as const
 
-type SectionId = (typeof sections)[number]['id']
+type SectionId = (typeof sections)[number]['id'] | 'editor'
 type ProfileForm = {
   tin: string
   branch: string
   year: string
   registeredName: string
   rdo: string
+  address: string
+  zip: string
+  phone: string
+  email: string
 }
 type ProfileFieldName = keyof ProfileForm
 type ProfileErrors = Partial<Record<ProfileFieldName, string>>
@@ -223,6 +239,10 @@ function App() {
     year: '',
     registeredName: '',
     rdo: '',
+    address: '',
+    zip: '',
+    phone: '',
+    email: '',
   })
   const [profileErrors, setProfileErrors] = useState<ProfileErrors>({})
   const [profileStatus, setProfileStatus] = useState('')
@@ -235,6 +255,15 @@ function App() {
   const [jobs, setJobs] = useState<Job[]>(() => queue.list())
   const [logs, setLogs] = useState<LogEntry[]>(() => logger.getEntries())
   const [logFilter, setLogFilter] = useState<LogFilter>('all')
+  const [editorEntry, setEditorEntry] = useState<LibraryEntry | null>(null)
+  const [editorDraft, setEditorDraft] = useState<Draft | null>(null)
+  const [editorInstance, setEditorInstance] = useState<FormInstance | null>(null)
+  const [editorSnapshot, setEditorSnapshot] = useState<FieldSnapshot[]>([])
+  const [editorIssues, setEditorIssues] = useState<ValidationIssue[]>([])
+  const [editorInputValues, setEditorInputValues] = useState<
+    Record<string, string | boolean>
+  >({})
+  const [editorLoading, setEditorLoading] = useState(false)
 
   useEffect(() => queue.onChange(setJobs), [])
   useEffect(
@@ -304,6 +333,10 @@ function App() {
         year: Number(profileForm.year),
         registeredName: profileForm.registeredName,
         rdo: profileForm.rdo,
+        address: profileForm.address,
+        zip: profileForm.zip,
+        phone: profileForm.phone,
+        email: profileForm.email,
       })
       const nextProfiles = store.listTaxpayers()
       setProfiles(nextProfiles)
@@ -343,6 +376,138 @@ function App() {
     setLibrary(store.listLibrary(selectedProfileId))
   }
 
+  function valuesFromForm(form: FormInstance): DraftValues {
+    return Object.fromEntries(
+      form.fields().map((field) => [
+        field.id,
+        field.type === 'checkbox' || field.type === 'radio'
+          ? Boolean(field.checked)
+          : field.value,
+      ]),
+    )
+  }
+
+  function refreshEditor(form: FormInstance) {
+    const snapshot = form.fields()
+    const result = form.validate(logger)
+    setEditorSnapshot(snapshot)
+    setEditorIssues(result.issues)
+    setEditorInputValues(
+      Object.fromEntries(
+        snapshot.map((field) => [
+          field.id,
+          field.type === 'checkbox' || field.type === 'radio'
+            ? Boolean(field.checked)
+            : field.value,
+        ]),
+      ),
+    )
+    return result
+  }
+
+  async function openDraft(entry: LibraryEntry) {
+    if (!selectedProfile) {
+      return
+    }
+    const supported = ['1601Cv2018', '2551Qv2018', '0619E']
+    if (!supported.includes(entry.formCode)) {
+      logger.log('warn', 'editor', 'Form is not supported by the editor yet', {
+        formCode: entry.formCode,
+      })
+      return
+    }
+    const drafts = store.listDrafts(selectedProfile.id, entry.formCode)
+    let draft =
+      drafts[0] ??
+      store.createDraft(selectedProfile.id, entry.formCode)
+    setEditorEntry(entry)
+    setEditorDraft(draft)
+    setEditorInstance(null)
+    setEditorSnapshot([])
+    setEditorIssues([])
+    setEditorLoading(true)
+    setSelectedSection('editor')
+    logger.log('info', 'editor', 'Opening draft', {
+      draftId: draft.id,
+      formCode: entry.formCode,
+      resumed: drafts.length > 0,
+    })
+    let form: FormInstance | undefined
+    try {
+      form = await openOfficialForm(entry.formCode as PrefillFormCode)
+      const values = drafts.length
+        ? draft.values
+        : buildPrefillValues(entry.formCode as PrefillFormCode, selectedProfile, form.fields())
+      for (const [id, value] of Object.entries(values)) {
+        form.set(id, value)
+      }
+      if (drafts.length === 0) {
+        draft = store.saveDraft(draft.id, valuesFromForm(form))
+        setEditorDraft(draft)
+      }
+      setEditorInstance(form)
+      refreshEditor(form)
+    } catch (error) {
+      await form?.close()
+      const message = error instanceof Error ? error.message : String(error)
+      logger.log('error', 'editor', 'Failed to open draft', {
+        draftId: draft.id,
+        error: message,
+      })
+      setEditorIssues([{ message, fieldId: null, source: 'official' }])
+    } finally {
+      setEditorLoading(false)
+    }
+  }
+
+  function commitEditorField(id: string, value: string | boolean) {
+    if (!editorInstance) {
+      return
+    }
+    editorInstance.set(id, value)
+    const result = refreshEditor(editorInstance)
+    logger.log('debug', 'editor', 'Field updated', {
+      draftId: editorDraft?.id,
+      fieldId: id,
+      issueCount: result.issues.length,
+    })
+  }
+
+  function saveEditorDraft() {
+    if (!editorInstance || !editorDraft) {
+      return
+    }
+    const draft = store.saveDraft(editorDraft.id, valuesFromForm(editorInstance))
+    setEditorDraft(draft)
+    logger.log('info', 'editor', 'Draft saved', {
+      draftId: draft.id,
+      formCode: draft.formCode,
+    })
+  }
+
+  function validateEditor() {
+    if (editorInstance) {
+      const result = refreshEditor(editorInstance)
+      logger.log('info', 'editor', 'Draft validated', {
+        draftId: editorDraft?.id,
+        issueCount: result.issues.length,
+      })
+    }
+  }
+
+  async function closeEditor() {
+    await editorInstance?.close()
+    logger.log('info', 'editor', 'Editor closed', { draftId: editorDraft?.id })
+    setEditorInstance(null)
+    setEditorEntry(null)
+    setEditorDraft(null)
+    setEditorSnapshot([])
+    setEditorIssues([])
+    setEditorInputValues({})
+    setSelectedSection('library')
+  }
+
+  const editorModel = buildEditorModel(editorSnapshot, editorIssues)
   const displayedLogs =
     logFilter === 'all' ? logs : logs.filter((entry) => entry.level === logFilter)
 
@@ -528,6 +693,34 @@ function App() {
                     placeholder="e.g. 039"
                     onChange={updateProfileField}
                   />
+                  <ProfileField
+                    label="Address"
+                    field="address"
+                    value={profileForm.address}
+                    error={profileErrors.address ?? ''}
+                    onChange={updateProfileField}
+                  />
+                  <ProfileField
+                    label="ZIP"
+                    field="zip"
+                    value={profileForm.zip}
+                    error={profileErrors.zip ?? ''}
+                    onChange={updateProfileField}
+                  />
+                  <ProfileField
+                    label="Telephone"
+                    field="phone"
+                    value={profileForm.phone}
+                    error={profileErrors.phone ?? ''}
+                    onChange={updateProfileField}
+                  />
+                  <ProfileField
+                    label="Email"
+                    field="email"
+                    value={profileForm.email}
+                    error={profileErrors.email ?? ''}
+                    onChange={updateProfileField}
+                  />
                   <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                     <ActionButton testId="profile-save" onClick={saveProfile}>
                       Save
@@ -665,62 +858,371 @@ function App() {
                           No forms added for this profile.
                         </text>
                       )}
-                      {library.map((entry) => (
-                        <div
-                          key={entry.formCode}
-                          testId={`library-form-${entry.formCode}`}
-                          style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'space-between',
-                            gap: 8,
-                            padding: 10,
-                            borderRadius: 7,
-                            backgroundColor: '#1b1f27',
-                          }}
-                        >
-                          <text
-                            style={{
-                              color: '#e3e6eb',
-                              fontSize: 13,
-                              flexGrow: 1,
-                              minWidth: 0,
-                              whiteSpace: 'nowrap',
-                              textOverflow: 'ellipsis',
-                            }}
-                          >
-                            {entry.label}
-                          </text>
-                          <text
-                            style={{
-                              color: '#9ca7b7',
-                              fontSize: 11,
-                              width: 100,
-                              minWidth: 100,
-                              flexShrink: 0,
-                              textAlign: 'right',
-                              whiteSpace: 'nowrap',
-                            }}
-                          >
-                            {entry.formCode}
-                          </text>
+                      {library.map((entry) => {
+                        const draftCount = selectedProfileId
+                          ? store.listDrafts(selectedProfileId, entry.formCode).length
+                          : 0
+                        return (
                           <div
-                            testId={`library-remove-${entry.formCode}`}
-                            onClick={() => removeLibraryForm(entry.formCode)}
+                            key={entry.formCode}
+                            testId={`library-form-${entry.formCode}`}
                             style={{
-                              padding: 6,
-                              borderRadius: 4,
-                              cursor: 'pointer',
-                              backgroundColor: '#303744',
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 8,
+                              padding: 10,
+                              borderRadius: 7,
+                              backgroundColor: '#1b1f27',
                             }}
                           >
-                            <text style={{ color: '#fca5a5', fontSize: 11 }}>Remove</text>
+                            <text
+                              style={{
+                                color: '#e3e6eb',
+                                fontSize: 13,
+                                flexGrow: 1,
+                                minWidth: 0,
+                                whiteSpace: 'nowrap',
+                                textOverflow: 'ellipsis',
+                              }}
+                            >
+                              {entry.label}
+                            </text>
+                            <text
+                              style={{
+                                color: '#9ca7b7',
+                                fontSize: 11,
+                                width: 100,
+                                minWidth: 100,
+                                flexShrink: 0,
+                                textAlign: 'right',
+                                whiteSpace: 'nowrap',
+                              }}
+                            >
+                              {entry.formCode}
+                            </text>
+                            <text style={{ color: '#9ca7b7', fontSize: 11 }}>
+                              {`${draftCount} drafts`}
+                            </text>
+                            <ActionButton
+                              testId={`library-open-${entry.formCode}`}
+                              onClick={() => {
+                                void openDraft(entry)
+                              }}
+                            >
+                              Open
+                            </ActionButton>
+                            <div
+                              testId={`library-remove-${entry.formCode}`}
+                              onClick={() => removeLibraryForm(entry.formCode)}
+                              style={{
+                                padding: 6,
+                                borderRadius: 4,
+                                cursor: 'pointer',
+                                backgroundColor: '#303744',
+                              }}
+                            >
+                              <text style={{ color: '#fca5a5', fontSize: 11 }}>Remove</text>
+                            </div>
                           </div>
-                        </div>
-                      ))}
+                        )
+                      })}
                     </div>
                   </div>
                 </div>
+              )}
+            </>
+          )}
+          {selectedSection === 'editor' && (
+            <>
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: 16,
+                }}
+              >
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 5, minWidth: 0 }}>
+                  <text style={{ color: '#f4f5f7', fontSize: 26 }}>
+                    {`BIR Form ${editorEntry?.formCode ?? ''}`}
+                  </text>
+                  <text style={{ color: '#9ca7b7', fontSize: 13 }}>
+                    {selectedProfile
+                      ? `${formatTin(selectedProfile.tin9, selectedProfile.branch)} · ${selectedProfile.year}`
+                      : ''}
+                  </text>
+                </div>
+                <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
+                  <ActionButton testId="editor-save" onClick={saveEditorDraft}>
+                    Save draft
+                  </ActionButton>
+                  <ActionButton testId="editor-validate" onClick={validateEditor}>
+                    Validate
+                  </ActionButton>
+                  <ActionButton
+                    testId="editor-back"
+                    onClick={() => {
+                      void closeEditor()
+                    }}
+                  >
+                    Back
+                  </ActionButton>
+                </div>
+              </div>
+              {editorLoading ? (
+                <text style={{ color: '#c8d0dc', fontSize: 14 }}>Opening official form…</text>
+              ) : (
+                <>
+                  <div
+                    testId="editor-error-banner"
+                    style={{
+                      height: 30,
+                      minHeight: 30,
+                      paddingLeft: 10,
+                      backgroundColor: editorModel.bannerErrorText ? '#451f27' : '#1b1f27',
+                      borderRadius: 5,
+                    }}
+                  >
+                    <text style={{ color: '#fca5a5', fontSize: 12 }}>
+                      {editorModel.bannerErrorText}
+                    </text>
+                  </div>
+                  <div
+                    testId="editor-fields"
+                    style={{
+                      display: 'flex',
+                      flexDirection: 'column',
+                      flexGrow: 1,
+                      minHeight: 0,
+                      gap: 12,
+                      overflow: 'scroll',
+                    }}
+                  >
+                    {editorModel.sections.map((section, sectionIndex) => (
+                      <div
+                        key={`${section.item ?? 'other'}-${sectionIndex}`}
+                        style={{
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: 8,
+                          padding: 12,
+                          borderRadius: 8,
+                          backgroundColor: '#1b1f27',
+                        }}
+                      >
+                        <text style={{ color: '#93c5fd', fontSize: 14 }}>
+                          {section.item ? `Item ${section.item}` : 'Other fields'}
+                        </text>
+                        {section.rows.map((row) => {
+                          const field = row.fields[0]
+                          const value = editorInputValues[field.id] ?? field.value
+                          const commit = (next: string | boolean) =>
+                            commitEditorField(field.id, next)
+                          return (
+                            <div
+                              key={row.id}
+                              testId={`editor-row-${row.id}`}
+                              style={{ display: 'flex', flexDirection: 'column', gap: 4 }}
+                            >
+                              <div
+                                style={{
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: 14,
+                                  minWidth: 0,
+                                }}
+                              >
+                                <text
+                                  style={{
+                                    color: '#d6dbe4',
+                                    fontSize: 12,
+                                    width: 290,
+                                    minWidth: 190,
+                                    flexShrink: 0,
+                                  }}
+                                >
+                                  {row.label}
+                                </text>
+                                <div style={{ flexGrow: 1, minWidth: 0 }}>
+                                  {row.type === 'select-one' ? (
+                                    <Select
+                                      value={String(value)}
+                                      items={(field.options ?? []).map((option) => ({
+                                        value: option.value,
+                                        label: option.label || option.value,
+                                      }))}
+                                      onValueChange={(next: string) => commit(next)}
+                                      disabled={field.disabled}
+                                      style={{ width: '100%', minWidth: 0 }}
+                                    >
+                                      <SelectTrigger
+                                        style={{
+                                          display: 'flex',
+                                          alignItems: 'center',
+                                          width: '100%',
+                                          height: 34,
+                                          padding: 8,
+                                          color: '#f4f5f7',
+                                          backgroundColor: '#10141a',
+                                          borderWidth: 1,
+                                          borderColor: '#3b414d',
+                                          borderRadius: 5,
+                                        }}
+                                      >
+                                        <SelectValue placeholder="Select an option" />
+                                      </SelectTrigger>
+                                      <SelectContent
+                                        style={{
+                                          width: 580,
+                                          maxHeight: 240,
+                                          overflowY: 'scroll',
+                                          padding: 4,
+                                          backgroundColor: '#10141a',
+                                          borderWidth: 1,
+                                          borderColor: '#3b414d',
+                                          borderRadius: 5,
+                                        }}
+                                      >
+                                        {(field.options ?? []).map((option) => (
+                                          <SelectItem
+                                            key={option.value}
+                                            value={option.value}
+                                            style={(state) => ({
+                                              padding: 8,
+                                              color: '#f4f5f7',
+                                              backgroundColor: state.highlighted
+                                                ? '#303744'
+                                                : state.selected
+                                                  ? '#232b38'
+                                                  : '#171c24',
+                                            })}
+                                          >
+                                            {option.label || option.value}
+                                          </SelectItem>
+                                        ))}
+                                      </SelectContent>
+                                    </Select>
+                                  ) : row.type === 'radio' ? (
+                                    <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+                                      {row.fields.map((radio) => (
+                                        <div
+                                          key={radio.id}
+                                          testId={`editor-radio-${radio.id}`}
+                                          onClick={() => {
+                                            if (radio.disabled) {
+                                              return
+                                            }
+                                            for (const option of row.fields) {
+                                              editorInstance?.set(
+                                                option.id,
+                                                option.id === radio.id,
+                                              )
+                                            }
+                                            refreshEditor(editorInstance!)
+                                          }}
+                                          style={{
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            gap: 6,
+                                            cursor: radio.disabled ? 'default' : 'pointer',
+                                            opacity: radio.disabled ? 0.55 : 1,
+                                          }}
+                                        >
+                                          <div
+                                            style={{
+                                              display: 'flex',
+                                              alignItems: 'center',
+                                              justifyContent: 'center',
+                                              width: 18,
+                                              minWidth: 18,
+                                              height: 18,
+                                              borderWidth: 1,
+                                              borderColor: '#708090',
+                                              borderRadius: 9,
+                                            }}
+                                          >
+                                            <text style={{ color: '#60a5fa', fontSize: 13 }}>
+                                              {radio.checked ? '●' : ''}
+                                            </text>
+                                          </div>
+                                          <text style={{ color: '#e3e6eb', fontSize: 12 }}>
+                                            {radio.label || radio.value}
+                                          </text>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  ) : row.type === 'checkbox' ? (
+                                    <div
+                                      testId={`editor-checkbox-${field.id}`}
+                                      onClick={() => commit(!field.checked)}
+                                      style={{
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        gap: 7,
+                                        cursor: field.disabled ? 'default' : 'pointer',
+                                        opacity: field.disabled ? 0.55 : 1,
+                                      }}
+                                    >
+                                      <text style={{ color: '#60a5fa', fontSize: 16 }}>
+                                        {field.checked ? '☑' : '☐'}
+                                      </text>
+                                      <text style={{ color: '#e3e6eb', fontSize: 12 }}>
+                                        {field.label}
+                                      </text>
+                                    </div>
+                                  ) : (
+                                    <input
+                                      testId={`editor-input-${field.id}`}
+                                      value={String(value)}
+                                      readOnly={field.disabled}
+                                      onChange={(event) =>
+                                        setEditorInputValues((current) => ({
+                                          ...current,
+                                          [field.id]: event.value ?? '',
+                                        }))
+                                      }
+                                      onBlur={(event) =>
+                                        commit(
+                                          event.value ??
+                                            editorInputValues[field.id]?.toString() ??
+                                            field.value,
+                                        )
+                                      }
+                                      onKeyDown={(event) => {
+                                        if (event.key === 'Enter') {
+                                          commit(
+                                            editorInputValues[field.id]?.toString() ?? field.value,
+                                          )
+                                        }
+                                      }}
+                                      style={{
+                                        height: 34,
+                                        padding: 8,
+                                        color: field.disabled ? '#9ca7b7' : '#f4f5f7',
+                                        backgroundColor: '#10141a',
+                                        borderWidth: 1,
+                                        borderColor: '#3b414d',
+                                        borderRadius: 5,
+                                      }}
+                                    />
+                                  )}
+                                </div>
+                              </div>
+                              <div
+                                testId={`editor-error-${row.id}`}
+                                style={{ height: 18, minHeight: 18 }}
+                              >
+                                <text style={{ color: '#f87171', fontSize: 11 }}>
+                                  {row.errorText}
+                                </text>
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    ))}
+                  </div>
+                </>
               )}
             </>
           )}

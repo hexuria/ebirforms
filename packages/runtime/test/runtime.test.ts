@@ -99,12 +99,97 @@ function applyKnownDifferences(keys: string[], knownDifferences: KnownDifference
 }
 
 describe('openOfficialForm', () => {
+  test(
+    'labels ten hand-verified fields per form and reports id fallbacks',
+    async () => {
+      const verified = [
+        {
+          code: '1601Cv2018',
+          fields: [
+            ['frm1601c:txtTIN1', 'Taxpayer Identification Number (TIN)', '6', 417],
+            ['frm1601c:txtTIN2', 'Taxpayer Identification Number (TIN)', '6', 418],
+            ['frm1601c:txtTIN3', 'Taxpayer Identification Number (TIN)', '6', 419],
+            ['frm1601c:txtBranchCode', 'Taxpayer Identification Number (TIN)', '6', 420],
+            ['frm1601c:txtRDOCode', '7 RDO Code', '7', 4692],
+            ['frm1601c:txtZipCode', '9A Zip Code', '9A', 522],
+            ['frm1601c:txtTelNum', '10 Contact Number', '10', 542],
+            ['txtEmail', 'Email Address', '12', 585],
+            ['frm1601c:selTreaty', 'If yes, specify', '13', 621],
+            ['frm1601c:txtTax14', '14', '14', 667],
+          ],
+        },
+        {
+          code: '2551Qv2018',
+          fields: [
+            ['frm2551Qv2018:rtnMonth', 'Year Ended(MM/YYYY)', '2', 453],
+            ['frm2551Qv2018:txtYear', 'Year Ended(MM/YYYY)', '2', 469],
+            ['frm2551Qv2018:txtSheets', 'Attached', null, 571],
+            ['frm2551Qv2018:txtTIN1', 'Taxpayer Indentification Number (TIN)', '6', 619],
+            ['frm2551Qv2018:txtTIN2', 'Taxpayer Indentification Number (TIN)', '6', 621],
+            ['frm2551Qv2018:txtTIN3', 'Taxpayer Indentification Number (TIN)', '6', 623],
+            ['frm2551Qv2018:txtBranchCode', 'Taxpayer Indentification Number (TIN)', '6', 625],
+            ['frm2551Qv2018:txtRDOCode', '7 RDO Code', '7', 5935],
+            ['frm2551Qv2018:txtTaxReliefSpecify', 'If yes, specify', '12A', 874],
+            ['frm2551Qv2018:txt17Specify', '(specify)', '17', 1155],
+          ],
+        },
+        {
+          code: '0619E',
+          fields: [
+            ['frm0619E:txtTIN1', 'Taxpayer Identification Number (TIN)', '7', 424],
+            ['frm0619E:txtTIN2', 'Taxpayer Identification Number (TIN)', '7', 425],
+            ['frm0619E:txtTIN3', 'Taxpayer Identification Number (TIN)', '7', 426],
+            ['frm0619E:txtBranchCode', 'Taxpayer Identification Number (TIN)', '7', 427],
+            ['frm0619E:txtRDOCode', '8 RDO Code', '8', 3463],
+            ['frm0619E:txtTax14', '14', '14', 616],
+            ['frm0619E:txtTax15', '15', '15', 634],
+            ['frm0619E:txtTax16', '16', '16', 652],
+            ['frm0619E:txtTax17A', '17A', '17A', 676],
+            ['frm0619E:txtTax17B', '17B', '17B', 694],
+          ],
+        },
+      ] as const
+      for (const formCase of verified) {
+        const form = await openOfficialForm(formCase.code)
+        try {
+          const fields = form.fields()
+          for (const [id, label, item, line] of formCase.fields) {
+            const field = fields.find((entry) => entry.id === id)
+            expect(
+              { label: field?.label, item: field?.item },
+              `${formCase.code} ${id} at BIR-Form${formCase.code}.hta:${line}`,
+            ).toEqual({ label, item })
+          }
+          console.log(
+            `[field labels] ${formCase.code}: 10 checked; id fallbacks=${fields.filter((field) => field.label === field.id).length}/${fields.length}`,
+          )
+        } finally {
+          await form.close()
+        }
+      }
+    },
+    30_000,
+  )
+
   test('runs the official ready logic and builds the 1601C RDO select', async () => {
     const form = await openOfficialForm('1601Cv2018')
     try {
+      expect(form.call('eval', 'd === document')).toBe(true)
+      expect(form.call('eval', "document.getElementById('tblSched1a') !== null")).toBe(true)
+      expect(
+        form.call('eval', "typeof document.getElementById('tblSched1a').rows.length"),
+      ).toBe('number')
       expect(form.fields().find((field) => field.id === 'frm1601c:txtRDOCode')).toMatchObject({
         type: 'select-one',
       })
+      expect(
+        form.call(
+          'eval',
+          "Array.from(document.getElementById('frm1601c:txtRDOCode').options).some(option => option.value === '039')",
+        ),
+      ).toBe(true)
+      form.set('frm1601c:txtRDOCode', '039')
+      expect(form.get('frm1601c:txtRDOCode')).toBe('039')
     } finally {
       await form.close()
     }

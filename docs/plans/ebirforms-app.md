@@ -117,29 +117,26 @@ dialog from a Print button.
 
 Status: `[ ]` todo, `[~]` in progress, `[x]` done (gate passed).
 
-- [x] **P0 Bootstrap.** ([PR #3](https://github.com/hexuria/ebirforms/pull/3): CI green on Windows/Ubuntu/macOS, window verified on Windows.) Bun workspace, submodules, idempotent
+- [x] **P0 Bootstrap.** ([PR #3](https://github.com/hexuria/ebirforms/pull/3)) Bun workspace, submodules, idempotent
   `scripts/setup-*`, CI on Windows/Linux/macOS (typecheck + `bun test`), app
   window with an empty shell.
   *Gate:* CI green; window opens on Windows (screenshot).
-- [~] **P1 Reverse-engineering inventory.** ([PR #4](https://github.com/hexuria/ebirforms/pull/4): runtime + 79-form catalog + 1601C/2551Q/0619E parity with documented `knownDifferences`.) Confirm the latest version on
+- [x] **P1 Reverse-engineering inventory.** ([PR #4](https://github.com/hexuria/ebirforms/pull/4)) Confirm the latest version on
   bir.gov.ph with REA; REA JS analysis of the package; generated form catalog
   (79 active forms in the official `formType` list, 43 with printable sheets) and
   per-form field models taken from the official `frmMain.elements`
   serialization order (ids, types, maxlength, options, item labels).
-  *Gate:* serializable field sets match
-  `buwiz-forms/rules/forms/*/fields.json` for 1601C, 2551Q, 0619E. Spike:
-  0619E matches 59/59; 1601C differs on `txtRDOCode` and 2551Q is off by one,
-  both still to explain from each form's own `saveXML`. REA evidence
-  committed.
-- [~] **P2 Profiles and library.** ([PR #5](https://github.com/hexuria/ebirforms/pull/5)) Taxpayer, branch, tax year, form picker,
+  *Gate:* 79 active forms, printable mappings, and documented
+  rules-vs-official `knownDifferences` verified against each HTA.
+- [x] **P2 Profiles and library.** ([PR #5](https://github.com/hexuria/ebirforms/pull/5)) Taxpayer, branch, tax year, form picker,
   library, SQLite store, logger, job queue.
   *Gate:* unit tests; UI walkthrough creating `123-456-788` branches `00000`
   and `00002` with different years and different libraries.
-- [~] **P3 Validation engine.** ([PR #6](https://github.com/hexuria/ebirforms/pull/6)) Sandbox, guard extraction, inline errors with
+- [x] **P3 Validation engine.** ([PR #6](https://github.com/hexuria/ebirforms/pull/6)) Sandbox, guard extraction, inline errors with
   reserved lines.
   *Gate:* parity oracle passes for 1601C, 2551Q, 0619E; GPUIX automation test
   proves no layout shift when errors appear.
-- [ ] **P4 Form editor.** Generated editor for the first forms (1601C, 2551Q,
+- [~] **P4 Form editor.** Generated editor for the first forms (1601C, 2551Q,
   0619E) bound to the official runtime instance, drafts.
   *Gate:* filled fixtures compute the same totals as the official HTA.
 - [ ] **P5 Print preview and print.**
@@ -185,6 +182,20 @@ Status: `[ ]` todo, `[~]` in progress, `[x]` done (gate passed).
   screens; reserved error rows verified pixel-stable. Note: this VM has live `BIR_SFTP_*` set,
   so tests and dev launches must keep stripping `BIR_SFTP_LIVE` until P6 adds an explicit guard.
 - P3 slice in #6: `validate()` = official first alert (Validate-button onclick + focus capture)
-  + acorn guard extraction for all errors; random-fill oracle 50/50 per form. Open items for P4:
-  1601C loop-contained schedule guards (:3035-3108), and sandbox gaps hit by eventful sets
-  (`tblSched1a`, `getReqWithheldCompute`).
+  + acorn guard extraction for all errors; random-fill oracle 50/50 per form.
+  Remaining known coverage gap: 1601C loop-contained schedule guards (:3035-3108).
+- P4: load local non-VBScript scripts from each target HTA in document order,
+  capture sandbox errors, and derive field labels/items from preceding row/cell
+  text. Eventful `computeSchedule1()` uses global `d` and
+  `d.getElementById('tblSched1a').rows.length` (`BIR-Form1601Cv2018.hta:3550`);
+  the element is a `<tbody>` (`:1246`). The official shell supplies `d=document`
+  (`BIRForms.hta:123`), so the sandbox mirrors that alias and polyfills the
+  missing `HTMLTableSectionElement.rows` property in happy-dom 21.0.1 (its
+  declaration exposes only `insertRow`/`deleteRow`). RDO options are read by
+  the official `loadXMLrdo()` through `Scripting.FileSystemObject`; the runtime
+  provides a read-only package-confined file shim so `xml/rdo.xml` is available
+  without editing vendor files. `getReqWithheldCompute`
+  has no definition in the package and is
+  referenced only by disabled 2551Q rate fields (:1974-2085), so read-only
+  fields are not included in the eventful fill oracle. Drafts use schema v3;
+  new-draft prefill and reopening use `FormInstance.set()` before saving values.

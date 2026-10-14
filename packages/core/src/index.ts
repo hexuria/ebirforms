@@ -5,6 +5,8 @@ export type { LogEntry, LogLevel } from './logger.js'
 export { formatTin, openStore, parseTin, Store } from './store.js'
 export type {
   CreateProfileInput,
+  Draft,
+  DraftValues,
   LibraryEntry,
   Profile,
   TaxpayerTree,

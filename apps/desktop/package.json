@@ -9,6 +9,7 @@
   "dependencies": {
     "@ebirforms/core": "workspace:*",
     "@ebirforms/forms": "workspace:*",
+    "@ebirforms/runtime": "workspace:*",
     "@gpuix/native": "0.10.0",
     "@gpuix/react": "0.10.0",
     "react": "19.3.0"
