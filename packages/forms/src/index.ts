@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { Window } from 'happy-dom'
 
 export interface CatalogEntry {
@@ -105,11 +105,25 @@ export const printableSlugByCode: Record<string, string> = {
   '2553': '2553-1999',
 }
 
-const repositoryRoot = resolve(import.meta.dir, '../../..')
-const defaultPackageDir = join(repositoryRoot, 'vendor', 'buwiz-validation', 'package')
+/**
+ * Where vendor/ lives: EBIRFORMS_VENDOR_DIR, else beside a compiled binary
+ * (dist/vendor, or Contents/Resources/vendor in a macOS .app), else the
+ * repository checkout. A compiled binary's import.meta.dir is inside its
+ * virtual file system, so walking up from it finds nothing.
+ * Same rule as packages/runtime/src/index.ts; keep the two in step.
+ */
+function vendorRoot(): string {
+  if (process.env.EBIRFORMS_VENDOR_DIR) return resolve(process.env.EBIRFORMS_VENDOR_DIR)
+  const exeDir = dirname(process.execPath)
+  for (const candidate of [join(exeDir, 'vendor'), join(exeDir, '..', 'Resources', 'vendor')]) {
+    if (existsSync(join(candidate, 'buwiz-validation'))) return candidate
+  }
+  return join(resolve(import.meta.dir, '../../..'), 'vendor')
+}
+const repositoryVendor = vendorRoot()
+const defaultPackageDir = join(repositoryVendor, 'buwiz-validation', 'package')
 const defaultFrozenDir = join(
-  repositoryRoot,
-  'vendor',
+  repositoryVendor,
   'buwiz-forms-html',
   'html-frozen',
 )

@@ -43,6 +43,8 @@ import { buildSchemaModel, type BoundField, type FormSchema, type ModelItem } fr
 import { spawn } from 'node:child_process'
 import { resolveSystemTheme, resolveTheme, themes, type ResolvedTheme, type ThemeMode, type ThemeTokens } from './theme.js'
 import { beginWindowDrag, closeWindow, dragWindowTo, toggleMaximizeWindow, type DragAnchor } from './win32.js'
+// @ts-expect-error -- a file import resolves to a path at run time
+import fontFile from '../assets/fonts/BricolageGrotesque-Variable.ttf' with { type: 'file' }
 
 const appDir = dataDir()
 mkdirSync(appDir, { recursive: true })
@@ -85,7 +87,8 @@ if (process.env.EBIRFORMS_SEED === 'demo') {
     logger.log('warn', 'seed', 'Demo seed failed', { error: String(error) })
   }
 }
-const fontPath = join(import.meta.dir, '../assets/fonts/BricolageGrotesque-Variable.ttf')
+// A file import, so a compiled binary embeds the font instead of looking beside its source.
+const fontPath: string = fontFile
 
 function FontRegistration() {
   const renderer = useGpuixRequired()
