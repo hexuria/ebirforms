@@ -297,6 +297,8 @@ function periodChoices(year: number, frequency: ReturnFrequency): PeriodChoice[]
   return [{ period: String(year), label: `${year} annual return` }]
 }
 
+const SUPPORTED_FORM_CODES = ['1601Cv2018', '2551Qv2018', '0619E'] as const
+
 function App() {
   const [themeMode, setThemeMode] = useState<ThemeMode>(readTheme)
   activeTheme = themes[themeMode]
@@ -346,6 +348,7 @@ function App() {
   const pendingSearchFocus = useRef(false)
   const dragAnchor = useRef<DragAnchor | null>(null)
   const histRef = useRef<{ stack: NavState[]; idx: number }>({ stack: [], idx: -1 })
+  const formLoadSeq = useRef(0)
   const [, setHistVersion] = useState(0)
   const gpuix = useGpuixRequired()
 
@@ -441,6 +444,12 @@ function App() {
   async function applyNav(next: NavState) {
     const switching = formInstance && (next.page !== 'form' || next.formCode !== formEntry?.formCode || next.period !== draft?.period)
     if (switching) {
+      formLoadSeq.current += 1
+      if (draft) {
+        try {
+          store.saveDraft(draft.id, valuesFromForm(formInstance))
+        } catch {}
+      }
       await formInstance.close()
       setFormInstance(null)
       setFieldSnapshot([])
@@ -449,6 +458,11 @@ function App() {
     if (next.page !== 'form' && formEntry) {
       setFormEntry(null)
       setDraft(null)
+    }
+    if (next.profileId !== selectedProfileId) setPendingCodes([])
+    if (next.page === 'form' && next.formCode && !(SUPPORTED_FORM_CODES as readonly string[]).includes(next.formCode)) {
+      setStatusMessage(`${next.formCode} isn't editable yet — the editor covers 1601C, 2551Q and 0619E for now.`)
+      next = { ...next, page: 'taxpayer', tab: 'forms', formCode: undefined, period: undefined }
     }
     setPage(next.page)
     setTab(next.tab)
@@ -599,11 +613,11 @@ function App() {
         branch: branch.code,
         year: Number(yearInput),
         registeredName: selectedProfile?.registeredName ?? taxpayer.name,
-        rdo: selectedProfile?.rdo ?? branch.facts.rdo ?? '',
-        address: selectedProfile?.address ?? branch.facts.address ?? '',
-        zip: selectedProfile?.zip ?? branch.facts.zip ?? '',
-        email: selectedProfile?.email ?? branch.facts.email ?? '',
-        phone: selectedProfile?.phone ?? branch.facts.phone ?? '',
+        rdo: selectedProfile?.rdo ?? branch.overrides.rdo ?? '',
+        address: selectedProfile?.address ?? branch.overrides.address ?? '',
+        zip: selectedProfile?.zip ?? branch.overrides.zip ?? '',
+        email: selectedProfile?.email ?? branch.overrides.email ?? '',
+        phone: selectedProfile?.phone ?? branch.overrides.phone ?? '',
       })
       refreshTree(taxpayer.tin9, branchId(taxpayer.tin9, branch.code), profile.id)
       setShowNewYear(false)
@@ -629,8 +643,9 @@ function App() {
   }
 
   async function openForm(entry: LibraryEntry, period: string, profile: Profile | undefined = selectedProfile) {
-    if (!profile || !['1601Cv2018', '2551Qv2018', '0619E'].includes(entry.formCode)) return
+    if (!profile || !(SUPPORTED_FORM_CODES as readonly string[]).includes(entry.formCode)) return
     const code = entry.formCode as PrefillFormCode
+    const ticket = ++formLoadSeq.current
     const previous = store.listDrafts(profile.id, code).find((item) => item.period === period)
     const opened = store.openDraft(profile.id, code, period)
     if (formInstance) {
@@ -646,6 +661,10 @@ function App() {
     let form: FormInstance | undefined
     try {
       form = await openOfficialForm(code)
+      if (ticket !== formLoadSeq.current) {
+        await form.close()
+        return
+      }
       const prefillValues = buildPrefillValues(code, profile, form.fields(), period)
       const initialValues = mergeDraftPrefill(opened.values, prefillValues)
       for (const [id, value] of Object.entries(initialValues)) form.set(id, value)

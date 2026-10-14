@@ -243,8 +243,8 @@ function migrate(db: Database): void {
         SET name = COALESCE((
           SELECT registered_name
           FROM profiles
-          WHERE profiles.tin9 = taxpayers.tin9 AND profiles.branch = '00000'
-          ORDER BY profiles.year DESC
+          WHERE profiles.tin9 = taxpayers.tin9
+          ORDER BY (profiles.branch = '00000') DESC, profiles.year DESC
           LIMIT 1
         ), '');
 

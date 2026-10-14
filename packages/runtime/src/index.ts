@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { readFileSync, realpathSync } from 'node:fs'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { Window } from 'happy-dom'
@@ -150,17 +150,20 @@ export async function openOfficialForm(
     Close: () => {},
     close: () => {},
   }
+  const insidePackage = (filePath: string) => {
+    const lexical = relative(packageDir, filePath)
+    if (lexical === '..' || lexical.startsWith(`..${sep}`) || isAbsolute(lexical)) {
+      return false
+    }
+    const real = relative(realpathSync(packageDir), realpathSync(filePath))
+    return !(real === '..' || real.startsWith(`..${sep}`) || isAbsolute(real))
+  }
   const openPackageTextFile = (fileLocation: string, ioMode = 1) => {
     if (ioMode !== 1 || isAbsolute(fileLocation)) {
       throw new Error(`Unsupported file access: ${fileLocation}`)
     }
     const filePath = resolve(packageDir, fileLocation)
-    const relativePath = relative(packageDir, filePath)
-    if (
-      relativePath === '..' ||
-      relativePath.startsWith(`..${sep}`) ||
-      isAbsolute(relativePath)
-    ) {
+    if (!insidePackage(filePath)) {
       throw new Error(`File access is outside the official package: ${fileLocation}`)
     }
     const contents = readFileSync(filePath, 'utf8').replace(/^\uFEFF/, '')
@@ -248,7 +251,11 @@ export async function openOfficialForm(
           }
           const scriptUrl = new URL(scriptSrc, pathToFileURL(formPath))
           if (scriptUrl.protocol === 'file:') {
-            scripts.push(readFileSync(fileURLToPath(scriptUrl), 'utf8'))
+            const scriptPath = fileURLToPath(scriptUrl)
+            if (!insidePackage(scriptPath)) {
+              throw new Error(`Script is outside the official package: ${scriptSrc}`)
+            }
+            scripts.push(readFileSync(scriptPath, 'utf8'))
           }
         } else {
           scripts.push(content)
