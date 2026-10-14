@@ -936,7 +936,9 @@ export class Store {
   touchDraft(id: string): Draft {
     return this.withErrorLogging('touchDraft', () => {
       const result = this.db
-        .query('UPDATE drafts SET updated_at = MAX(updated_at + 1, ?) WHERE id = ?')
+        .query(
+          'UPDATE drafts SET updated_at = MAX((SELECT MAX(updated_at) FROM drafts) + 1, ?) WHERE id = ?',
+        )
         .run(Date.now(), id)
       if (!result.changes) {
         throw new Error(`Draft not found: ${id}.`)
