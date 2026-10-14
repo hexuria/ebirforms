@@ -35,6 +35,9 @@ import {
   autoFieldIds,
   buildEditorModel,
   buildPrefillValues,
+  cleanFormTitle,
+  displayFormCode,
+  formCategory,
   mergeDraftPrefill,
   type PrefillFormCode,
 } from './editor-model.js'
@@ -230,10 +233,12 @@ function Field({
 function Panel({
   title,
   subtitle,
+  aside,
   children,
 }: {
   title: string
   subtitle?: string
+  aside?: string
   children?: ReactNode
 }) {
   const t = useTheme()
@@ -250,9 +255,9 @@ function Panel({
         backgroundColor: t.chrome,
       }}
     >
-      <div>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <text style={{ color: t.fg, fontSize: 15, fontWeight: 700 }}>{title}</text>
-        {subtitle && <text style={{ color: t.mutedFg, fontSize: 12 }}>{subtitle}</text>}
+        {aside ? <text style={{ color: t.mutedFg, fontSize: 11 }}>{aside}</text> : subtitle && <text style={{ color: t.mutedFg, fontSize: 12 }}>{subtitle}</text>}
       </div>
       {children}
     </div>
@@ -305,6 +310,7 @@ function App() {
   const [taxpayerEdit, setTaxpayerEdit] = useState({ name: '', type: 'individual', birthDate: '' })
   const [branchEdit, setBranchEdit] = useState<NewBranchForm>(blankBranch)
   const [yearInput, setYearInput] = useState(String(new Date().getFullYear()))
+  const [showNewYear, setShowNewYear] = useState(false)
   const [statusMessage, setStatusMessage] = useState('')
   const [search, setSearch] = useState('')
   const [pendingCodes, setPendingCodes] = useState<string[]>([])
@@ -482,8 +488,15 @@ function App() {
         tin: taxpayer.tin9,
         branch: branch.code,
         year: Number(yearInput),
+        registeredName: selectedProfile?.registeredName ?? taxpayer.name,
+        rdo: selectedProfile?.rdo ?? branch.facts.rdo ?? '',
+        address: selectedProfile?.address ?? branch.facts.address ?? '',
+        zip: selectedProfile?.zip ?? branch.facts.zip ?? '',
+        email: selectedProfile?.email ?? branch.facts.email ?? '',
+        phone: selectedProfile?.phone ?? branch.facts.phone ?? '',
       })
       refreshTree(taxpayer.tin9, branchId(taxpayer.tin9, branch.code), profile.id)
+      setShowNewYear(false)
       setStatusMessage(`${profile.year} added.`)
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : String(error))
@@ -644,14 +657,20 @@ function App() {
     )
   }
 
-  function statusColor(status: DraftStatus) {
-    return status === 'confirmed' || status === 'paid'
-      ? t.success
-      : status === 'submitted'
-        ? t.warning
-        : status === 'queued'
-          ? t.primary
-          : t.mutedFg
+  function statusStyle(status: DraftStatus | undefined) {
+    if (status === 'draft') return { color: t.warnText, backgroundColor: t.markBg, borderColor: t.mark }
+    if (status === 'confirmed' || status === 'paid') {
+      return { color: t.good, backgroundColor: t.goodBg, borderColor: t.good }
+    }
+    if (status === 'queued' || status === 'submitted') {
+      return { color: t.primary, backgroundColor: t.secondary, borderColor: t.border }
+    }
+    return { color: t.mutedFg, backgroundColor: t.bg, borderColor: t.border }
+  }
+
+  function statusLabel(status: DraftStatus | undefined) {
+    if (!status) return 'New'
+    return status[0].toUpperCase() + status.slice(1)
   }
 
   function statusFor(entry: LibraryEntry, period: string) {
@@ -665,15 +684,17 @@ function App() {
     if (!form || !selectedProfile) return null
     const choices = periodChoices(selectedProfile.year, form.frequency)
     return (
-      <div key={entry.formCode} style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 16, borderWidth: 1, borderColor: t.border, borderRadius: 10, backgroundColor: t.chrome }}>
+      <div key={entry.formCode} style={{ display: 'flex', flexDirection: 'column', gap: 12, width: '32.5%', minWidth: 340, flexGrow: 1, padding: 14, borderWidth: 1, borderColor: t.border, borderRadius: 10, backgroundColor: t.chrome }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
-          <text style={{ color: t.fg, fontSize: 13, fontWeight: 700, width: 112, minWidth: 112 }}>{entry.formCode}</text>
-          <text style={{ color: t.mutedFg, fontSize: 11, flexGrow: 1, minWidth: 0, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{form.label}</text>
-          <text style={{ color: t.mutedFg, fontSize: 10 }}>{form.frequency}</text>
+          <text style={{ color: t.fg, fontSize: 22, fontWeight: 800, width: 100, minWidth: 100 }}>{displayFormCode(entry.formCode)}</text>
+          <text style={{ color: t.mutedFg, fontSize: 10, padding: 5, borderRadius: 12, backgroundColor: t.secondary }}>{formCategory(entry.formCode)}</text>
         </div>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+        <text style={{ color: t.fg, fontSize: 12, minWidth: 0, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{cleanFormTitle(form.label)}</text>
+        <text style={{ color: t.mutedFg, fontSize: 11 }}>Year {selectedProfile.year}:</text>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
           {choices.map((choice) => {
             const status = statusFor(entry, choice.period)
+            const statusTokens = statusStyle(status)
             return (
               <div
                 key={choice.period}
@@ -681,16 +702,13 @@ function App() {
                 onClick={() => void openForm(entry, choice.period)}
                 style={{
                   display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'center',
-                  padding: 10, width: form.frequency === 'monthly' ? '15%' : '23%',
-                  minWidth: form.frequency === 'monthly' ? 62 : 86,
-                  borderWidth: 1, borderColor: t.border, borderRadius: 7,
-                  cursor: 'pointer', backgroundColor: t.bg,
+                  padding: 7, width: 85, minWidth: 85, height: 60,
+                  borderWidth: 1, borderColor: statusTokens.borderColor, borderRadius: 7,
+                  cursor: 'pointer', backgroundColor: statusTokens.backgroundColor,
                 }}
               >
                 <text style={{ color: t.fg, fontSize: 12 }}>{choice.label}</text>
-                <text style={{ color: status ? statusColor(status) : t.mutedFg, fontSize: 9 }}>
-                  {status ?? 'OPEN'}
-                </text>
+                <text style={{ color: statusTokens.color, fontSize: 10 }}>{statusLabel(status)}</text>
               </div>
             )
           })}
@@ -718,10 +736,10 @@ function App() {
               />
             ))}
           </div>
-          <div style={{ display: 'flex', gap: 12 }}>
+          <div style={{ display: 'flex', gap: 4, padding: 4, borderRadius: 8, backgroundColor: t.muted, width: 280 }}>
             {(['individual', 'non-individual'] as const).map((type) => (
-              <div key={type} onClick={() => setNewTaxpayer((current) => ({ ...current, type }))} style={{ display: 'flex', gap: 6 }}>
-                <text style={{ color: t.fg }}>{newTaxpayer.type === type ? '◉' : '○'} {type}</text>
+              <div key={type} onClick={() => setNewTaxpayer((current) => ({ ...current, type }))} style={{ flexGrow: 1, padding: 9, borderRadius: 6, backgroundColor: newTaxpayer.type === type ? t.chrome : t.muted }}>
+                <text style={{ color: t.fg, fontSize: 12, textAlign: 'center' }}>{type === 'individual' ? 'Individual' : 'Non-individual'}</text>
               </div>
             ))}
           </div>
@@ -743,44 +761,47 @@ function App() {
     }
     if (!taxpayer || !branch) {
       return (
-        <Panel title="Add a taxpayer" subtitle="Taxpayer and branch facts are shared by their tax-year profiles.">
+        <Panel title="No taxpayer selected" subtitle="Choose a taxpayer from the sidebar or add a new one.">
           <Button onClick={() => setShowNewTaxpayer(true)}>New taxpayer</Button>
         </Panel>
       )
     }
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-        <Panel title="Taxpayer details" subtitle="Shared identity across all branches and years.">
+        <Panel title="Taxpayer" aside="Shared by all branches">
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
             <Field label="TIN" value={formatTin(taxpayer.tin9)} disabled auto />
             <Field label="Name" value={taxpayerEdit.name} onChange={(value) => setTaxpayerEdit((current) => ({ ...current, name: value }))} />
             <Field label="Birth date" value={taxpayerEdit.birthDate} onChange={(value) => setTaxpayerEdit((current) => ({ ...current, birthDate: value }))} />
           </div>
-          <div style={{ display: 'flex', gap: 8 }}>
+          <div style={{ display: 'flex', gap: 4, padding: 4, borderRadius: 8, backgroundColor: t.muted, width: 280 }}>
             {(['individual', 'non-individual'] as const).map((type) => (
-              <div key={type} onClick={() => setTaxpayerEdit((current) => ({ ...current, type }))} style={{ padding: 8, borderRadius: 6, backgroundColor: taxpayerEdit.type === type ? t.secondary : t.bg }}>
-                <text style={{ color: t.fg, fontSize: 12 }}>{taxpayerEdit.type === type ? '●' : '○'} {type}</text>
+              <div key={type} onClick={() => setTaxpayerEdit((current) => ({ ...current, type }))} style={{ flexGrow: 1, padding: 9, borderRadius: 6, backgroundColor: taxpayerEdit.type === type ? t.chrome : t.muted }}>
+                <text style={{ color: t.fg, fontSize: 12, textAlign: 'center' }}>{type === 'individual' ? 'Individual' : 'Non-individual'}</text>
               </div>
             ))}
-            <Button onClick={saveTaxpayerDetails}>Save taxpayer</Button>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'flex-start', width: '100%' }}>
+            <Button testId="save-taxpayer" onClick={saveTaxpayerDetails}>Save</Button>
           </div>
         </Panel>
-        <Panel title={`${branch.name} · ${branch.code}`} subtitle="Blank branch facts inherit from head office.">
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
-                <Field label="Branch name" value={branchEdit.name} onChange={(value) => setBranchEdit((current) => ({ ...current, name: value }))} />
-            {(['rdo', 'zip', 'address', 'phone', 'email'] as const).map((field) => (
-              <Field
-                key={field}
-                label={field.toUpperCase()}
-                value={branchEdit[field]}
-                onChange={(value) => setBranchEdit((current) => ({ ...current, [field]: value }))}
-                auto={branch.code !== '00000' && branch.facts.inherited[field]}
-                placeholder={branch.code !== '00000' && branch.facts.inherited[field] ? `Inherited: ${branch.facts[field] ?? '—'}` : ''}
-              />
-            ))}
+        <Panel title="Branch" aside={branch.name}>
+          <div style={{ display: 'flex', gap: 12 }}>
+            <div style={{ width: '30%' }}><Field label="Branch code" value={branch.code} disabled /></div>
+            <div style={{ width: '66%' }}><Field label="Branch name" value={branchEdit.name} onChange={(value) => setBranchEdit((current) => ({ ...current, name: value }))} /></div>
+          </div>
+          <div style={{ display: 'flex', gap: 12 }}>
+            <div style={{ width: '48%' }}><Field label="RDO" value={branchEdit.rdo} onChange={(value) => setBranchEdit((current) => ({ ...current, rdo: value }))} /></div>
+            <div style={{ width: '48%' }}><Field label="Zip" value={branchEdit.zip} onChange={(value) => setBranchEdit((current) => ({ ...current, zip: value }))} /></div>
+          </div>
+          <div style={{ width: '100%' }}>
+            <Field label="Address" value={branchEdit.address} onChange={(value) => setBranchEdit((current) => ({ ...current, address: value }))} />
+          </div>
+          <div style={{ display: 'flex', gap: 12 }}>
+            <div style={{ width: '48%' }}><Field label="Phone" value={branchEdit.phone} onChange={(value) => setBranchEdit((current) => ({ ...current, phone: value }))} /></div>
+            <div style={{ width: '48%' }}><Field label="Email" value={branchEdit.email} onChange={(value) => setBranchEdit((current) => ({ ...current, email: value }))} /></div>
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
-            <Button onClick={saveBranchDetails}>Save branch</Button>
             <Button quiet onClick={() => setShowNewBranch((current) => !current)}>Add branch</Button>
           </div>
           {showNewBranch && (
@@ -789,22 +810,14 @@ function App() {
                 <Field label="Branch code" value={newBranch.code} onChange={(value) => setNewBranch((current) => ({ ...current, code: value.replace(/\D/g, '').slice(0, 5) }))} error={branchError} />
                 <Field label="Branch name" value={newBranch.name} onChange={(value) => setNewBranch((current) => ({ ...current, name: value }))} />
                 {(['rdo', 'zip', 'address', 'phone', 'email'] as const).map((field) => (
-                  <Field key={field} label={field.toUpperCase()} value={newBranch[field]} onChange={(value) => setNewBranch((current) => ({ ...current, [field]: value }))} />
+                  <Field key={field} label={field === 'rdo' ? 'RDO' : field === 'zip' ? 'ZIP' : field[0].toUpperCase() + field.slice(1)} value={newBranch[field]} onChange={(value) => setNewBranch((current) => ({ ...current, [field]: value }))} />
                 ))}
               </div>
               <Button onClick={addBranch}>Create branch</Button>
             </Panel>
           )}
-        </Panel>
-        <Panel title="Tax years" subtitle="Each year has its own selected forms and period drafts.">
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-            {branch.years.map((profile) => (
-              <div key={profile.id} onClick={() => setSelectedProfileId(profile.id)} style={{ padding: 10, borderWidth: 1, borderColor: selectedProfile?.id === profile.id ? t.primary : t.border, borderRadius: 7 }}>
-                <text style={{ color: t.fg }}>{profile.year}</text>
-              </div>
-            ))}
-            <input testId="new-year-input" value={yearInput} onChange={(event) => setYearInput(event.value ?? '')} style={{ width: 84, height: 34, padding: 7, color: t.fg, backgroundColor: t.bg, borderWidth: 1, borderColor: t.input, borderRadius: 6 }} />
-            <Button onClick={addYear}>Add year</Button>
+          <div style={{ display: 'flex', justifyContent: 'flex-start', width: '100%' }}>
+            <Button testId="save-branch" onClick={saveBranchDetails}>Save</Button>
           </div>
         </Panel>
         {statusMessage && <text style={{ color: t.success, fontSize: 12 }}>{statusMessage}</text>}
@@ -820,7 +833,6 @@ function App() {
             <text style={{ color: t.fg, fontSize: 25, fontWeight: 700 }}>{taxpayer?.name || 'Taxpayers'}</text>
             <text style={{ color: t.mutedFg, fontSize: 12 }}>{taxpayer ? `${formatTin(taxpayer.tin9)}  /  ${branch?.name ?? ''}` : 'Taxpayer, branch, and return workspace'}</text>
           </div>
-          <Button testId="add-taxpayer" onClick={() => { setShowNewTaxpayer(true); setTab('details') }}>+ Add taxpayer</Button>
         </div>
         <div style={{ display: 'flex', gap: 6, borderBottomWidth: 1, borderColor: t.border }}>
           {(['details', 'forms', 'templates'] as const).map((item) => (
@@ -838,20 +850,45 @@ function App() {
           )}
           {tab === 'forms' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-              {!selectedProfile && <Panel title="Select a tax year"><text style={{ color: t.mutedFg }}>Add or select a year for this branch.</text></Panel>}
+              {!selectedProfile && (
+                <>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <text style={{ color: t.fg, fontSize: 22, fontWeight: 700 }}>Forms</text>
+                    <Button quiet testId="add-year-toggle" onClick={() => setShowNewYear((value) => !value)}>+ Add year</Button>
+                  </div>
+                  {showNewYear && (
+                    <Panel title="Add tax year" subtitle="A new year starts with the selected branch facts.">
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                        <Field label="Tax year" value={yearInput} onChange={(value) => setYearInput(value.replace(/\D/g, '').slice(0, 4))} />
+                        <Button testId="add-year-save" onClick={addYear}>Create year</Button>
+                      </div>
+                    </Panel>
+                  )}
+                  <Panel title="Select a tax year"><text style={{ color: t.mutedFg }}>Select or add a year for this branch.</text></Panel>
+                </>
+              )}
               {selectedProfile && (
                 <>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <text style={{ color: t.mutedFg, fontSize: 12 }}>Tax year</text>
-                      <Select value={String(selectedProfile.year)} onValueChange={(value) => {
-                        const profile = branch?.years.find((item) => String(item.year) === value)
-                        if (profile) setSelectedProfileId(profile.id)
-                      }}>
-                        <SelectTrigger style={{ width: 110, height: 34 }}><SelectValue /></SelectTrigger>
-                        <SelectContent>{branch?.years.map((profile) => <SelectItem key={profile.id} value={String(profile.year)}>{profile.year}</SelectItem>)}</SelectContent>
-                      </Select>
+                    <text style={{ color: t.fg, fontSize: 22, fontWeight: 700 }}>Forms</text>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                      {branch?.years.map((profile) => (
+              <div key={profile.id} testId={`year-${profile.year}-${profile.branch}`} onClick={() => setSelectedProfileId(profile.id)} style={{ padding: 8, borderRadius: 16, borderWidth: 1, borderColor: profile.id === selectedProfile.id ? t.primary : t.border, backgroundColor: profile.id === selectedProfile.id ? t.secondary : t.chrome }}>
+                          <text style={{ color: t.fg, fontSize: 11, fontWeight: profile.id === selectedProfile.id ? 700 : 500 }}>Tax Year {profile.year}</text>
+                        </div>
+                      ))}
+                      <Button quiet testId="add-year-toggle" onClick={() => setShowNewYear((value) => !value)}>+ Add year</Button>
                     </div>
+                  </div>
+                  {showNewYear && (
+                    <Panel title="Add tax year" subtitle="A new year starts with the selected branch facts.">
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                        <Field label="Tax year" value={yearInput} onChange={(value) => setYearInput(value.replace(/\D/g, '').slice(0, 4))} />
+                        <Button testId="add-year-save" onClick={addYear}>Create year</Button>
+                      </div>
+                    </Panel>
+                  )}
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end' }}>
                     <Button testId="choose-forms" onClick={() => setPickerOpen((current) => !current)}>{pickerOpen ? 'Close picker' : 'Choose forms'}</Button>
                   </div>
                   {pickerOpen && (
@@ -871,11 +908,9 @@ function App() {
                     </Panel>
                   )}
                   {selectedLibrary.length === 0 && <Panel title="Your form library is empty" subtitle="Choose forms to add returns for this year." />}
-                  {selectedLibrary.map((entry) => (
-                    <div key={entry.formCode} style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                      {periodCard(entry)}
-                    </div>
-                  ))}
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14 }}>
+                    {selectedLibrary.map(periodCard)}
+                  </div>
                 </>
               )}
             </div>
@@ -885,7 +920,7 @@ function App() {
     )
   }
 
-  function formPage() {
+  function legacyFormPage() {
     const currentStatus = draft?.status ?? 'draft'
     const stages: DraftStatus[] = ['draft', 'queued', 'submitted', 'confirmed', 'paid']
     return (
@@ -913,7 +948,7 @@ function App() {
         <div style={{ display: 'flex', justifyContent: 'center', gap: 8, padding: 12, borderBottomWidth: 1, borderColor: t.border }}>
           {stages.map((stage, index) => (
               <div key={stage} onClick={() => updateDraftStatus(stage)} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <div style={{ width: 8, height: 8, borderRadius: 8, backgroundColor: index <= stages.indexOf(currentStatus) ? statusColor(currentStatus) : t.border }} />
+              <div style={{ width: 8, height: 8, borderRadius: 8, backgroundColor: index <= stages.indexOf(currentStatus) ? t.primary : t.border }} />
               <text style={{ color: index <= stages.indexOf(currentStatus) ? t.fg : t.mutedFg, fontSize: 11 }}>{stage[0].toUpperCase() + stage.slice(1)}</text>
               {index < stages.length - 1 && <text style={{ color: t.border }}>—</text>}
             </div>
@@ -991,48 +1026,234 @@ function App() {
     )
   }
 
+  function formPage() {
+    if (!formEntry) return legacyFormPage()
+    const currentStatus = draft?.status ?? 'draft'
+    const stages: DraftStatus[] = ['draft', 'queued', 'submitted', 'confirmed', 'paid']
+    const currentIndex = stages.indexOf(currentStatus)
+    const trackerDots = [
+      { left: 12, top: 0 },
+      { left: 20, top: 4 },
+      { left: 24, top: 12 },
+      { left: 20, top: 20 },
+      { left: 12, top: 24 },
+      { left: 4, top: 20 },
+      { left: 0, top: 12 },
+      { left: 4, top: 4 },
+    ]
+    const revision =
+      formEntry.formCode === '1601Cv2018' || formEntry.formCode === '2551Qv2018'
+        ? 'January 2018 (ENCS)'
+        : formEntry.formCode === '0619E'
+          ? 'January 2018'
+          : ''
+
+    function control(field: FieldSnapshot, width = 270) {
+      const locked = editorModel.sections.some((section) =>
+        section.rows.some((row) => row.fields.some((entry) => entry.id === field.id && row.locked)),
+      ) || field.disabled
+      if (field.type === 'select-one') {
+        return (
+          <Select value={String(editorValues[field.id] ?? '')} onValueChange={(value) => editField(field, value)} disabled={locked}>
+            <SelectTrigger style={{ width, height: 36 }}><SelectValue placeholder="Select" /></SelectTrigger>
+            <SelectContent>{field.options?.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
+          </Select>
+        )
+      }
+      if (field.type === 'checkbox') {
+        return (
+          <div onClick={() => !locked && editField(field, !Boolean(editorValues[field.id]))} style={{ width: 30, height: 30, display: 'flex', justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: t.border, borderRadius: 5, backgroundColor: locked ? t.muted : t.bg }}>
+            <text style={{ color: t.fg, fontSize: 15 }}>{editorValues[field.id] ? '✓' : ''}</text>
+          </div>
+        )
+      }
+      return (
+        <input
+          testId={`field-${field.id}`}
+          value={String(editorValues[field.id] ?? '')}
+          readOnly={locked}
+          onChange={(event) => editField(field, event.value ?? '')}
+          style={{
+            width,
+            height: 36,
+            padding: 8,
+            textAlign: field.label.toLowerCase().includes('amount') ? 'right' : 'left',
+            color: locked ? t.mutedFg : t.fg,
+            backgroundColor: locked ? t.muted : t.bg,
+            borderWidth: 1,
+            borderColor: t.input,
+            borderRadius: 5,
+          }}
+        />
+      )
+    }
+
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minHeight: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', paddingBottom: 12, borderBottomWidth: 1, borderColor: t.border }}>
+          <Button quiet onClick={() => void closeForm()}>‹ Back</Button>
+          <div
+            onMouseEnter={() => setShowPrintTip(true)}
+            onMouseLeave={() => setShowPrintTip(false)}
+            style={{ position: 'relative' }}
+          >
+            <Button quiet disabled onClick={() => {}}>Print Preview</Button>
+            {showPrintTip && <div style={{ position: 'absolute', top: 42, right: 0, padding: 8, borderWidth: 1, borderColor: t.border, borderRadius: 6, backgroundColor: t.chrome }}><text style={{ color: t.fg, fontSize: 11 }}>Coming in P5</text></div>}
+          </div>
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4, padding: 14 }}>
+          <text style={{ color: t.fg, fontSize: 25, fontWeight: 800 }}>BIR Form No. {displayFormCode(formEntry.formCode)}</text>
+          <text style={{ color: t.fg, fontSize: 15, textAlign: 'center' }}>{cleanFormTitle(formEntry.label)}</text>
+          {revision && <text style={{ color: t.mutedFg, fontSize: 11 }}>{revision}</text>}
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, padding: 12, borderBottomWidth: 1, borderColor: t.border }}>
+          {stages.map((stage, index) => (
+            <div key={stage} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <div testId={`stage-${stage}`} onClick={() => updateDraftStatus(stage)} style={{
+                width: 28, height: 28, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                position: 'relative',
+                borderWidth: index > currentIndex ? 0 : 2,
+                borderColor: index < currentIndex ? t.good : index === currentIndex ? t.primary : t.border,
+                borderRadius: 18, backgroundColor: index < currentIndex ? t.good : index === currentIndex ? t.primary : t.bg,
+              }}>
+                {index > currentIndex && trackerDots.map((dot, dotIndex) => (
+                  <div key={dotIndex} style={{ position: 'absolute', left: dot.left, top: dot.top, width: 4, height: 4, borderRadius: 2, backgroundColor: t.border }} />
+                ))}
+                <text style={{ color: index < currentIndex ? '#ffffff' : index === currentIndex ? t.primaryFg : t.mutedFg, fontSize: 12, fontWeight: 700 }}>{index < currentIndex ? '✓' : String(index + 1)}</text>
+              </div>
+              <text style={{ color: index <= currentIndex ? t.fg : t.mutedFg, fontSize: 11 }}>{stage[0].toUpperCase() + stage.slice(1)}</text>
+              {index < stages.length - 1 && <div style={{ width: 28, height: 2, backgroundColor: index < currentIndex ? t.good : t.border }} />}
+            </div>
+          ))}
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', flexGrow: 1, minHeight: 0, overflow: 'scroll', padding: 16 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14, width: 720, maxWidth: '100%' }}>
+            {draft && (
+              <Panel title="Taxpayer">
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16 }}>
+                  <text style={{ color: t.fg, fontSize: 12 }}>{taxpayer?.name ?? selectedProfile?.registeredName}</text>
+                  <text style={{ color: t.mutedFg, fontSize: 12 }}>{formatTin(selectedProfile?.tin9 ?? '', selectedProfile?.branch)}</text>
+                  <text style={{ color: t.mutedFg, fontSize: 12 }}>RDO {branch?.facts.rdo ?? '-'}</text>
+                  <text style={{ color: t.mutedFg, fontSize: 12 }}>{branch?.facts.address ?? 'Address -'}</text>
+                  <text style={{ color: t.mutedFg, fontSize: 9, padding: 3, borderRadius: 10, backgroundColor: t.muted }}>AUTO</text>
+                </div>
+              </Panel>
+            )}
+            {issues.some((issue) => issue.fieldId === null) && (
+              <Panel title="Review required"><text style={{ color: t.danger, fontSize: 12 }}>{editorModel.bannerErrorText}</text></Panel>
+            )}
+            {formLoading && <text style={{ color: t.mutedFg }}>Opening official form.</text>}
+            {editorModel.sections.map((section, index) => (
+              <Panel key={`${section.section ?? 'other'}-${index}`} title={section.section ?? 'Part I - Background Information'}>
+                {section.rows.map((row) => {
+                  const fields = row.fields
+                  const radios = row.kind === 'radio' || (row.kind === 'period' && fields.some((field) => field.type === 'radio'))
+                  const renderRowControls = () => {
+                    if (row.kind === 'tin') {
+                      return <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>{fields.map((field, fieldIndex) => control(field, fieldIndex === 3 ? 82 : 60))}</div>
+                    }
+                    if (row.kind === 'period') {
+                      return <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>{fields.map((field) => field.type === 'radio' ? (
+                        <div key={field.id} onClick={() => editField(field, true)} style={{ padding: 8, borderWidth: 1, borderColor: editorValues[field.id] ? t.primary : t.border, borderRadius: 6, backgroundColor: editorValues[field.id] ? t.secondary : t.bg }}>
+                          <text style={{ color: t.fg, fontSize: 11 }}>{field.optionLabel || 'Option'}</text>
+                        </div>
+                      ) : <div key={field.id} style={{ display: 'flex', alignItems: 'center', gap: 8 }}><text style={{ color: t.mutedFg, fontSize: 10 }}>{field.label}</text>{control(field, field.type === 'select-one' ? 150 : 100)}</div>)}</div>
+                    }
+                    if (radios) {
+                      return <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>{fields.map((field) => (
+                        <div key={field.id} onClick={() => editField(field, true)} style={{ padding: 8, borderWidth: 1, borderColor: editorValues[field.id] ? t.primary : t.border, borderRadius: 6, backgroundColor: editorValues[field.id] ? t.secondary : t.bg }}>
+                          <text style={{ color: t.fg, fontSize: 11 }}>{field.optionLabel || 'Option'}</text>
+                        </div>
+                      ))}</div>
+                    }
+                    if (fields.length > 1) {
+                      return <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>{fields.map((field) => <div key={field.id}>{control(field, 110)}</div>)}</div>
+                    }
+                    return control(fields[0])
+                  }
+                  return (
+                    <div key={row.id} style={{ display: 'flex', flexDirection: 'column', gap: 4, padding: 7, borderBottomWidth: 1, borderColor: t.border }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 9, minHeight: 40 }}>
+                        {row.item && <text style={{ color: t.mutedFg, fontSize: 10, width: 34, height: 24, padding: 4, borderRadius: 6, backgroundColor: t.secondary }}>{row.item}</text>}
+                        <text style={{ color: t.fg, fontSize: 12, flexGrow: 1, minWidth: 0 }}>{row.label || 'Return field'}</text>
+                        {row.locked && <text style={{ color: t.mutedFg, fontSize: 9, padding: 3, borderRadius: 10, backgroundColor: t.muted }}>AUTO</text>}
+                        {renderRowControls()}
+                      </div>
+                      <div style={{ minHeight: 18, height: 18 }}>
+                        <text style={{ color: row.errorText ? t.danger : t.mutedFg, fontSize: 10 }}>{row.errorText}</text>
+                      </div>
+                    </div>
+                  )
+                })}
+              </Panel>
+            ))}
+          </div>
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', width: 720, maxWidth: '100%', alignSelf: 'center', gap: 8, padding: 12, borderTopWidth: 1, borderColor: t.border, backgroundColor: t.chrome }}>
+          <Button quiet testId="validate-return" onClick={() => formInstance && refreshEditor(formInstance)}>Validate</Button>
+          <Button testId="save-return" onClick={saveDraft}>Save draft</Button>
+        </div>
+      </div>
+    )
+  }
+
   function sidebar() {
-    const navItems: Array<[NavPage, string]> = [
-      ['tasks', 'Background tasks'],
-      ['logs', 'Logs'],
-      ['calendar', 'Tax calendars'],
-      ['settings', 'Settings'],
+    const navItems: Array<[NavPage, string, string]> = [
+      ['tasks', 'Background Tasks', '▤'],
+      ['logs', 'Logs', '≡'],
+      ['calendar', 'Tax Calendars', '▦'],
+      ['settings', 'Settings', '⚙'],
     ]
     return (
       <div style={{ display: 'flex', flexDirection: 'column', width: sidebarCollapsed ? 64 : 250, minWidth: sidebarCollapsed ? 64 : 250, padding: 12, gap: 10, backgroundColor: t.chrome, borderRightWidth: 1, borderColor: t.border }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: 7 }}>
           {!sidebarCollapsed && <text style={{ color: t.fg, fontSize: 18, fontWeight: 800 }}>eBIRForms</text>}
-          <div testId="sidebar-toggle" onClick={() => setSidebarCollapsed((value) => !value)}><text style={{ color: t.mutedFg }}>☰</text></div>
+          <div testId="sidebar-toggle" onClick={() => setSidebarCollapsed((value) => !value)}><text style={{ color: t.mutedFg }}>{sidebarCollapsed ? '›' : '‹'}</text></div>
         </div>
         {!sidebarCollapsed && (
           <>
-            <input value={taxpayerSearch} onChange={(event) => setTaxpayerSearch(event.value ?? '')} placeholder="Search taxpayer" style={{ height: 34, padding: 8, color: t.fg, backgroundColor: t.bg, borderWidth: 1, borderColor: t.input, borderRadius: 6 }} />
-            <Button onClick={() => { setShowNewTaxpayer(true); setPage('taxpayer'); setTab('details') }}>+ New taxpayer</Button>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: 6 }}>
+              <text style={{ color: t.mutedFg, fontSize: 10, fontWeight: 700 }}>TAXPAYERS</text>
+              <div testId="add-taxpayer" onClick={() => { setShowNewTaxpayer(true); setPage('taxpayer'); setTab('details') }} style={{ width: 24, height: 24, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 6, backgroundColor: t.secondary }}>
+                <text style={{ color: t.fg, fontSize: 17 }}>+</text>
+              </div>
+            </div>
+            <input value={taxpayerSearch} onChange={(event) => setTaxpayerSearch(event.value ?? '')} placeholder="Search taxpayer" style={{ height: 36, minHeight: 36, padding: 9, color: t.fg, backgroundColor: t.bg, borderWidth: 1, borderColor: t.input, borderRadius: 6 }} />
             <div testId="taxpayer-tree" style={{ display: 'flex', flexDirection: 'column', gap: 8, flexGrow: 1, overflow: 'scroll' }}>
               {filteredTaxpayers.map((item) => (
                 <div key={item.tin9} style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-                  <text style={{ color: t.fg, fontSize: 12, fontWeight: 700 }}>{item.name || formatTin(item.tin9)}</text>
+                  <div onClick={() => item.branches[0] && chooseBranch(item.tin9, item.branches[0].code)} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: 7, borderRadius: 7, backgroundColor: selectedTin === item.tin9 ? t.secondary : t.chrome }}>
+                    <text style={{ color: t.mutedFg, fontSize: 12 }}>⌄</text>
+                    <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+                      <text style={{ color: t.fg, fontSize: 12, fontWeight: 700, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{item.name || formatTin(item.tin9)}</text>
+                      <text style={{ color: t.mutedFg, fontSize: 10 }}>TIN: {formatTin(item.tin9)}</text>
+                    </div>
+                  </div>
                   {item.branches.map((branchItem) => (
-                    <div key={branchItem.code} style={{ display: 'flex', flexDirection: 'column', paddingLeft: 8, gap: 4 }}>
-                      <div testId={`branch-${item.tin9}-${branchItem.code}`} onClick={() => chooseBranch(item.tin9, branchItem.code)} style={{ padding: 5, borderRadius: 5, backgroundColor: selectedBranchId === branchId(item.tin9, branchItem.code) ? t.secondary : t.chrome }}>
-                        <text style={{ color: t.mutedFg, fontSize: 11 }}>⌄ {branchItem.code} · {branchItem.name}</text>
-                      </div>
-                      {branchItem.years.map((profile) => (
-                        <div key={profile.id} testId={`year-${profile.year}-${profile.branch}`} onClick={() => chooseProfile(profile)} style={{ padding: 6, paddingLeft: 18, borderRadius: 5, backgroundColor: selectedProfile?.id === profile.id ? t.accent : t.chrome }}>
-                          <text style={{ color: t.fg, fontSize: 11 }}>{profile.year}</text>
-                        </div>
-                      ))}
+                    <div key={branchItem.code} testId={`branch-${item.tin9}-${branchItem.code}`} onClick={() => chooseBranch(item.tin9, branchItem.code)} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginLeft: 15, padding: 7, borderRadius: 6, backgroundColor: selectedBranchId === branchId(item.tin9, branchItem.code) ? t.accent : t.chrome }}>
+                      <text style={{ color: t.fg, fontSize: 11, flexGrow: 1, minWidth: 0, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{branchItem.name}</text>
+                      <text style={{ color: t.mutedFg, fontSize: 10, fontFamily: 'Consolas, monospace', padding: 3, borderRadius: 5, backgroundColor: t.secondary }}>{branchItem.code}</text>
                     </div>
                   ))}
+                  <div testId={`add-branch-${item.tin9}`} onClick={() => {
+                    setSelectedTin(item.tin9)
+                    setSelectedBranchId(item.branches[0] ? branchId(item.tin9, item.branches[0].code) : undefined)
+                    setShowNewBranch(true)
+                    setPage('taxpayer')
+                    setTab('details')
+                  }} style={{ marginLeft: 15, padding: 6, borderRadius: 6 }}>
+                    <text style={{ color: t.mutedFg, fontSize: 10 }}>+ Add branch</text>
+                  </div>
                 </div>
               ))}
             </div>
           </>
         )}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4, borderTopWidth: 1, borderColor: t.border, paddingTop: 8 }}>
-          {navItems.map(([id, label]) => (
-            <div key={id} testId={`nav-${id}`} onClick={() => setPage(id)} style={{ padding: 9, borderRadius: 6, backgroundColor: page === id ? t.secondary : t.chrome }}>
-              <text style={{ color: t.fg, fontSize: 12 }}>{sidebarCollapsed ? label.slice(0, 1) : label}</text>
+          {navItems.map(([id, label, icon]) => (
+            <div key={id} testId={`nav-${id}`} onClick={() => setPage(id)} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: 10, borderRadius: 8, backgroundColor: page === id ? t.secondary : t.chrome }}>
+              <text style={{ color: t.mutedFg, fontSize: 15, width: 18 }}>{icon}</text>
+                {!sidebarCollapsed && <text style={{ color: page === id ? t.fg : t.mutedFg, fontSize: 12 }}>{label}</text>}
             </div>
           ))}
         </div>
@@ -1101,17 +1322,16 @@ function App() {
         {sidebar()}
         <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0, minHeight: 0 }}>
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, padding: 12, borderBottomWidth: 1, borderColor: t.border, backgroundColor: t.chrome }}>
-            <div testId="notification-bell" onClick={() => setPage('logs')}><text style={{ color: t.fg, fontSize: 15 }}>♢</text></div>
-            <div testId="theme-quick-toggle" onClick={() => setThemeMode((mode) => mode === 'light' ? 'dark' : 'light')}><text style={{ color: t.fg, fontSize: 13 }}>{themeMode === 'light' ? '☾' : '☀'}</text></div>
+            <div testId="notification-bell" onClick={() => setPage('logs')}><text style={{ color: t.fg, fontSize: 17 }}>🔔</text></div>
+            <div testId="theme-quick-toggle" onClick={() => setThemeMode((mode) => mode === 'light' ? 'dark' : 'light')}><text style={{ color: t.fg, fontSize: 17 }}>{themeMode === 'light' ? '☾' : '☀'}</text></div>
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minHeight: 0, padding: 20 }}>
             {mainContent()}
           </div>
         </div>
       </div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', padding: 8, borderTopWidth: 1, borderColor: t.border, backgroundColor: t.chrome }}>
-        <text style={{ color: t.mutedFg, fontSize: 10 }}>eBIRForms · prepare with confidence</text>
-        <text style={{ color: t.mutedFg, fontSize: 10 }}>SFTP: {sftpMode} · Offline first</text>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', padding: 7, borderTopWidth: 1, borderColor: t.border, backgroundColor: t.chrome }}>
+        <text style={{ color: t.mutedFg, fontSize: 10 }}>{sftpMode}</text>
       </div>
     </div>
   )

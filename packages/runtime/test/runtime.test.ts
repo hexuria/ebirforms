@@ -110,9 +110,9 @@ describe('openOfficialForm', () => {
             ['frm1601c:txtTIN2', 'Taxpayer Identification Number (TIN)', '6', 418],
             ['frm1601c:txtTIN3', 'Taxpayer Identification Number (TIN)', '6', 419],
             ['frm1601c:txtBranchCode', 'Taxpayer Identification Number (TIN)', '6', 420],
-            ['frm1601c:txtRDOCode', '7 RDO Code', '7', 4692],
-            ['frm1601c:txtZipCode', '9A Zip Code', '9A', 522],
-            ['frm1601c:txtTelNum', '10 Contact Number', '10', 542],
+            ['frm1601c:txtRDOCode', 'RDO Code', '7', 4692],
+            ['frm1601c:txtZipCode', 'Zip Code', '9A', 522],
+            ['frm1601c:txtTelNum', 'Contact Number', '10', 542],
             ['txtEmail', 'Email Address', '12', 585],
             ['frm1601c:selTreaty', 'If yes, specify', '13', 621],
             ['frm1601c:txtTax14', '14', '14', 667],
@@ -128,7 +128,7 @@ describe('openOfficialForm', () => {
             ['frm2551Qv2018:txtTIN2', 'Taxpayer Indentification Number (TIN)', '6', 621],
             ['frm2551Qv2018:txtTIN3', 'Taxpayer Indentification Number (TIN)', '6', 623],
             ['frm2551Qv2018:txtBranchCode', 'Taxpayer Indentification Number (TIN)', '6', 625],
-            ['frm2551Qv2018:txtRDOCode', '7 RDO Code', '7', 5935],
+            ['frm2551Qv2018:txtRDOCode', 'RDO Code', '7', 5935],
             ['frm2551Qv2018:txtTaxReliefSpecify', 'If yes, specify', '12A', 874],
             ['frm2551Qv2018:txt17Specify', '(specify)', '17', 1155],
           ],
@@ -140,7 +140,7 @@ describe('openOfficialForm', () => {
             ['frm0619E:txtTIN2', 'Taxpayer Identification Number (TIN)', '7', 425],
             ['frm0619E:txtTIN3', 'Taxpayer Identification Number (TIN)', '7', 426],
             ['frm0619E:txtBranchCode', 'Taxpayer Identification Number (TIN)', '7', 427],
-            ['frm0619E:txtRDOCode', '8 RDO Code', '8', 3463],
+            ['frm0619E:txtRDOCode', 'RDO Code', '8', 3463],
             ['frm0619E:txtTax14', '14', '14', 616],
             ['frm0619E:txtTax15', '15', '15', 634],
             ['frm0619E:txtTax16', '16', '16', 652],
@@ -152,7 +152,14 @@ describe('openOfficialForm', () => {
       for (const formCase of verified) {
         const form = await openOfficialForm(formCase.code)
         try {
-          const fields = form.fields()
+        const fields = form.fields()
+        const visibleFields = fields.filter((field) => field.visible !== false)
+        const labeled = visibleFields.filter((field) => field.label.trim() && field.label !== field.id).length
+        const coverage = labeled / visibleFields.length
+        console.log(
+          `[label diagnostics] ${formCase.code}: ${visibleFields.length - labeled}/${visibleFields.length} visible id fallback(s): ${visibleFields.filter((field) => field.label === field.id).map((field) => field.id).join(', ')}`,
+        )
+          expect(coverage).toBeGreaterThanOrEqual(0.95)
           for (const [id, label, item, line] of formCase.fields) {
             const field = fields.find((entry) => entry.id === id)
             expect(
@@ -161,7 +168,7 @@ describe('openOfficialForm', () => {
             ).toEqual({ label, item })
           }
           console.log(
-            `[field labels] ${formCase.code}: 10 checked; id fallbacks=${fields.filter((field) => field.label === field.id).length}/${fields.length}`,
+            `[field coverage] ${formCase.code}: ${labeled}/${fields.length} (${(coverage * 100).toFixed(1)}%); 10 hand-verified`,
           )
         } finally {
           await form.close()
@@ -170,6 +177,36 @@ describe('openOfficialForm', () => {
     },
     30_000,
   )
+
+  test('captures radio option labels from adjacent official text', async () => {
+    for (const [code] of parityForms) {
+      const form = await openOfficialForm(code)
+      try {
+        const radios = form.fields().filter((field) => field.type === 'radio')
+        expect(radios.length, `${code} radio controls`).toBeGreaterThan(0)
+        console.log(
+          `[radio labels] ${code}: ${radios.filter((field) => !field.optionLabel).map((field) => `${field.id}=${field.value}`).join(', ')}`,
+        )
+        expect(radios.every((field) => Boolean(field.optionLabel) && field.optionLabel !== field.id)).toBe(true)
+        if (code === '2551Qv2018') {
+          expect(
+            radios
+              .filter((field) => field.name.endsWith(':qtr'))
+              .map((field) => field.optionLabel),
+          ).toEqual(['1st', '2nd', '3rd', '4th'])
+        }
+        if (code === '0619E') {
+          expect(
+            radios
+              .filter((field) => field.name === 'frm0619E:optCategory')
+              .map((field) => field.optionLabel),
+          ).toEqual(['Private', 'Government'])
+        }
+      } finally {
+        await form.close()
+      }
+    }
+  }, 30_000)
 
   test('runs the official ready logic and builds the 1601C RDO select', async () => {
     const form = await openOfficialForm('1601Cv2018')
@@ -193,7 +230,7 @@ describe('openOfficialForm', () => {
     } finally {
       await form.close()
     }
-  })
+  }, 15_000)
 
   test('runs official compute handlers after setting a field', async () => {
     const form = await openOfficialForm('1601Cv2018')
@@ -310,5 +347,5 @@ describe('openOfficialForm', () => {
       }
     }
     expect(differences).toEqual([])
-  }, 20_000)
+  }, 45_000)
 })

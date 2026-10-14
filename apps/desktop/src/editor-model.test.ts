@@ -3,6 +3,10 @@ import {
   autoFieldIds,
   buildEditorModel,
   buildPrefillValues,
+  cleanFormTitle,
+  displayFormCode,
+  formCategories,
+  formCategory,
   mergeDraftPrefill,
   prefillMap,
   type PrefillFormCode,
@@ -24,21 +28,40 @@ const field = (id: string, item: string | null, type: FieldSnapshot['type'] = 't
 
 const sectionCases: Record<PrefillFormCode, Array<[string, string]>> = {
   '1601Cv2018': [
-    ['frm1601c:txtTaxpayerName', 'Part IV'],
-    ['frm1601c:txtTax14', 'Part IV'],
-    ['frm1601c:txtAgency37', 'Part IV'],
+    ['frm1601c:txtTaxpayerName', 'Part I'],
+    ['frm1601c:txtTax14', 'Part II'],
+    ['frm1601c:txtAgency37', 'Part III'],
   ],
   '2551Qv2018': [
-    ['frm2551Qv2018:registeredName', 'Part III'],
-    ['frm2551Qv2018:txt15', 'Part III'],
+    ['frm2551Qv2018:registeredName', 'Part I'],
+    ['frm2551Qv2018:txt15', 'Part II'],
     ['frm2551Qv2018:txtAgency25', 'Part III'],
   ],
   '0619E': [
-    ['frm0619E:txtTaxpayerName', 'Part III'],
-    ['frm0619E:txtTax14', 'Part III'],
+    ['frm0619E:txtTaxpayerName', 'Part I'],
+    ['frm0619E:txtTax14', 'Part II'],
     ['txtAgency19', 'Part III'],
   ],
 }
+
+describe('form library display metadata', () => {
+  test('uses explicit categories and cleans official code/title decoration', () => {
+    expect(formCategories).toEqual({
+      '0619E': 'Withholding Tax',
+      '1601C': 'Withholding Tax',
+      '1601Cv2018': 'Withholding Tax',
+      '1701': 'Income Tax',
+      '1701Q': 'Income Tax',
+      '2551Q': 'Percentage Tax',
+      '2551Qv2018': 'Percentage Tax',
+      '2550Q': 'VAT',
+    })
+    expect(formCategory('1601Cv2018')).toBe('Withholding Tax')
+    expect(formCategory('unknown')).toBe('Tax Return')
+    expect(displayFormCode('2551Qv2018')).toBe('2551Q')
+    expect(cleanFormTitle('BIR Form No. 1601-C - Monthly Return (NEW)')).toBe('Monthly Return')
+  })
+})
 
 describe('buildEditorModel', () => {
   test('groups by official section and combines radios by name', () => {
@@ -53,10 +76,37 @@ describe('buildEditorModel', () => {
       'Part I - Background Information',
       'Part II - Computation of tax',
     ])
-    expect(model.sections[0].rows.map((row) => row.id)).toEqual(['a', 'period'])
+    expect(model.sections[0].rows.map((row) => row.id)).toEqual([
+      'item:Part I - Background Information:1',
+      'radio:Part I - Background Information:period',
+    ])
     expect(model.sections[0].rows[1].fields.map((radio) => radio.id)).toEqual([
       'period-1',
       'period-2',
+    ])
+  })
+
+  test('groups same-item controls, TIN segments, and month/year controls', () => {
+    const partI = 'Part I - Background Information'
+    const snapshot = [
+      { ...field('frm:txtTIN1', '6'), section: partI },
+      { ...field('frm:txtTIN2', '6'), section: partI },
+      { ...field('frm:txtTIN3', '6'), section: partI },
+      { ...field('frm:txtBranchCode', '6'), section: partI },
+      { ...field('frm:txtMonth', '2'), section: partI },
+      { ...field('frm:txtYear', '2'), section: partI },
+      { ...field('amount-a', '14'), section: 'Part II - Tax' },
+      { ...field('amount-b', '14'), section: 'Part II - Tax' },
+    ]
+    const model = buildEditorModel(snapshot, [])
+    expect(model.sections[0].rows.find((row) => row.kind === 'tin')?.fields).toHaveLength(4)
+    expect(model.sections[0].rows.find((row) => row.kind === 'period')?.fields.map((entry) => entry.id)).toEqual([
+      'frm:txtMonth',
+      'frm:txtYear',
+    ])
+    expect(model.sections[1].rows.find((row) => row.item === '14')?.fields.map((entry) => entry.id)).toEqual([
+      'amount-a',
+      'amount-b',
     ])
   })
 
@@ -78,16 +128,63 @@ describe('buildEditorModel', () => {
       { message: 'General error', fieldId: null, source: 'official' },
     ]
     const model = buildEditorModel([field('a', '1'), field('b', '1')], issues)
-    expect(model.sections[0].rows.map((row) => row.errorText)).toEqual([
-      'Invalid field',
-      '',
-    ])
-    expect(typeof model.sections[0].rows[1].errorText).toBe('string')
+    expect(model.sections[0].rows.map((row) => row.errorText)).toEqual(['Invalid field'])
+    expect(typeof model.sections[0].rows[0].errorText).toBe('string')
     expect(model.bannerErrorText).toBe('General error')
   })
 })
 
 describe('form prefill maps', () => {
+  test(
+    'keeps official Parts in order and reports their item ranges',
+    async () => {
+      const expectedParts: Record<PrefillFormCode, string[]> = {
+        '1601Cv2018': ['I', 'II', 'III', 'IV'],
+        '2551Qv2018': ['I', 'II', 'III'],
+        '0619E': ['I', 'II', 'III'],
+      }
+      const expectedRanges: Record<PrefillFormCode, Record<string, string | null>> = {
+        '1601Cv2018': {
+          'Part I - Background Information': '01-13',
+          'Part II - Computation of Tax': '14-36',
+          'Part III - Details of Payment': '37-39',
+          'Part IV - Schedule': null,
+        },
+        '2551Qv2018': {
+          'Part I - Background Information': '1-12A',
+          'Part II - Total Tax Payable': '17-17',
+          'Part III - Details of Payment': '5-27',
+        },
+        '0619E': {
+          'Part I - Background Information': '01-13',
+          'Part II - Tax Remittance': '14-18',
+          'Part III - Details of Payment': '19-21',
+        },
+      }
+      for (const code of Object.keys(prefillMap) as Array<keyof typeof prefillMap>) {
+        const form = await openOfficialForm(code)
+        try {
+          const model = buildEditorModel(form.fields(), [])
+          const partSections = model.sections.filter((section) => section.section?.startsWith('Part '))
+          const parts = partSections.map((section) => section.section!.match(/^Part (I{1,3}|IV|V)\b/)?.[1])
+          expect(parts).toEqual(expectedParts[code])
+          const ranges = partSections.map((section) => {
+            const items = [...new Set(section.rows.flatMap((row) => row.item ? [row.item] : []))]
+              .sort((left, right) => Number.parseInt(left, 10) - Number.parseInt(right, 10))
+            return [section.section!, items.length ? `${items[0]}-${items.at(-1)}` : null] as const
+          })
+          expect(Object.fromEntries(ranges)).toEqual(expectedRanges[code])
+          console.log(
+            `[verified Part item ranges] ${code}: ${ranges.map(([part, range]) => `${part} ${range}`).join('; ')}`,
+          )
+        } finally {
+          await form.close()
+        }
+      }
+    },
+    30_000,
+  )
+
   test(
     'map every profile value to a live official field and split long addresses',
     async () => {

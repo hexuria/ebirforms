@@ -6,6 +6,7 @@ export interface EditorRow {
   name: string
   label: string
   item: string | null
+  kind: 'field' | 'radio' | 'tin' | 'period'
   type: FieldSnapshot['type']
   fields: FieldSnapshot[]
   errorText: string
@@ -23,6 +24,32 @@ export interface EditorModel {
 }
 
 export type PrefillFormCode = '1601Cv2018' | '2551Qv2018' | '0619E'
+
+export const formCategories: Record<string, string> = {
+  '0619E': 'Withholding Tax',
+  '1601C': 'Withholding Tax',
+  '1601Cv2018': 'Withholding Tax',
+  '1701': 'Income Tax',
+  '1701Q': 'Income Tax',
+  '2551Q': 'Percentage Tax',
+  '2551Qv2018': 'Percentage Tax',
+  '2550Q': 'VAT',
+}
+
+export function displayFormCode(code: string): string {
+  return code.replace(/v\d{4}.*$/i, '')
+}
+
+export function cleanFormTitle(label: string): string {
+  return label
+    .replace(/^BIR Form(?: No\.?)?\s+.*?\s+[-–—]\s*/i, '')
+    .replace(/\s*\(NEW\)\s*$/i, '')
+    .trim()
+}
+
+export function formCategory(code: string): string {
+  return formCategories[code] ?? 'Tax Return'
+}
 
 export const prefillMap: Record<
   PrefillFormCode,
@@ -186,10 +213,22 @@ export function buildEditorModel(
     }
   }
   const rows: EditorRow[] = []
-  const radioRows = new Map<string, EditorRow>()
+  const groupedRows = new Map<string, EditorRow>()
   for (const field of snapshot) {
-    const radioGroup = field.type === 'radio' ? field.name || field.id : null
-    const existing = radioGroup ? radioRows.get(radioGroup) : undefined
+    if (field.visible === false) continue
+    const section = field.section ?? 'Part I - Background Information'
+    const group =
+      /(?:txtTIN[123]|BranchCode)/i.test(field.id)
+        ? `tin:${section}`
+        : /(?:txtMonth|rtnMonth|txtYear|qtr_[1-4])/i.test(field.id)
+          ? `period:${section}`
+          : field.type === 'radio'
+            ? `radio:${section}:${field.name || field.id}`
+            : null
+    const kind: EditorRow['kind'] =
+      group?.startsWith('tin:') ? 'tin' : group?.startsWith('period:') ? 'period' : group ? 'radio' : 'field'
+    const key = group ?? (field.item ? `item:${section}:${field.item}` : field.id)
+    const existing = groupedRows.get(key)
     if (existing) {
       existing.fields.push(field)
       existing.locked ||= lockedFieldIds.has(field.id) || field.disabled
@@ -203,23 +242,25 @@ export function buildEditorModel(
     }
     const messages = issuesByField.get(field.id) ?? []
     const row: EditorRow = {
-      id: radioGroup ?? field.id,
-      name: radioGroup ?? field.name,
+      id: key,
+      name: field.name || field.id,
       label: field.label,
       item: field.item,
+      kind,
       type: field.type,
       fields: [field],
       errorText: messages.join('\n'),
       locked: lockedFieldIds.has(field.id) || field.disabled,
     }
     rows.push(row)
-    if (radioGroup) {
-      radioRows.set(radioGroup, row)
-    }
+    groupedRows.set(key, row)
   }
   const sections: EditorSection[] = []
   for (const row of rows) {
-    const sectionName = row.fields[0].section
+    const sectionName =
+      row.kind === 'period'
+        ? 'Part I - Background Information'
+        : row.fields[0].section ?? 'Part I - Background Information'
     let section = sections.find((entry) => entry.section === sectionName)
     if (!section) {
       section = { section: sectionName, rows: [] }
@@ -227,6 +268,12 @@ export function buildEditorModel(
     }
     section.rows.push(row)
   }
+  const sectionOrder = ['Part I', 'Part II', 'Part III', 'Part IV', 'Part V']
+  sections.sort(
+    (left, right) =>
+      sectionOrder.indexOf(left.section?.split(' - ')[0] ?? '') -
+      sectionOrder.indexOf(right.section?.split(' - ')[0] ?? ''),
+  )
   return {
     bannerErrorText: issues
       .filter((issue) => issue.fieldId === null)

@@ -21,8 +21,10 @@ export interface FieldSnapshot {
   label: string
   item: string | null
   section: string | null
+  optionLabel?: string
   checked?: boolean
   disabled: boolean
+  visible?: boolean
   maxLength?: number
   options?: { value: string; label: string }[]
 }
@@ -256,6 +258,25 @@ export async function openOfficialForm(
     )
     window.document.write(documentHtml)
 
+    const radioOptionLabels = new Map<string, string>()
+    for (const match of html.matchAll(/<input\b[^>]*>/gi)) {
+      if (!/\btype\s*=\s*["']?radio\b/i.test(match[0])) continue
+      const idMatch = /\bid\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(match[0])
+      const labelMatch = /^\s*<label\b[^>]*>([\s\S]*?)<\/label\s*>/i.exec(
+        html.slice((match.index ?? 0) + match[0].length),
+      )
+      const rawText = labelMatch?.[1].replace(/<[^>]*>/g, '') ?? ''
+      const text = rawText
+        .replace(/&nbsp;|&#160;/gi, ' ')
+        .replace(/&amp;/gi, '&')
+        .replace(/&quot;/gi, '"')
+        .replace(/&#39;|&apos;/gi, "'")
+        .replace(/\s+/g, ' ')
+        .trim()
+      const id = idMatch?.[1] ?? idMatch?.[2] ?? idMatch?.[3]
+      if (id && text) radioOptionLabels.set(id, text)
+    }
+
     for (const script of scripts) {
       w.eval(script)
     }
@@ -352,70 +373,192 @@ export async function openOfficialForm(
     const evaluateInSandbox = (prelude: string, expression: string): unknown =>
       w.eval(`(function () {\n${prelude}\nreturn (${expression});\n})()`)
 
-    const textContent = (node: any): string => {
-      const clone = node.cloneNode(true) as any
-      clone.querySelectorAll?.('input, select, textarea, button, script, style, option').forEach(
-        (child: any) => child.remove(),
-      )
-      const text = String(clone.textContent ?? '').replace(/\s+/g, ' ').trim()
-      return /[\p{L}\p{N}]/u.test(text) ? text : ''
-    }
-
-    const precedingText = (node: any, boundary: any): string => {
-      let current = node
-      while (current && current !== boundary) {
-        let sibling = current.previousSibling
-        while (sibling) {
-          const text = textContent(sibling)
-          if (text) {
-            return text
-          }
-          sibling = sibling.previousSibling
+    const controlSelector = 'input, select, textarea, button'
+    const previousNode = (node: any): any => {
+      if (node?.previousSibling) {
+        node = node.previousSibling
+        if (node.matches?.(controlSelector)) return node
+        while (node.lastChild) {
+          if (node.lastChild.matches?.(controlSelector)) return node.lastChild
+          node = node.lastChild
         }
-        current = current.parentNode
+        return node
+      }
+      return node?.parentNode
+    }
+    const nextNode = (node: any): any => {
+      if (node?.firstChild) return node.firstChild
+      while (node && !node.nextSibling) node = node.parentNode
+      return node?.nextSibling
+    }
+    const adjacentText = (element: any, direction: -1 | 1): string => {
+      let node = element
+      while ((node = direction < 0 ? previousNode(node) : nextNode(node)) && node !== mainForm) {
+        if (node.nodeType === 3) {
+          const value = String(node.nodeValue ?? '').replace(/\s+/g, ' ').trim()
+          if (value && !/^[\p{P}\p{S}\s]+$/u.test(value)) return value
+        } else if (node.nodeType === 1) {
+          if (node.matches?.(controlSelector) && node !== element) return ''
+          if (node.matches?.('option')) return ''
+          if (node.matches?.('script, style')) {
+            node = direction < 0 ? previousNode(node) : node
+          }
+        }
       }
       return ''
     }
 
-    const fieldLabel = (element: any): { label: string; item: string | null } => {
-      const cell = element.closest('td, th')
+  const splitItem = (value: string): { label: string; item: string | null } => {
+      const text = value.replace(/\s+/g, ' ').trim()
+      const match = /^(\d+[A-Z]?)(?:\b\s*[-.)]?\s*)?(.*)$/i.exec(text)
+      return {
+        label: match ? match[2].trim() || match[1] : text,
+        item: match?.[1] ?? null,
+      }
+  }
+
+  const tableColumnLabel = (element: any): string => {
+    let cell = element.closest('td, th')
+    let row = cell?.parentElement
+    let table = row?.closest('table')
+    while (cell && row && table) {
+      const column = Array.from(row.children).indexOf(cell)
+      const rows = (Array.from(table.querySelectorAll('tr')) as any[])
+        .filter((candidate) => candidate.closest('table') === table)
+      for (let index = rows.indexOf(row) - 1; index >= 0; index -= 1) {
+        const candidate = rows[index].children[column]
+        if (!candidate || candidate.querySelector(controlSelector)) continue
+        const text = String(candidate.textContent ?? '').replace(/\s+/g, ' ').trim()
+        if (text && !/^[\p{P}\p{S}\s]+$/u.test(text)) return text
+      }
+      row = table.closest('tr')
+      cell = row?.querySelector('td, th') ?? null
+      table = row?.closest('table')
+    }
+    return ''
+  }
+
+  const fieldLabel = (element: any): { label: string; item: string | null; optionLabel: string } => {
+    let label = adjacentText(element, -1)
+    if (!label) {
+      const associatedLabel = Array.from(element.labels ?? []) as any[]
+      label = associatedLabel.map((candidate) => String(candidate.textContent ?? '').trim()).find(Boolean) ?? ''
+    }
+    if (!label) {
       const row = element.closest('tr')
-      let label = cell ? precedingText(element, cell) : precedingText(element, row)
-      if (!label && cell && row) {
-        let previousCell = cell.previousElementSibling
-        while (previousCell && !label) {
-          label = textContent(previousCell)
-          previousCell = previousCell.previousElementSibling
-        }
+      const controls = row ? Array.from(row.querySelectorAll(controlSelector)) as any[] : []
+      const firstControl = controls[0]
+      if (firstControl && controls.indexOf(element) > 0) {
+        label = adjacentText(firstControl, -1)
       }
-      const itemFromLabel = /^(\d+[A-Z]?)\b/.exec(label)?.[1] ?? null
-      let item = itemFromLabel
-      if (!item && cell && row) {
-        let previousCell = cell.previousElementSibling
-        while (previousCell && !item) {
-          item = /^(\d+[A-Z]?)\b/.exec(textContent(previousCell))?.[1] ?? null
-          previousCell = previousCell.previousElementSibling
+    }
+    if (!label) label = tableColumnLabel(element)
+    if (!label && /2$/.test(element.id)) {
+      const baseId = element.id.slice(0, -1)
+      const original = mainForm.ownerDocument.getElementById(baseId)
+      if (original) label = fieldLabel(original).label
+    }
+    if (!label && element.type === 'checkbox') label = 'Remove schedule row'
+    let optionLabel = ''
+    if (element.type === 'radio') {
+      const associatedLabel = (Array.from(element.labels ?? []) as any[]).find(
+        (candidate) => String(candidate.textContent ?? '').trim(),
+      )
+      let sibling = element.nextSibling
+      let siblingLabel: any = null
+      while (sibling) {
+        if (sibling.nodeType === 1) {
+          if (sibling.tagName?.toLowerCase() === 'label') {
+            siblingLabel = sibling
+            break
+          }
+          if (sibling.matches?.(controlSelector)) break
+          siblingLabel = sibling.querySelector?.('label') ?? null
+          if (siblingLabel) break
         }
+        sibling = sibling.nextSibling
       }
-      return { label: label || element.id, item }
+      const radioGroup = (Array.from(mainForm.querySelectorAll('input[type="radio"]')) as any[])
+        .filter((radio) => radio.name === element.name)
+      const groupIndex = radioGroup.indexOf(element)
+      const row = element.closest('tr')
+      const rowLabels = row ? Array.from(row.querySelectorAll('label')) as any[] : []
+      optionLabel =
+        radioOptionLabels.get(element.id) ||
+        String(associatedLabel?.textContent ?? siblingLabel?.textContent ?? '').trim() ||
+        String(rowLabels.slice(-radioGroup.length)[groupIndex]?.textContent ?? '').trim() ||
+        adjacentText(element, 1) ||
+        adjacentText(element, -1)
+    }
+    const parsed = splitItem(label)
+    const rowItem = splitItem(String(element.closest('tr')?.textContent ?? '')).item
+    return {
+      label: parsed.label || element.id,
+      item: parsed.item ?? rowItem,
+      optionLabel: optionLabel.replace(/\s+/g, ' ').trim(),
+    }
     }
 
+    const fieldSectionCache = new WeakMap<any, string | null>()
     const fieldSection = (element: any): string | null => {
+      if (fieldSectionCache.has(element)) {
+        return fieldSectionCache.get(element) ?? null
+      }
       const walker = w.document.createTreeWalker(mainForm, w.NodeFilter.SHOW_TEXT)
       let section: string | null = null
       let node = walker.nextNode()
       while (node) {
-        if (element.contains(node.parentNode)) {
+        if (
+          element.compareDocumentPosition(node) &
+          w.Node.DOCUMENT_POSITION_FOLLOWING
+        ) {
           break
         }
-        const text = textContent(node).trim()
-        if (/^Part\s+[IVX]+/i.test(text)) {
-          section = text
+        const text = String(node.nodeValue ?? '').replace(/\s+/g, ' ').trim()
+        const match = /^Part\s+(IV|III|II|I|V)\b\s*[--:]?\s*(.*)$/i.exec(text)
+        if (match) {
+          const smallWords = new Set(['a', 'an', 'and', 'at', 'by', 'for', 'in', 'of', 'on', 'or', 'the', 'to'])
+          const title = match[2]
+            .toLowerCase()
+            .split(/\s+/)
+            .map((word, index) =>
+              index > 0 && smallWords.has(word)
+                ? word
+                : word.replace(/^[a-z]/, (letter) => letter.toUpperCase()),
+            )
+            .join(' ')
+          section = `Part ${match[1].toUpperCase()}${title ? ` - ${title}` : ''}`
         }
         node = walker.nextNode()
       }
+      fieldSectionCache.set(element, section)
       return section
     }
+
+    const isVisible = (element: any): boolean => {
+      let node = element
+      while (node) {
+        if (
+          node.hidden ||
+          node.style?.display === 'none' ||
+          node.style?.visibility === 'hidden'
+        ) {
+          return false
+        }
+        node = node.parentElement
+      }
+      return true
+    }
+
+    let cachedValidation:
+      | {
+          source: string
+          entries: Array<{
+            guard: ReturnType<typeof extractGuards>[number]
+            evaluate: () => unknown
+          }>
+        }
+      | undefined
 
     const instance: FormInstance = {
       code,
@@ -444,7 +587,9 @@ export async function openOfficialForm(
               label: text.label,
               item: text.item,
               section: fieldSection(element),
+              optionLabel: text.optionLabel || undefined,
               disabled: element.disabled,
+              visible: isVisible(element),
             }
             if (type === 'radio' || type === 'checkbox') {
               field.checked = element.checked
@@ -532,18 +677,26 @@ export async function openOfficialForm(
             ? null
             : { message: firstMessage, fieldId: officialFieldId, source: 'official' }
 
-        const guards = extractGuards(handler.toString())
+        const handlerSource = handler.toString()
+        if (!cachedValidation || cachedValidation.source !== handlerSource) {
+          cachedValidation = {
+            source: handlerSource,
+            entries: extractGuards(handlerSource).map((guard) => ({
+              guard,
+              evaluate: w.Function(
+                `return (function () {\n${guard.prelude}\nif (!(${guard.test})) { return null; }\nreturn String(${guard.message});\n})()`,
+              ) as () => unknown,
+            })),
+          }
+        }
         const issues: ValidationIssue[] = []
         const seen = new Set<string>()
         let evaluated = 0
         let failedToEvaluate = 0
-        for (const guard of guards) {
+        for (const { guard, evaluate } of cachedValidation.entries) {
           restoreFormState(snapshot)
           try {
-            const result = evaluateInSandbox(
-              guard.prelude,
-              `(function () {\nif (!(${guard.test})) { return null; }\nreturn String(${guard.message});\n})()`,
-            )
+            const result = evaluate()
             evaluated += 1
             if (result === null) {
               continue
@@ -593,7 +746,11 @@ export async function openOfficialForm(
         return {
           officialFirst,
           issues,
-          coverage: { guards: guards.length, evaluated, failedToEvaluate },
+          coverage: {
+            guards: cachedValidation.entries.length,
+            evaluated,
+            failedToEvaluate,
+          },
         }
       },
       captureSaveXml() {

@@ -214,3 +214,6 @@ Status: `[ ]` todo, `[~]` in progress, `[x]` done (gate passed).
   `EBIRFORMS_DATA_DIR`, a generated second test TIN, and no live SFTP setting.
   Bricolage Grotesque and its OFL license are bundled for the native GPUIX font
   registration API, with a system-font fallback when the renderer lacks it.
+- P4 Round 2 derives labels and radio options from adjacent document-order text,
+  groups related controls by item, keeps period controls in Part I, and tests
+  visible-label coverage and official Part ranges for the three editor forms.
