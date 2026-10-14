@@ -296,18 +296,25 @@ function Icon({ name, size = 16, color, strokeWidth = 1.75 }: {
  * a repeat on the same element within 40 ms is dropped.
  */
 let lastClick = { element: -1, at: 0 }
+let insideClick = false
 function once<A extends unknown[]>(handler: ((...args: A) => unknown) | undefined): (...args: A) => void {
   return (...args: A) => {
-    const element = (args[0] as { elementId?: number } | undefined)?.elementId
-    // Nested calls (a primitive forwarding to the caller's handler) carry no event: pass through.
-    if (element === undefined) {
+    // A primitive forwarding to its caller's handler runs inside the outer
+    // dispatch: let it through. Only top-level dispatches are de-duplicated.
+    if (insideClick) {
       handler?.(...args)
       return
     }
+    const element = (args[0] as { elementId?: number } | undefined)?.elementId ?? -2
     const now = performance.now()
     if (element === lastClick.element && now - lastClick.at < 40) return
     lastClick = { element, at: now }
-    handler?.(...args)
+    insideClick = true
+    try {
+      handler?.(...args)
+    } finally {
+      insideClick = false
+    }
   }
 }
 
@@ -1498,7 +1505,7 @@ function App() {
         <Avatar name={pillLabel} size={20} />
         <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 600, whiteSpace: 'nowrap' }}>{pillLabel}</text>
         {pillTin !== '' && <text style={{ color: t.fg2, fontSize: F_META, ...NUM_STYLE, fontWeight: 400, whiteSpace: 'nowrap' }}>{pillTin}</text>}
-        <Icon name="chevDown" size={14} color={t.fg3} />
+        <Icon name={panel === 'taxpayer' ? 'chevLeft' : 'chevRight'} size={14} color={t.fg3} />
       </div>
     )
   }
@@ -1678,6 +1685,19 @@ function App() {
           )}
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 2, paddingTop: 8, position: 'relative' }}>
+          <NavRow testId="nav-settings" icon="settings" label="Settings" current={page === 'settings'} onClick={once(() => goto('settings'))} />
+          <div
+            testId="user-card"
+            onClick={once(() => setMenuOpen((value) => !value))}
+            style={{ display: 'flex', alignItems: 'center', gap: 10, paddingTop: 6, paddingBottom: 6, paddingLeft: 8, paddingRight: 8, borderRadius: 8, cursor: 'pointer', backgroundColor: menuOpen ? t.hover : CLEAR, hover: { backgroundColor: t.hover } }}
+          >
+            <Avatar name={accountName} size={28} />
+            <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
+              <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 500, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{accountName}</text>
+              <text style={{ color: t.fg3, fontSize: F_META, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{email || 'No email set'}</text>
+            </div>
+            <Icon name="upDown" size={16} color={t.fg3} />
+          </div>
           {menuOpen && (
             <div
               onMouseDownOutside={() => setMenuOpen(false)}
@@ -1704,19 +1724,6 @@ function App() {
               <NavRow testId="menu-logout" icon="logout" label="Log out" onClick={once(() => { setMenuOpen(false); showToast('Signed out.') })} />
             </div>
           )}
-          <NavRow testId="nav-settings" icon="settings" label="Settings" current={page === 'settings'} onClick={once(() => goto('settings'))} />
-          <div
-            testId="user-card"
-            onClick={once(() => setMenuOpen((value) => !value))}
-            style={{ display: 'flex', alignItems: 'center', gap: 10, paddingTop: 6, paddingBottom: 6, paddingLeft: 8, paddingRight: 8, borderRadius: 8, cursor: 'pointer', backgroundColor: menuOpen ? t.hover : CLEAR, hover: { backgroundColor: t.hover } }}
-          >
-            <Avatar name={accountName} size={28} />
-            <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
-              <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 500, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{accountName}</text>
-              <text style={{ color: t.fg3, fontSize: F_META, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{email || 'No email set'}</text>
-            </div>
-            <Icon name="upDown" size={16} color={t.fg3} />
-          </div>
         </div>
       </div>
     )
