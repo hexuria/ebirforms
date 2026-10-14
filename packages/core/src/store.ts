@@ -301,6 +301,18 @@ function migrate(db: Database): void {
       db.exec('CREATE INDEX drafts_profile_updated ON drafts (profile_id, updated_at)')
       db.exec('PRAGMA user_version = 3')
     }
+
+    if (version < 4) {
+      // v4: key/value settings for the desktop shell (display name, email,
+      // theme, sidebar prefs, last-read-notifications watermark, backups).
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS settings (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        )
+      `)
+      db.exec('PRAGMA user_version = 4')
+    }
   })
   migration()
 }
@@ -883,6 +895,72 @@ export class Store {
           values: JSON.parse(valuesJson) as DraftValues,
         }),
       )
+    })
+  }
+
+  /** Drafts across every taxpayer, most recently touched first. */
+  listRecentDrafts(limit = 8): Draft[] {
+    return this.withErrorLogging('listRecentDrafts', () => {
+      const rows = this.db
+        .query(
+          'SELECT id, profile_id AS profileId, form_code AS formCode, period, "values" AS valuesJson, status, created_at AS createdAt, updated_at AS updatedAt FROM drafts ORDER BY updated_at DESC, created_at DESC, rowid DESC LIMIT ?',
+        )
+        .all(limit)
+      return (rows as Array<Omit<Draft, 'values'> & { valuesJson: string }>).map(
+        ({ valuesJson, ...row }) => ({
+          ...row,
+          values: JSON.parse(valuesJson) as DraftValues,
+        }),
+      )
+    })
+  }
+
+  /** Drafts already filed: queued, submitted, confirmed or paid. */
+  listFiledDrafts(): Draft[] {
+    return this.withErrorLogging('listFiledDrafts', () => {
+      const rows = this.db
+        .query(
+          `SELECT id, profile_id AS profileId, form_code AS formCode, period, "values" AS valuesJson, status, created_at AS createdAt, updated_at AS updatedAt FROM drafts WHERE status IN ('queued', 'submitted', 'confirmed', 'paid') ORDER BY updated_at DESC, created_at DESC, rowid DESC`,
+        )
+        .all()
+      return (rows as Array<Omit<Draft, 'values'> & { valuesJson: string }>).map(
+        ({ valuesJson, ...row }) => ({
+          ...row,
+          values: JSON.parse(valuesJson) as DraftValues,
+        }),
+      )
+    })
+  }
+
+  /** Bump updated_at without touching values/status (recent-returns list). */
+  touchDraft(id: string): Draft {
+    return this.withErrorLogging('touchDraft', () => {
+      const result = this.db
+        .query('UPDATE drafts SET updated_at = MAX(updated_at + 1, ?) WHERE id = ?')
+        .run(Date.now(), id)
+      if (!result.changes) {
+        throw new Error(`Draft not found: ${id}.`)
+      }
+      return this.getDraft(id)!
+    })
+  }
+
+  getSetting(key: string): string | null {
+    return this.withErrorLogging('getSetting', () => {
+      const row = this.db
+        .query('SELECT value FROM settings WHERE key = ?')
+        .get(key) as { value: string } | null
+      return row?.value ?? null
+    })
+  }
+
+  setSetting(key: string, value: string): void {
+    return this.withErrorLogging('setSetting', () => {
+      this.db
+        .query(
+          'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+        )
+        .run(key, value)
     })
   }
 

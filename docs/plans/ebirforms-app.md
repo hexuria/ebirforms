@@ -138,8 +138,30 @@ Status: `[ ]` todo, `[~]` in progress, `[x]` done (gate passed).
   *Gate:* parity oracle passes for 1601C, 2551Q, 0619E; GPUIX automation test
   proves no layout shift when errors appear.
 - [~] **P4 Form editor.** Branch-owned taxpayer facts, period-aware selected
-  form library, light/dark GPUIX shell, and generated editors for the first
-  forms (1601C, 2551Q, 0619E) bound to the official runtime instance.
+  form library, and generated editors for the first forms (1601C, 2551Q,
+  0619E) bound to the official runtime instance. App shell rebuilt to the
+  `buwiz-ui-redesign` design system (DESIGN_SYSTEM.md + shell-prototype.html):
+  fg/bg/surface/hover/selected/border tokens in light, dark and system
+  (persisted in the settings kv); Windows chrome `[sidebar][back][fwd]` +
+  centered taxpayer ContextPill + `[bell][theme][captions]`, macOS reserves
+  the traffic-light pad and drops captions. Sidebar: search field +
+  start-a-return `+`, Home/Calendar/Filings nav, Recent returns (toggleable),
+  Settings, user card. Right panel: taxpayer card (profile facts, branches,
+  switch taxpayer) and notifications derived from real data (due ≤14d,
+  filed, dead jobs) with persisted last-read. Views: Home due/fed rows from
+  `projectDue`, Calendar month-grouped deadlines, Filings use-as-template
+  draft copy, Taxpayer Profile/Forms/Templates tabs with disclosure-group
+  editing and `Same as head office` inheritance switches, Settings
+  (appearance toggles, real Backup, job queue rows), search palette
+  (Ctrl+K), start-a-return modal. Form page restyled to the prototype's
+  Forms tab: meta + title + frequency/fields chips, context bar (avatar,
+  TIN, period, guided-mode stub), stage tracker, "On this form" part
+  navigator, collapsible Part cards with numbered item rows (PILL radios,
+  four-box TIN, period groups, ₱ money fields, locked "From tax profile"
+  controls, reserved error rows), sticky Validate/Save bar. `deadlines.ts`
+  adds BIR due-date rules + `projectDue`; store v4 adds the settings kv,
+  `listRecentDrafts`, `listFiledDrafts`, `touchDraft`. `EBIRFORMS_SEED=demo`
+  seeds three demo taxpayers/profiles/drafts for verification.
   *Gate:* filled fixtures compute the same totals as the official HTA.
 - [ ] **P5 Print preview and print.**
   *Gate:* filled values visible on rendered pages; PDF printed via the OS
@@ -210,6 +232,8 @@ Status: `[ ]` todo, `[~]` in progress, `[x]` done (gate passed).
   explicit overrides for forms whose labels do not name a period. Runtime
   field snapshots carry the nearest official `Part I`, `Part II`, etc. heading
   so the editor follows the form's structure rather than item numbering.
+- P4 UI rebuilt to the buwiz-ui-redesign shell (DESIGN_SYSTEM.md tokens,
+  prototype forms tab for the editor); store v4 + deadlines projection added.
 - P4 scratch walkthrough data is seeded by `scripts/seed-p4.ts`; it uses
   `EBIRFORMS_DATA_DIR`, a generated second test TIN, and no live SFTP setting.
   Bricolage Grotesque and its OFL license are bundled for the native GPUIX font

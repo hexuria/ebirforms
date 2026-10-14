@@ -1,3 +1,16 @@
+export {
+  dueDateFor,
+  familyCode,
+  isAnnualPeriod,
+  isMonthlyPeriod,
+  isQuarterlyPeriod,
+  nextPeriod,
+  periodKind,
+  periodLabel,
+  periodsForYear,
+  projectDue,
+} from './deadlines.js'
+export type { DueProjectionInput, DueRow } from './deadlines.js'
 export { describeSftpConfig, loadSftpConfig } from './env.js'
 export type { SftpConfig } from './env.js'
 export { dataDir, Logger } from './logger.js'

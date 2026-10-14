@@ -1,7 +1,14 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { copyFileSync, mkdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { render } from '@gpuix/react'
+import { render, useGpuixRequired } from '@gpuix/react'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@gpuix/react'
 import {
   dataDir,
   describeSftpConfig,
@@ -11,8 +18,13 @@ import {
   JobQueue,
   loadSftpConfig,
   Logger,
+  nextPeriod,
   openStore,
   parseTin,
+  periodLabel,
+  periodsForYear,
+  projectDue,
+  type DueProjectionInput,
   type Job,
   type LibraryEntry,
   type LogEntry,
@@ -20,29 +32,20 @@ import {
   type Profile,
   type TaxpayerTree,
 } from '@ebirforms/core'
-import { loadCatalog, type CatalogEntry, type ReturnFrequency } from '@ebirforms/forms'
+import { loadCatalog, type ReturnFrequency } from '@ebirforms/forms'
 import { openOfficialForm } from '@ebirforms/runtime'
 import type { FieldSnapshot, FormInstance, ValidationIssue } from '@ebirforms/runtime'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-  useGpuixRequired,
-  type PublicInstance,
-} from '@gpuix/react'
 import {
   autoFieldIds,
   buildEditorModel,
   buildPrefillValues,
   cleanFormTitle,
   displayFormCode,
-  formCategory,
   mergeDraftPrefill,
   type PrefillFormCode,
 } from './editor-model.js'
-import { themes, type ThemeMode, type ThemeTokens } from './theme.js'
+import { seedDemo } from './seed-demo.js'
+import { resolveSystemTheme, resolveTheme, themes, type ResolvedTheme, type ThemeMode, type ThemeTokens } from './theme.js'
 import { beginWindowDrag, closeWindow, dragWindowTo, toggleMaximizeWindow, type DragAnchor } from './win32.js'
 
 const appDir = dataDir()
@@ -51,20 +54,15 @@ const store = openStore(join(appDir, 'ebirforms.sqlite'))
 const logger: Logger = store.logger
 const queue = new JobQueue(store)
 const catalog = loadCatalog()
-const themePath = join(appDir, 'theme.json')
-const fontPath = join(import.meta.dir, '../assets/fonts/BricolageGrotesque-Variable.ttf')
-
-function readTheme(): ThemeMode {
+const catalogByCode = new Map(catalog.map((entry) => [entry.code, entry]))
+if (process.env.EBIRFORMS_SEED === 'demo') {
   try {
-    if (existsSync(themePath)) {
-      const parsed = JSON.parse(readFileSync(themePath, 'utf8')) as { mode?: ThemeMode }
-      if (parsed.mode === 'light' || parsed.mode === 'dark') return parsed.mode
-    }
-  } catch {
-    return 'light'
+    seedDemo(store)
+  } catch (error) {
+    logger.log('warn', 'seed', 'Demo seed failed', { error: String(error) })
   }
-  return 'light'
 }
+const fontPath = join(import.meta.dir, '../assets/fonts/BricolageGrotesque-Variable.ttf')
 
 function FontRegistration() {
   const renderer = useGpuixRequired()
@@ -87,20 +85,38 @@ function FontRegistration() {
   return null
 }
 
-type NavPage = 'taxpayer' | 'tasks' | 'logs' | 'calendar' | 'settings' | 'form' | 'import'
-type TaxpayerTab = 'details' | 'forms' | 'templates' | 'email' | 'export'
+// ---------------------------------------------------------------------------
+// Design constants (verbatim from the mockup's Components tab)
+
+const FONT = 'Segoe UI Variable Text, Segoe UI, Bricolage Grotesque, sans-serif'
+const NUM_STYLE = { fontVariantNumeric: 'tabular-nums', fontWeight: 600 } as const
+const F_CAP = 11
+const F_META = 12
+const F_BODY = 13
+const F_EMPH = 14
+const F_TITLE = 16
+const F_PAGE = 20
+
+const WINDOW_TITLE = 'eBIRForms'
+const isWin = process.platform === 'win32'
+const isMac = process.platform === 'darwin'
+
+type Page = 'home' | 'calendar' | 'filings' | 'taxpayer' | 'settings' | 'jobs' | 'logs' | 'form'
+type TpTab = 'profile' | 'forms' | 'templates'
 type NavState = {
-  page: NavPage
-  tab: TaxpayerTab
+  page: Page
+  tab: TpTab
   tin?: string
   branchId?: string
   profileId?: string
   formCode?: string
   period?: string
 }
-const WINDOW_TITLE = 'eBIRForms'
-const isWin = process.platform === 'win32'
-const isMac = process.platform === 'darwin'
+type PanelKind = 'taxpayer' | 'notifications' | null
+type Overlay =
+  | null
+  | { kind: 'search' }
+  | { kind: 'startReturn' }
 type LogFilter = LogLevel | 'all'
 type DraftStatus = Draft['status']
 type FactsForm = {
@@ -119,16 +135,8 @@ type NewTaxpayerForm = FactsForm & {
   birthDate: string
 }
 type NewBranchForm = FactsForm & { code: string; name: string }
-type PeriodChoice = { period: string; label: string }
 
-const blankFacts: FactsForm = {
-  name: '',
-  rdo: '',
-  zip: '',
-  address: '',
-  phone: '',
-  email: '',
-}
+const blankFacts: FactsForm = { name: '', rdo: '', zip: '', address: '', phone: '', email: '' }
 const blankTaxpayer: NewTaxpayerForm = {
   ...blankFacts,
   tin1: '',
@@ -149,17 +157,114 @@ function branchId(tin9: string, code: string): string {
   return `${tin9}${code}`
 }
 
-function Button({
-  children,
-  onClick,
-  disabled = false,
-  quiet = false,
-  testId,
-}: {
-  children: string
+function initials(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean)
+  const letters = parts.slice(0, 2).map((part) => part[0]?.toUpperCase() ?? '')
+  return letters.join('') || '?'
+}
+
+const MONTH_ABBR = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC']
+
+function fmtDate(iso: string | number): string {
+  const date = typeof iso === 'string' ? new Date(`${iso}T00:00:00`) : new Date(iso)
+  return `${MONTH_ABBR[date.getMonth()][0]}${MONTH_ABBR[date.getMonth()].slice(1).toLowerCase()} ${date.getDate()}, ${date.getFullYear()}`
+}
+
+function fmtDateShort(iso: string): string {
+  const date = new Date(`${iso}T00:00:00`)
+  return `${MONTH_ABBR[date.getMonth()][0]}${MONTH_ABBR[date.getMonth()].slice(1).toLowerCase()} ${date.getDate()}`
+}
+
+function fmtDateTime(ts: number): string {
+  const date = new Date(ts)
+  return `${fmtDate(ts)}, ${date.toLocaleTimeString('en', { hour: 'numeric', minute: '2-digit' })}`
+}
+
+function daysUntil(iso: string): number {
+  const today = new Date()
+  today.setHours(0, 0, 0, 0)
+  return Math.round((Date.parse(`${iso}T00:00:00`) - today.getTime()) / 86400000)
+}
+
+function freqLabel(frequency: ReturnFrequency): string {
+  return frequency === 'monthly' ? 'Monthly' : frequency === 'quarterly' ? 'Quarterly' : 'Annual'
+}
+
+// ---------------------------------------------------------------------------
+// Lucide icon paths (24x24, stroke style) — from the mockup's icon dictionary
+
+const ICON_PATHS: Record<string, string> = {
+  panelLeft: '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/>',
+  arrowLeft: '<path d="m12 19-7-7 7-7"/><path d="M19 12H5"/>',
+  arrowRight: '<path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>',
+  search: '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
+  plus: '<path d="M5 12h14"/><path d="M12 5v14"/>',
+  bell: '<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>',
+  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>',
+  moon: '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
+  monitor: '<rect x="3" y="3" width="18" height="12" rx="2"/><path d="M12 17v4"/><path d="M8 21h8"/>',
+  settings: '<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>',
+  home: '<path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V12h6v10"/>',
+  calendar: '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4"/><path d="M8 2v4"/><path d="M3 10h18"/>',
+  file: '<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/>',
+  history: '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/>',
+  chevDown: '<path d="m6 9 6 6 6-6"/>',
+  chevRight: '<path d="m9 18 6-6-6-6"/>',
+  chevLeft: '<path d="m15 18-6-6 6-6"/>',
+  pencil: '<path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/>',
+  check: '<path d="M20 6 9 17l-5-5"/>',
+  x: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+  building: '<rect x="4" y="2" width="16" height="20" rx="2"/><path d="M9 22v-4h6v4"/><path d="M8 6h.01"/><path d="M16 6h.01"/><path d="M12 6h.01"/><path d="M12 10h.01"/><path d="M12 14h.01"/><path d="M16 10h.01"/><path d="M16 14h.01"/><path d="M8 10h.01"/><path d="M8 14h.01"/>',
+  pin: '<path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3"/>',
+  user: '<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+  copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+  branch: '<path d="M6 3v12"/><circle cx="6" cy="19" r="3"/><circle cx="18" cy="9" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/>',
+  checkCircle: '<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>',
+  alert: '<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
+  upload: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m17 8-5-5-5 5"/><path d="M12 3v12"/>',
+  hash: '<path d="M4 9h16"/><path d="M4 15h16"/><path d="M10 3 8 21"/><path d="m16 3-2 18"/>',
+  box: '<path d="m7.5 4.27 9 5.15"/><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/>',
+  template: '<rect x="3" y="3" width="18" height="7" rx="1"/><rect x="3" y="14" width="9" height="7" rx="1"/><rect x="16" y="14" width="5" height="7" rx="1"/>',
+  info: '<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>',
+  database: '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4 3 9 3s9-1.34 9-3"/>',
+  list: '<path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/>',
+}
+
+let activeTheme: ThemeTokens = themes.light
+function useTheme(): ThemeTokens {
+  return activeTheme
+}
+
+type IconName = keyof typeof ICON_PATHS
+
+function Icon({ name, size = 16, color, strokeWidth = 1.75 }: {
+  name: IconName
+  size?: number
+  color?: string
+  strokeWidth?: number
+}) {
+  const t = useTheme()
+  const stroke = color ?? t.fg2
+  const source = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="${stroke}" stroke-width="${strokeWidth}" stroke-linecap="round" stroke-linejoin="round">${ICON_PATHS[name]}</svg>`
+  return (
+    <svg
+      source={source}
+      style={{ width: size, height: size, minWidth: size }}
+    />
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Primitives
+
+function IBtn({ icon, onClick, size = 28, iconSize = 16, active = false, disabled = false, danger = false, testId }: {
+  icon: IconName
   onClick: () => void
+  size?: number
+  iconSize?: number
+  active?: boolean
   disabled?: boolean
-  quiet?: boolean
+  danger?: boolean
   testId?: string
 }) {
   const t = useTheme()
@@ -171,55 +276,246 @@ function Button({
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        padding: 10,
-        minHeight: 36,
+        width: size,
+        height: size,
         borderRadius: 7,
         cursor: disabled ? 'default' : 'pointer',
-        opacity: disabled ? 0.46 : 1,
-        backgroundColor: quiet ? t.secondary : t.primary,
-        hover: { opacity: disabled ? 0.46 : 0.86 },
+        opacity: disabled ? 0.4 : 1,
+        backgroundColor: active ? t.selected : 'rgba(0,0,0,0)',
+        hover: disabled ? {} : { backgroundColor: danger ? '#e81123' : t.hover },
       }}
     >
-      <text style={{ color: quiet ? t.fg : t.primaryFg, fontSize: 13, fontWeight: 600 }}>
+      <Icon name={icon} size={iconSize} color={disabled ? t.fg3 : active ? t.fg : t.fg2} />
+    </div>
+  )
+}
+
+function Btn({ children, onClick, kind = 'primary', disabled = false, small = false, icon, testId }: {
+  children: ReactNode
+  onClick: () => void
+  kind?: 'primary' | 'secondary' | 'ghost'
+  disabled?: boolean
+  small?: boolean
+  icon?: IconName
+  testId?: string
+}) {
+  const t = useTheme()
+  const styles = {
+    primary: { bg: t.primary, fg: t.primaryFg, border: t.primary },
+    secondary: { bg: t.surface, fg: t.fg, border: t.borderStrong },
+    ghost: { bg: 'rgba(0,0,0,0)', fg: t.fg2, border: 'rgba(0,0,0,0)' },
+  }[kind]
+  return (
+    <div
+      testId={testId}
+      onClick={() => !disabled && onClick()}
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 6,
+        height: small ? 26 : 32,
+        paddingLeft: small ? 10 : 14,
+        paddingRight: small ? 10 : 14,
+        borderRadius: 7,
+        borderWidth: kind === 'secondary' ? 1 : 0,
+        borderColor: styles.border,
+        backgroundColor: styles.bg,
+        cursor: disabled ? 'default' : 'pointer',
+        opacity: disabled ? 0.45 : 1,
+        hover: disabled ? {} : { opacity: 0.85 },
+      }}
+    >
+      {icon && <Icon name={icon} size={small ? 12 : 14} color={styles.fg} />}
+      <text style={{ color: styles.fg, fontSize: small ? F_META : F_BODY, fontWeight: 500 }}>
         {children}
       </text>
     </div>
   )
 }
 
-let activeTheme: ThemeTokens = themes.light
-function useTheme(): ThemeTokens {
-  return activeTheme
+function Kbd({ children }: { children: string }) {
+  const t = useTheme()
+  return (
+    <div
+      style={{
+        paddingLeft: 6,
+        paddingRight: 6,
+        height: 18,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        borderRadius: 4,
+        borderWidth: 1,
+        borderColor: t.border,
+        backgroundColor: t.surface,
+      }}
+    >
+      <text style={{ color: t.fg3, fontSize: 10, ...NUM_STYLE }}>{children}</text>
+    </div>
+  )
 }
 
-function Field({
-  label,
-  value,
-  onChange,
-  error = '',
-  placeholder,
-  disabled = false,
-  auto = false,
-  testId,
-}: {
-  label: string
-  value: string
-  onChange?: (value: string) => void
-  error?: string
-  placeholder?: string
-  disabled?: boolean
-  auto?: boolean
+function Switch({ on, onToggle, testId }: { on: boolean; onToggle: (value: boolean) => void; testId?: string }) {
+  const t = useTheme()
+  return (
+    <div
+      testId={testId}
+      onClick={() => onToggle(!on)}
+      style={{
+        width: 32,
+        height: 18,
+        borderRadius: 9,
+        backgroundColor: on ? t.accent : t.borderStrong,
+        display: 'flex',
+        alignItems: 'center',
+        paddingLeft: on ? 16 : 2,
+        cursor: 'pointer',
+      }}
+    >
+      <div style={{ width: 14, height: 14, borderRadius: 7, backgroundColor: '#ffffff' }} />
+    </div>
+  )
+}
+
+function Seg<T extends string>({ options, value, onChange, testId }: {
+  options: Array<{ value: T; label: string; icon?: IconName }>
+  value: T
+  onChange: (value: T) => void
   testId?: string
 }) {
   const t = useTheme()
   return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 5, minWidth: 0, flexGrow: 1, flexBasis: 180 }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <text style={{ color: t.fg, fontSize: 12, fontWeight: 600 }}>{label}</text>
-        {auto && (
-          <text style={{ color: t.mutedFg, fontSize: 10 }}>AUTO</text>
-        )}
-      </div>
+    <div
+      testId={testId}
+      style={{
+        display: 'flex',
+        gap: 2,
+        padding: 2,
+        borderRadius: 8,
+        backgroundColor: t.hover,
+        alignSelf: 'flex-start',
+      }}
+    >
+      {options.map((option) => {
+        const active = option.value === value
+        return (
+          <div
+            key={option.value}
+            testId={`${testId}-${option.value}`}
+            onClick={() => onChange(option.value)}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 5,
+              height: 24,
+              paddingLeft: 12,
+              paddingRight: 12,
+              borderRadius: 6,
+              cursor: 'pointer',
+              backgroundColor: active ? t.raised : 'rgba(0,0,0,0)',
+              hover: { backgroundColor: active ? t.raised : t.selected },
+            }}
+          >
+            {option.icon && <Icon name={option.icon} size={14} color={active ? t.fg : t.fg2} />}
+            <text style={{ color: active ? t.fg : t.fg2, fontSize: F_META, fontWeight: active ? 600 : 400 }}>
+              {option.label}
+            </text>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function Chip({ children, tone = 'plain', icon }: { children: ReactNode; tone?: 'plain' | 'accent' | 'success' | 'warning' | 'danger' | 'muted'; icon?: IconName }) {
+  const t = useTheme()
+  const tones = {
+    plain: { bg: t.hover, fg: t.fg2 },
+    muted: { bg: t.hover, fg: t.fg3 },
+    accent: { bg: t.accentSoft, fg: t.accent },
+    success: { bg: t.successSoft, fg: t.success },
+    warning: { bg: t.warningSoft, fg: t.warning },
+    danger: { bg: t.dangerSoft, fg: t.danger },
+  }[tone]
+  return (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 4,
+        height: 20,
+        paddingLeft: 8,
+        paddingRight: 8,
+        borderRadius: 10,
+        backgroundColor: tones.bg,
+      }}
+    >
+      {icon && <Icon name={icon} size={12} color={tones.fg} />}
+      <text style={{ color: tones.fg, fontSize: F_CAP, fontWeight: 500 }}>{children}</text>
+    </div>
+  )
+}
+
+function Avatar({ name, size = 28 }: { name: string; size?: number }) {
+  const t = useTheme()
+  return (
+    <div
+      style={{
+        width: size,
+        height: size,
+        minWidth: size,
+        borderRadius: size / 2,
+        backgroundColor: t.selected,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+      }}
+    >
+      <text style={{ color: t.fg, fontSize: size * 0.36, fontWeight: 600 }}>{initials(name)}</text>
+    </div>
+  )
+}
+
+function Check({ on, disabled = false }: { on: boolean; disabled?: boolean }) {
+  const t = useTheme()
+  return (
+    <div
+      style={{
+        width: 16,
+        height: 16,
+        borderRadius: 4,
+        borderWidth: 1,
+        borderColor: on ? t.primary : t.borderStrong,
+        backgroundColor: on ? t.primary : t.surface,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        opacity: disabled ? 0.5 : 1,
+      }}
+    >
+      {on && <Icon name="check" size={11} color={t.primaryFg} strokeWidth={3} />}
+    </div>
+  )
+}
+
+function FieldInput({ label, value, onChange, placeholder, disabled = false, mono = false, hint, testId }: {
+  label?: string
+  value: string
+  onChange?: (value: string) => void
+  placeholder?: string
+  disabled?: boolean
+  mono?: boolean
+  hint?: string
+  testId?: string
+}) {
+  const t = useTheme()
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0, flexGrow: 1 }}>
+      {label && (
+        <text style={{ color: t.fg3, fontSize: F_CAP }}>{label}</text>
+      )}
       <input
         testId={testId}
         value={value}
@@ -227,85 +523,132 @@ function Field({
         readOnly={disabled}
         onChange={(event) => onChange?.(event.value ?? '')}
         style={{
-          height: 36,
-          minHeight: 36,
-          padding: 9,
-          color: disabled ? t.mutedFg : t.fg,
-          backgroundColor: disabled ? t.muted : t.bg,
+          height: 32,
+          minHeight: 32,
+          padding: 7,
+          paddingLeft: 9,
+          paddingRight: 9,
+          color: disabled ? t.fg3 : t.fg,
+          backgroundColor: disabled ? t.hover : t.surface,
           borderWidth: 1,
-          borderColor: t.input,
-          borderRadius: 6,
+          borderColor: t.borderStrong,
+          borderRadius: 7,
+          ...(mono ? NUM_STYLE : {}),
+          fontSize: F_BODY,
         }}
       />
-      <div testId={testId ? `${testId}-validation` : undefined} style={{ height: 18, minHeight: 18 }}>
-        <text style={{ color: error ? t.danger : t.mutedFg, fontSize: 11 }}>{error}</text>
-      </div>
+      {hint ? <text style={{ color: t.fg3, fontSize: F_CAP }}>{hint}</text> : null}
     </div>
   )
 }
 
-function Panel({
-  title,
-  subtitle,
-  aside,
-  children,
-}: {
-  title: string
-  subtitle?: string
-  aside?: string
+function Card({ children, title, subtitle, aside, onToggle, open }: {
   children?: ReactNode
+  title?: string
+  subtitle?: string
+  aside?: ReactNode
+  onToggle?: () => void
+  open?: boolean
 }) {
   const t = useTheme()
+  const disclosure = onToggle !== undefined
   return (
     <div
       style={{
         display: 'flex',
         flexDirection: 'column',
-        gap: 14,
-        padding: 18,
         borderWidth: 1,
         borderColor: t.border,
         borderRadius: 10,
-        backgroundColor: t.chrome,
+        backgroundColor: t.surface,
       }}
     >
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <text style={{ color: t.fg, fontSize: 15, fontWeight: 700 }}>{title}</text>
-        {aside ? <text style={{ color: t.mutedFg, fontSize: 11 }}>{aside}</text> : subtitle && <text style={{ color: t.mutedFg, fontSize: 12 }}>{subtitle}</text>}
-      </div>
-      {children}
+      {title !== undefined && (
+        <div
+          onClick={disclosure ? onToggle : undefined}
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            padding: 14,
+            paddingLeft: 16,
+            paddingRight: 16,
+            cursor: disclosure ? 'pointer' : 'default',
+            borderBottomWidth: disclosure ? (open ? 1 : 0) : 1,
+            borderColor: t.border,
+          }}
+        >
+          {disclosure && (
+            <Icon name={open ? 'chevDown' : 'chevRight'} size={14} color={t.fg3} />
+          )}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 1, flexGrow: 1, minWidth: 0 }}>
+            <text style={{ color: t.fg, fontSize: F_EMPH, fontWeight: 600 }}>{title}</text>
+            {subtitle && <text style={{ color: t.fg3, fontSize: F_META }}>{subtitle}</text>}
+          </div>
+          {aside}
+        </div>
+      )}
+      {(!disclosure || open) && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 16 }}>
+          {children}
+        </div>
+      )}
     </div>
   )
 }
 
-function periodChoices(year: number, frequency: ReturnFrequency): PeriodChoice[] {
-  if (frequency === 'monthly') {
-    return Array.from({ length: 12 }, (_, index) => {
-      const month = String(index + 1).padStart(2, '0')
-      return {
-        period: `${year}-${month}`,
-        label: new Date(Date.UTC(2020, index, 1)).toLocaleString('en', { month: 'short' }),
-      }
-    })
-  }
-  if (frequency === 'quarterly') {
-    return [1, 2, 3, 4].map((quarter) => ({
-      period: `${year}-Q${quarter}`,
-      label: `Q${quarter}`,
-    }))
-  }
-  return [{ period: String(year), label: `${year} annual return` }]
+function SectionLabel({ children, first = false }: { children: ReactNode; first?: boolean }) {
+  const t = useTheme()
+  return (
+    <text style={{ color: t.fg3, fontSize: F_CAP, fontWeight: 600, paddingTop: first ? 2 : 12, paddingBottom: 4 }}>
+      {children}
+    </text>
+  )
 }
+
+// ---------------------------------------------------------------------------
 
 const SUPPORTED_FORM_CODES = ['1601Cv2018', '2551Qv2018', '0619E'] as const
 
+/** Starter packs map to real catalog codes (latest variant per family). */
+const STARTER_PACKS: Record<string, string[]> = {
+  'Non-VAT business': ['2551Qv2018', '1701Qv2018', '1701v2018', '0619E', '1601EQ'],
+  'VAT business': ['2550Qv2024', '1702Qv2018C', '1702RTv2018C', '0619E', '1601EQ'],
+  Employer: ['1601Cv2018', '1604C'],
+  Professional: ['1701Qv2018', '1701v2018', '2551Qv2018'],
+}
+
+type Notif = {
+  id: string
+  kind: 'warning' | 'success' | 'danger' | 'info' | 'plain'
+  title: string
+  subtitle: string
+  ts: number
+}
+
+type KeyEvent = {
+  key?: string
+  keyChar?: string
+  modifiers?: { ctrl?: boolean; cmd?: boolean; alt?: boolean; shift?: boolean }
+}
+
+let rootKeyHandler: ((event: KeyEvent) => void) | null = null
+
 function App() {
-  const [themeMode, setThemeMode] = useState<ThemeMode>(readTheme)
-  activeTheme = themes[themeMode]
+  const [themeMode, setThemeModeState] = useState<ThemeMode>(() => {
+    const saved = store.getSetting('theme')
+    return saved === 'dark' || saved === 'system' ? saved : 'light'
+  })
+  const [systemTheme] = useState<ResolvedTheme>(() => resolveSystemTheme())
+  activeTheme = themes[resolveTheme(themeMode, systemTheme)]
   const t = activeTheme
-  const [page, setPage] = useState<NavPage>('taxpayer')
-  const [tab, setTab] = useState<TaxpayerTab>('details')
+
+  const [page, setPage] = useState<Page>('home')
+  const [tab, setTab] = useState<TpTab>('profile')
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [panel, setPanel] = useState<PanelKind>(null)
+  const [overlay, setOverlay] = useState<Overlay>(null)
+  const [menuOpen, setMenuOpen] = useState(false)
   const [tree, setTree] = useState<TaxpayerTree[]>(() => store.listTaxpayers())
   const [selectedTin, setSelectedTin] = useState<string | undefined>(() => store.listTaxpayers()[0]?.tin9)
   const [selectedBranchId, setSelectedBranchId] = useState<string | undefined>(() => {
@@ -315,23 +658,25 @@ function App() {
   const [selectedProfileId, setSelectedProfileId] = useState<string | undefined>(() =>
     allProfiles(store.listTaxpayers())[0]?.id,
   )
-  const [taxpayerSearch, setTaxpayerSearch] = useState('')
   const [newTaxpayer, setNewTaxpayer] = useState(blankTaxpayer)
   const [newTaxpayerErrors, setNewTaxpayerErrors] = useState<Record<string, string>>({})
   const [showNewTaxpayer, setShowNewTaxpayer] = useState(false)
   const [showNewBranch, setShowNewBranch] = useState(false)
-  const [showPrintTip, setShowPrintTip] = useState(false)
   const [newBranch, setNewBranch] = useState(blankBranch)
   const [branchError, setBranchError] = useState('')
-  const [taxpayerEdit, setTaxpayerEdit] = useState({ name: '', type: 'individual', birthDate: '' })
+  const [openSecs, setOpenSecs] = useState<Set<string>>(() => new Set(['taxpayer', 'branch', 'contact']))
+  const [collapsedPartSet, setCollapsedPartSet] = useState<Set<string>>(new Set())
+  const togglePart = (key: string) => setCollapsedPartSet((current) => { const next = new Set(current); if (next.has(key)) next.delete(key); else next.add(key); return next })
+  const [editSec, setEditSec] = useState<string | null>(null)
+  const [taxpayerEdit, setTaxpayerEdit] = useState({ name: '', type: 'individual' as 'individual' | 'non-individual', birthDate: '' })
   const [branchEdit, setBranchEdit] = useState<NewBranchForm>(blankBranch)
+  const [branchInherit, setBranchInherit] = useState<Record<string, boolean>>({})
   const [yearInput, setYearInput] = useState(String(new Date().getFullYear()))
   const [showNewYear, setShowNewYear] = useState(false)
-  const [statusMessage, setStatusMessage] = useState('')
-  const [search, setSearch] = useState('')
+  const [formSearch, setFormSearch] = useState('')
   const [pendingCodes, setPendingCodes] = useState<string[]>([])
-  const [pickerOpen, setPickerOpen] = useState(false)
-  const [preset, setPreset] = useState('Employer')
+  const [startFormCode, setStartFormCode] = useState<string | null>(null)
+  const [startPeriod, setStartPeriod] = useState<string>('')
   const [queueJobs, setQueueJobs] = useState<Job[]>(() => queue.list())
   const [logs, setLogs] = useState<LogEntry[]>(() => logger.getEntries())
   const [logFilter, setLogFilter] = useState<LogFilter>('all')
@@ -342,13 +687,19 @@ function App() {
   const [issues, setIssues] = useState<ValidationIssue[]>([])
   const [editorValues, setEditorValues] = useState<Record<string, string | boolean>>({})
   const [formLoading, setFormLoading] = useState(false)
-  const [rightSidebar, setRightSidebar] = useState(false)
-  const [formFilter, setFormFilter] = useState('')
-  const searchInputRef = useRef<PublicInstance | null>(null)
-  const pendingSearchFocus = useRef(false)
+  const [toast, setToast] = useState<{ text: string; seq: number } | null>(null)
+  const [paletteQuery, setPaletteQuery] = useState('')
+  const [paletteIdx, setPaletteIdx] = useState(0)
+  const [showRecent, setShowRecent] = useState(() => store.getSetting('showRecent') !== '0')
+  const [askTemplate, setAskTemplate] = useState(() => store.getSetting('askTemplate') === '1')
+  const [displayName, setDisplayName] = useState(() => store.getSetting('displayName') ?? '')
+  const [email, setEmail] = useState(() => store.getSetting('email') ?? '')
+  const [lastRead, setLastRead] = useState(() => Number(store.getSetting('lastReadNotifs') ?? 0))
+  const [lastBackup, setLastBackup] = useState(() => store.getSetting('lastBackupAt') ?? '')
   const dragAnchor = useRef<DragAnchor | null>(null)
   const histRef = useRef<{ stack: NavState[]; idx: number }>({ stack: [], idx: -1 })
   const formLoadSeq = useRef(0)
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [, setHistVersion] = useState(0)
   const gpuix = useGpuixRequired()
 
@@ -357,20 +708,128 @@ function App() {
   const selectedProfile =
     branch?.years.find((item) => item.id === selectedProfileId) ?? branch?.years.at(-1)
   const selectedLibrary = selectedProfile ? store.listLibrary(selectedProfile.id) : []
-  const filteredTaxpayers = tree.filter(
-    (item) =>
-      !taxpayerSearch ||
-      formatTin(item.tin9).toLowerCase().includes(taxpayerSearch.toLowerCase()) ||
-      item.name.toLowerCase().includes(taxpayerSearch.toLowerCase()),
+
+  function showToast(text: string) {
+    if (toastTimer.current) clearTimeout(toastTimer.current)
+    setToast({ text, seq: Date.now() })
+    toastTimer.current = setTimeout(() => setToast(null), 2600)
+  }
+
+  function setThemeMode(mode: ThemeMode) {
+    setThemeModeState(mode)
+    store.setSetting('theme', mode)
+  }
+
+  function toggleRecent(value: boolean) {
+    setShowRecent(value)
+    store.setSetting('showRecent', value ? '1' : '0')
+  }
+
+  function toggleAskTemplate(value: boolean) {
+    setAskTemplate(value)
+    store.setSetting('askTemplate', value ? '1' : '0')
+  }
+
+  // -- Due projection + notifications (derived from real store data) --------
+
+  function draftStatuses(profileId: string, formCode: string): Record<string, DraftStatus> {
+    return Object.fromEntries(
+      store.listDrafts(profileId, formCode).map((item) => [item.period, item.status]),
+    )
+  }
+
+  const dueInputs: DueProjectionInput[] = tree.flatMap((item) =>
+    item.branches.flatMap((itemBranch) =>
+      itemBranch.years.flatMap((profile) =>
+        store.listLibrary(profile.id).map((entry) => ({
+          profileId: profile.id,
+          tin9: item.tin9,
+          branchCode: itemBranch.code,
+          year: profile.year,
+          formCode: entry.formCode,
+          frequency: catalogByCode.get(entry.formCode)?.frequency ?? 'annual',
+          statuses: draftStatuses(profile.id, entry.formCode),
+        })),
+      ),
+    ),
   )
-  const filteredCatalog = catalog.filter(
-    (entry) =>
-      !search ||
-      entry.code.toLowerCase().includes(search.trim().toLowerCase()) ||
-      entry.label.toLowerCase().includes(search.trim().toLowerCase()),
-  )
-  const editorModel = buildEditorModel(fieldSnapshot, issues, formEntry ? autoFieldIds(formEntry.formCode as PrefillFormCode) : new Set())
-  const shownLogs = logFilter === 'all' ? logs : logs.filter((entry) => entry.level === logFilter)
+  const dueRows = projectDue(dueInputs)
+  const dueByKey = new Map(dueRows.map((row) => [`${row.profileId}:${row.formCode}`, row]))
+  const filedDrafts = store.listFiledDrafts()
+  const recentDrafts = store.listRecentDrafts(4)
+
+  function profileById(profileId: string): { profile: Profile; taxpayer: TaxpayerTree; branchCode: string; branchName: string } | null {
+    for (const item of tree) {
+      for (const itemBranch of item.branches) {
+        const profile = itemBranch.years.find((entry) => entry.id === profileId)
+        if (profile) return { profile, taxpayer: item, branchCode: itemBranch.code, branchName: itemBranch.name }
+      }
+    }
+    return null
+  }
+
+  const notifications: Notif[] = (() => {
+    const items: Notif[] = []
+    for (const row of dueRows) {
+      const days = daysUntil(row.dueDate)
+      if (days > 14) continue
+      const owner = profileById(row.profileId)
+      items.push({
+        id: `due-${row.profileId}-${row.formCode}-${row.period}`,
+        kind: days < 0 ? 'danger' : 'warning',
+        title:
+          days < 0
+            ? `${displayFormCode(row.formCode)} · ${periodLabel(row.period)} is overdue`
+            : `${displayFormCode(row.formCode)} · ${periodLabel(row.period)} due ${fmtDateShort(row.dueDate)}`,
+        subtitle: `${owner?.taxpayer.name ?? row.tin9} · ${owner?.branchName ?? row.branchCode}`,
+        ts: Date.parse(`${row.dueDate}T00:00:00`),
+      })
+    }
+    for (const item of filedDrafts.slice(0, 6)) {
+      const owner = profileById(item.profileId)
+      items.push({
+        id: `filed-${item.id}`,
+        kind: 'success',
+        title: `${displayFormCode(item.formCode)} · ${periodLabel(item.period)} filed`,
+        subtitle: `${owner?.taxpayer.name ?? ''} · ${owner?.branchName ?? ''}`,
+        ts: item.updatedAt,
+      })
+    }
+    for (const job of queueJobs.filter((job) => job.state === 'dead')) {
+      items.push({
+        id: `job-${job.id}`,
+        kind: 'danger',
+        title: `${job.kind} failed`,
+        subtitle: job.lastError ?? 'The job ran out of attempts.',
+        ts: job.updatedAt,
+      })
+    }
+    for (const item of tree) {
+      const totalYears = item.branches.reduce((count, itemBranch) => count + itemBranch.years.length, 0)
+      if (totalYears === 0) {
+        items.push({
+          id: `profile-${item.tin9}`,
+          kind: 'info',
+          title: `${item.name || formatTin(item.tin9)} has no tax-year profile`,
+          subtitle: 'Add a year under Forms to start filing.',
+          ts: Date.now(),
+        })
+      }
+    }
+    if (lastBackup) {
+      items.push({
+        id: 'backup',
+        kind: 'plain',
+        title: 'Database backed up',
+        subtitle: fmtDateTime(Number(lastBackup)),
+        ts: Number(lastBackup),
+      })
+    }
+    return items.sort((a, b) => b.ts - a.ts).slice(0, 24)
+  })()
+  const unreadCount = notifications.filter((item) => item.ts > lastRead).length
+
+  // -- Navigation (history stack, autosave, unsupported-form guard) ---------
 
   const navNow: NavState = {
     page,
@@ -397,15 +856,6 @@ function App() {
     return unsubscribe
   }, [])
   useEffect(() => {
-    if (pendingSearchFocus.current && !sidebarCollapsed) {
-      pendingSearchFocus.current = false
-      focusSearchNow()
-    }
-  }, [sidebarCollapsed])
-  useEffect(() => {
-    writeFileSync(themePath, JSON.stringify({ mode: themeMode }))
-  }, [themeMode])
-  useEffect(() => {
     if (taxpayer) {
       setTaxpayerEdit({ name: taxpayer.name, type: taxpayer.type, birthDate: taxpayer.birthDate ?? '' })
     }
@@ -418,6 +868,13 @@ function App() {
         address: branch.overrides.address ?? '',
         phone: branch.overrides.phone ?? '',
         email: branch.overrides.email ?? '',
+      })
+      setBranchInherit({
+        rdo: branch.overrides.rdo == null,
+        zip: branch.overrides.zip == null,
+        address: branch.overrides.address == null,
+        phone: branch.overrides.phone == null,
+        email: branch.overrides.email == null,
       })
     }
   }, [taxpayer?.tin9, branch?.code])
@@ -467,7 +924,7 @@ function App() {
     }
     if (next.profileId !== selectedProfileId) setPendingCodes([])
     if (next.page === 'form' && next.formCode && !(SUPPORTED_FORM_CODES as readonly string[]).includes(next.formCode)) {
-      setStatusMessage(`${next.formCode} isn't editable yet — the editor covers 1601C, 2551Q and 0619E for now.`)
+      showToast(`${displayFormCode(next.formCode)} isn't editable yet — the editor covers 1601-C, 2551Q and 0619-E for now.`)
       next = { ...next, page: 'taxpayer', tab: 'forms', formCode: undefined, period: undefined }
     }
     setPage(next.page)
@@ -487,40 +944,35 @@ function App() {
     }
   }
 
+  function goto(page: Page, extra: Partial<NavState> = {}) {
+    navTo({ ...navNow, page, formCode: undefined, period: undefined, ...extra })
+  }
+
   function chooseBranch(tin9: string, code: string) {
     const id = branchId(tin9, code)
     const item = tree.find((entry) => entry.tin9 === tin9)?.branches.find((entry) => entry.code === code)
     navTo({ ...navNow, page: 'taxpayer', tin: tin9, branchId: id, profileId: item?.years.at(-1)?.id, formCode: undefined, period: undefined })
   }
 
-  function chooseProfile(profile: Profile) {
-    navTo({ ...navNow, page: 'taxpayer', tab: 'forms', tin: profile.tin9, branchId: branchId(profile.tin9, profile.branch), profileId: profile.id, formCode: undefined, period: undefined })
-  }
-
-  function openNewTaxpayer() {
-    setShowNewTaxpayer(true)
-    navTo({ ...navNow, page: 'taxpayer', tab: 'details', formCode: undefined, period: undefined })
-  }
-
-  function focusSearchNow() {
-    const el = searchInputRef.current
-    if (el?.id != null && gpuix.focusElement) {
-      try {
-        gpuix.focusElement(el.id)
-      } catch {
-        // Renderer without focusElement: expanding the sidebar still helps.
-      }
+  function chooseTaxpayer(tin9: string) {
+    const item = tree.find((entry) => entry.tin9 === tin9)
+    const firstBranch = item?.branches[0]
+    setPanel(null)
+    if (item) {
+      showToast(`Switched to ${item.name || formatTin(tin9)}`)
     }
+    navTo({
+      ...navNow,
+      page: 'taxpayer',
+      tin: tin9,
+      branchId: firstBranch ? branchId(tin9, firstBranch.code) : undefined,
+      profileId: firstBranch?.years.at(-1)?.id,
+      formCode: undefined,
+      period: undefined,
+    })
   }
 
-  function focusSidebarSearch() {
-    if (sidebarCollapsed) {
-      pendingSearchFocus.current = true
-      setSidebarCollapsed(false)
-      return
-    }
-    focusSearchNow()
-  }
+  // -- Taxpayer / branch / profile mutations (unchanged semantics) -----------
 
   function saveNewTaxpayer() {
     const tin = `${newTaxpayer.tin1}-${newTaxpayer.tin2}-${newTaxpayer.tin3}`
@@ -551,8 +1003,8 @@ function App() {
       setShowNewTaxpayer(false)
       setNewTaxpayer(blankTaxpayer)
       setNewTaxpayerErrors({})
-      setStatusMessage('Taxpayer added.')
-      navTo({ ...navNow, page: 'taxpayer', tab: 'details', tin: created.tin9, branchId: branchId(created.tin9, '00000'), profileId: undefined, formCode: undefined, period: undefined })
+      showToast('Taxpayer added.')
+      navTo({ ...navNow, page: 'taxpayer', tab: 'profile', tin: created.tin9, branchId: branchId(created.tin9, '00000'), profileId: undefined, formCode: undefined, period: undefined })
     } catch (error) {
       setNewTaxpayerErrors({ tin: error instanceof Error ? error.message : String(error) })
     }
@@ -562,26 +1014,28 @@ function App() {
     if (!taxpayer) return
     store.updateTaxpayer(taxpayer.tin9, {
       name: taxpayerEdit.name,
-      type: taxpayerEdit.type as 'individual' | 'non-individual',
+      type: taxpayerEdit.type,
       birthDate: taxpayerEdit.birthDate || null,
     })
     refreshTree(taxpayer.tin9)
-    setStatusMessage('Taxpayer details saved.')
+    setEditSec(null)
+    showToast('Taxpayer details saved.')
   }
 
   function saveBranchDetails() {
-    if (!branch) return
-    const id = branchId(taxpayer!.tin9, branch.code)
+    if (!branch || !taxpayer) return
+    const id = branchId(taxpayer.tin9, branch.code)
     store.updateBranch(id, {
       name: branchEdit.name,
-      rdo: branchEdit.rdo || null,
-      zip: branchEdit.zip || null,
-      address: branchEdit.address || null,
-      phone: branchEdit.phone || null,
-      email: branchEdit.email || null,
+      rdo: branchInherit.rdo ? null : branchEdit.rdo || null,
+      zip: branchInherit.zip ? null : branchEdit.zip || null,
+      address: branchInherit.address ? null : branchEdit.address || null,
+      phone: branchInherit.phone ? null : branchEdit.phone || null,
+      email: branchInherit.email ? null : branchEdit.email || null,
     })
-    refreshTree(taxpayer!.tin9, id)
-    setStatusMessage('Branch details saved.')
+    refreshTree(taxpayer.tin9, id)
+    setEditSec(null)
+    showToast('Branch details saved.')
   }
 
   function addBranch() {
@@ -605,7 +1059,7 @@ function App() {
       setShowNewBranch(false)
       setNewBranch(blankBranch)
       setBranchError('')
-      navTo({ ...navNow, page: 'taxpayer', tab: 'details', tin: taxpayer.tin9, branchId: created.id, profileId: undefined, formCode: undefined, period: undefined })
+      navTo({ ...navNow, page: 'taxpayer', tab: 'profile', tin: taxpayer.tin9, branchId: created.id, profileId: undefined, formCode: undefined, period: undefined })
     } catch (error) {
       setBranchError(error instanceof Error ? error.message : String(error))
     }
@@ -627,26 +1081,14 @@ function App() {
       })
       refreshTree(taxpayer.tin9, branchId(taxpayer.tin9, branch.code), profile.id)
       setShowNewYear(false)
-      setStatusMessage(`${profile.year} added.`)
+      showToast(`${profile.year} added.`)
       navTo({ ...navNow, page: 'taxpayer', tab: 'forms', tin: taxpayer.tin9, branchId: branchId(taxpayer.tin9, branch.code), profileId: profile.id, formCode: undefined, period: undefined })
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : String(error))
+      showToast(error instanceof Error ? error.message : String(error))
     }
   }
 
-  function toggleCode(code: string) {
-    if (selectedLibrary.some((entry) => entry.formCode === code)) return
-    setPendingCodes((current) =>
-      current.includes(code) ? current.filter((item) => item !== code) : [...current, code],
-    )
-  }
-
-  function addSelectedForms() {
-    if (!selectedProfile || !pendingCodes.length) return
-    store.addForms(selectedProfile.id, pendingCodes)
-    setPendingCodes([])
-    setPickerOpen(false)
-  }
+  // -- Form editor (unchanged semantics) ------------------------------------
 
   async function openForm(entry: LibraryEntry, period: string, profile: Profile | undefined = selectedProfile) {
     if (!profile || !(SUPPORTED_FORM_CODES as readonly string[]).includes(entry.formCode)) return
@@ -722,6 +1164,7 @@ function App() {
   function saveDraft() {
     if (!formInstance || !draft) return
     setDraft(store.saveDraft(draft.id, valuesFromForm(formInstance)))
+    if (askTemplate) showToast('Saved. (Template update prompt arrives with guided mode.)')
   }
 
   function updateDraftStatus(status: DraftStatus) {
@@ -737,516 +1180,1619 @@ function App() {
     navTo({ ...navNow, page: 'form', formCode: entry.formCode, period })
   }
 
-  const supportedPresets: Record<string, string[]> = {
-    Employer: ['1601Cv2018', '0619E', '1604C'],
-    'Non-VAT business': ['2551Qv2018', '0619E', '1701Q'],
-    'VAT business': ['2550Q', '0619E', '1701Q'],
+  function openDraftById(item: Draft) {
+    const owner = profileById(item.profileId)
+    if (!owner) return
+    const entry = store.listLibrary(item.profileId).find((entry) => entry.formCode === item.formCode)
+    if (!entry) return
+    store.touchDraft(item.id)
+    navTo({
+      ...navNow,
+      page: 'form',
+      tin: owner.taxpayer.tin9,
+      branchId: branchId(owner.taxpayer.tin9, owner.branchCode),
+      profileId: item.profileId,
+      formCode: item.formCode,
+      period: item.period,
+    })
   }
-  const availablePresetCodes = new Set(catalog.map((entry) => entry.code))
-  const visibleCatalog = search
-    ? filteredCatalog
-    : catalog.filter(
-        (entry) =>
-          availablePresetCodes.has(entry.code) &&
-          (preset === 'Employer'
-            ? ['1601Cv2018', '0619E', '1604C'].includes(entry.code)
-            : preset === 'Non-VAT business'
-              ? ['2551Qv2018', '0619E', '1701Q'].includes(entry.code)
-              : ['2550Q', '0619E', '1701Q'].includes(entry.code)),
-      )
 
-  function pickerRow(entry: CatalogEntry) {
-    const isInLibrary = selectedLibrary.some((item) => item.formCode === entry.code)
-    const checked = isInLibrary || pendingCodes.includes(entry.code)
+  function openDueRow(row: { profileId: string; formCode: string; period: string }) {
+    const owner = profileById(row.profileId)
+    if (!owner) return
+    navTo({
+      ...navNow,
+      page: 'form',
+      tin: owner.taxpayer.tin9,
+      branchId: branchId(owner.taxpayer.tin9, owner.branchCode),
+      profileId: row.profileId,
+      formCode: row.formCode,
+      period: row.period,
+    })
+  }
+
+  /** Copy a filed draft's values into a new draft for the next period. */
+  function useAsTemplate(item: Draft) {
+    const owner = profileById(item.profileId)
+    if (!owner) return
+    const next = nextPeriod(item.period)
+    const nextYear = Number(next.slice(0, 4))
+    let profile = owner.profile
+    if (nextYear !== owner.profile.year) {
+      const target = tree
+        .find((entry) => entry.tin9 === owner.taxpayer.tin9)
+        ?.branches.find((entry) => entry.code === owner.branchCode)
+        ?.years.find((entry) => entry.year === nextYear)
+      if (!target) {
+        showToast(`Add a ${nextYear} profile for ${owner.taxpayer.name} first.`)
+        return
+      }
+      profile = target
+    }
+    const copied = store.openDraft(profile.id, item.formCode, next)
+    store.saveDraft(copied.id, { ...item.values })
+    showToast(`${displayFormCode(item.formCode)} · ${periodLabel(next)} prefilled from ${periodLabel(item.period)}.`)
+    navTo({
+      ...navNow,
+      page: 'form',
+      tin: owner.taxpayer.tin9,
+      branchId: branchId(owner.taxpayer.tin9, owner.branchCode),
+      profileId: profile.id,
+      formCode: item.formCode,
+      period: next,
+    })
+  }
+
+  function toggleLibraryForm(code: string) {
+    if (!selectedProfile) return
+    if (selectedLibrary.some((entry) => entry.formCode === code)) {
+      store.removeForm(selectedProfile.id, code)
+    } else {
+      store.addForms(selectedProfile.id, [code])
+    }
+    refreshTree()
+  }
+
+  function applyPack(pack: string) {
+    if (!selectedProfile) return
+    const missing = (STARTER_PACKS[pack] ?? []).filter(
+      (code) => !selectedLibrary.some((entry) => entry.formCode === code),
+    )
+    if (missing.length) store.addForms(selectedProfile.id, missing)
+    refreshTree()
+    showToast(missing.length ? `Added ${missing.length} forms from ${pack}.` : `${pack} is already in the library.`)
+  }
+
+  function backupNow() {
+    try {
+      const dir = join(appDir, 'backups')
+      mkdirSync(dir, { recursive: true })
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+      copyFileSync(join(appDir, 'ebirforms.sqlite'), join(dir, `ebirforms-${stamp}.sqlite`))
+      const at = String(Date.now())
+      store.setSetting('lastBackupAt', at)
+      setLastBackup(at)
+      showToast(`Backed up to backups/ebirforms-${stamp}.sqlite`)
+      logger.log('info', 'backup', 'Database backed up', { stamp })
+    } catch (error) {
+      showToast(`Backup failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  // -- Keyboard --------------------------------------------------------------
+
+  rootKeyHandler = (event: KeyEvent) => {
+    const key = event.key ?? ''
+    const ctrl = event.modifiers?.ctrl || event.modifiers?.cmd
+    if (ctrl && (key === 'k' || key === 'K')) {
+      setPaletteQuery('')
+      setPaletteIdx(0)
+      setOverlay(overlay?.kind === 'search' ? null : { kind: 'search' })
+      return
+    }
+    if (ctrl && (key === 'b' || key === 'B')) {
+      setSidebarCollapsed((value) => !value)
+      return
+    }
+    if (key === 'escape' || key === 'Escape') {
+      if (overlay) {
+        setOverlay(null)
+        return
+      }
+      if (menuOpen) {
+        setMenuOpen(false)
+        return
+      }
+      if (panel) setPanel(null)
+    }
+  }
+
+  // -- Title bar -------------------------------------------------------------
+
+  function pillButton() {
+    const pillLabel = taxpayer ? (taxpayer.name || formatTin(taxpayer.tin9)) : 'eBIRForms'
+    const pillTin = taxpayer ? formatTin(taxpayer.tin9, branch?.code ?? '00000') : ''
     return (
       <div
-        key={entry.code}
-        testId={`picker-${entry.code}`}
-        onClick={() => toggleCode(entry.code)}
+        testId="titlebar-pill"
+        onClick={() => setPanel(panel === 'taxpayer' ? null : 'taxpayer')}
         style={{
           display: 'flex',
           alignItems: 'center',
-          gap: 10,
-          minHeight: 38,
-          padding: 7,
-          borderBottomWidth: 1,
-          borderColor: t.border,
-          cursor: isInLibrary ? 'default' : 'pointer',
-          backgroundColor: t.chrome,
+          gap: 7,
+          height: 28,
+          paddingLeft: 4,
+          paddingRight: 9,
+          borderRadius: 14,
+          borderWidth: 1,
+          borderColor: panel === 'taxpayer' ? t.borderStrong : t.border,
+          backgroundColor: panel === 'taxpayer' ? t.selected : t.surface,
+          cursor: 'pointer',
+          hover: { backgroundColor: panel === 'taxpayer' ? t.selected : t.hover },
         }}
       >
-        <div style={{
-          width: 18, minWidth: 18, height: 18, flexShrink: 0,
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          borderWidth: 1, borderColor: checked ? t.primary : t.border,
-          borderRadius: 4, backgroundColor: checked ? t.primary : t.bg,
-        }}>
-          <text style={{ color: t.primaryFg, fontSize: 12 }}>{checked ? '✓' : ''}</text>
+        <Avatar name={pillLabel} size={20} />
+        <text style={{ color: t.fg, fontSize: F_META, fontWeight: 600 }}>{pillLabel}</text>
+        {pillTin !== '' && (
+          <text style={{ color: t.fg3, fontSize: F_CAP, ...NUM_STYLE }}>{pillTin}</text>
+        )}
+        <Icon name="chevDown" size={14} color={t.fg3} />
+      </div>
+    )
+  }
+
+  function captionButton(label: string, onClick: () => void, danger = false, testId?: string) {
+    return (
+      <div
+        testId={testId}
+        onClick={onClick}
+        style={{
+          width: 46,
+          height: 40,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          cursor: 'pointer',
+          hover: { backgroundColor: danger ? '#c42b1c' : t.hover },
+        }}
+      >
+        <text style={{ color: t.fg2, fontSize: 13 }}>{label}</text>
+      </div>
+    )
+  }
+
+  function themeIcon(): IconName {
+    return themeMode === 'dark' ? 'moon' : themeMode === 'system' ? 'monitor' : 'sun'
+  }
+
+  function cycleTheme() {
+    setThemeMode(themeMode === 'light' ? 'dark' : themeMode === 'dark' ? 'system' : 'light')
+  }
+
+  function titleBar() {
+    return (
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          height: 40,
+          minHeight: 40,
+          paddingLeft: isMac ? 72 : 6,
+          paddingRight: isWin ? 0 : 6,
+          backgroundColor: t.bg,
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 2, flexGrow: 1, minWidth: 0 }}>
+          <IBtn
+            testId="tb-sidebar"
+            icon="panelLeft"
+            active={!sidebarCollapsed}
+            onClick={() => setSidebarCollapsed((value) => !value)}
+          />
+          <IBtn testId="tb-back" icon="arrowLeft" disabled={!canNavBack} onClick={() => navJump(-1)} />
+          <IBtn testId="tb-fwd" icon="arrowRight" disabled={!canNavFwd} onClick={() => navJump(1)} />
+          {sidebarCollapsed && (
+            <>
+              <IBtn testId="tb-search" icon="search" onClick={() => setOverlay({ kind: 'search' })} />
+              <IBtn testId="tb-plus" icon="plus" onClick={() => setOverlay({ kind: 'startReturn' })} />
+            </>
+          )}
+          <div
+            testId="tb-drag"
+            onMouseDown={() => {
+              dragAnchor.current = beginWindowDrag(WINDOW_TITLE)
+            }}
+            onMouseMove={() => {
+              if (dragAnchor.current) dragWindowTo(WINDOW_TITLE, dragAnchor.current)
+            }}
+            onMouseUp={() => {
+              dragAnchor.current = null
+            }}
+            style={{ flexGrow: 1, height: 40 }}
+          />
         </div>
-        <text style={{
-          flexGrow: 1, minWidth: 0, color: t.fg, fontSize: 12,
-          whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden',
-        }}>{entry.label}</text>
-        {isInLibrary && <text style={{ color: t.mutedFg, fontSize: 10 }}>IN LIBRARY</text>}
-        <text style={{ width: 112, minWidth: 112, textAlign: 'right', color: t.mutedFg, fontSize: 11 }}>
-          {entry.code}
+        {pillButton()}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 2, flexGrow: 1, justifyContent: 'flex-end' }}>
+          <div
+            testId="tb-drag-right"
+            onMouseDown={() => {
+              dragAnchor.current = beginWindowDrag(WINDOW_TITLE)
+            }}
+            onMouseMove={() => {
+              if (dragAnchor.current) dragWindowTo(WINDOW_TITLE, dragAnchor.current)
+            }}
+            onMouseUp={() => {
+              dragAnchor.current = null
+            }}
+            style={{ flexGrow: 1, height: 40 }}
+          />
+          <div style={{ position: 'relative' }}>
+            <IBtn
+              testId="tb-bell"
+              icon="bell"
+              active={panel === 'notifications'}
+              onClick={() => setPanel(panel === 'notifications' ? null : 'notifications')}
+            />
+            {unreadCount > 0 && (
+              <div
+                style={{
+                  position: 'absolute',
+                  top: 5,
+                  right: 6,
+                  width: 7,
+                  height: 7,
+                  borderRadius: 4,
+                  backgroundColor: t.accent,
+                  borderWidth: 1,
+                  borderColor: t.bg,
+                }}
+              />
+            )}
+          </div>
+          <IBtn testId="tb-theme" icon={themeIcon()} onClick={cycleTheme} />
+          {isWin && (
+            <>
+              {captionButton('─', () => gpuix.minimizeWindow?.(), false, 'tb-min')}
+              {captionButton('▢', () => { if (!toggleMaximizeWindow(WINDOW_TITLE)) gpuix.zoomWindow?.() }, false, 'tb-max')}
+              {captionButton('✕', () => closeWindow(WINDOW_TITLE), true, 'tb-close')}
+            </>
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  // -- Left sidebar ----------------------------------------------------------
+
+  function navRow(icon: IconName, label: string, active: boolean, onClick: () => void, testId?: string) {
+    return (
+      <div
+        testId={testId}
+        onClick={onClick}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 9,
+          height: 32,
+          paddingLeft: 8,
+          paddingRight: 8,
+          borderRadius: 7,
+          cursor: 'pointer',
+          backgroundColor: active ? t.selected : 'rgba(0,0,0,0)',
+          hover: { backgroundColor: active ? t.selected : t.hover },
+        }}
+      >
+        <Icon name={icon} size={16} color={active ? t.fg : t.fg2} />
+        <text style={{ color: active ? t.fg : t.fg2, fontSize: F_BODY, fontWeight: active ? 600 : 400 }}>
+          {label}
         </text>
       </div>
     )
   }
 
-  function statusStyle(status: DraftStatus | undefined) {
-    if (status === 'draft') return { color: t.warnText, backgroundColor: t.markBg, borderColor: t.mark }
-    if (status === 'confirmed' || status === 'paid') {
-      return { color: t.good, backgroundColor: t.goodBg, borderColor: t.good }
-    }
-    if (status === 'queued' || status === 'submitted') {
-      return { color: t.primary, backgroundColor: t.secondary, borderColor: t.border }
-    }
-    return { color: t.mutedFg, backgroundColor: t.bg, borderColor: t.border }
-  }
-
-  function statusLabel(status: DraftStatus | undefined) {
-    if (!status) return 'New'
-    return status[0].toUpperCase() + status.slice(1)
-  }
-
-  function statusFor(entry: LibraryEntry, period: string) {
-    return selectedProfile
-      ? store.listDrafts(selectedProfile.id, entry.formCode).find((item) => item.period === period)?.status
-      : undefined
-  }
-
-  function periodCard(entry: LibraryEntry) {
-    const form = catalog.find((item) => item.code === entry.formCode)
-    if (!form || !selectedProfile) return null
-    const choices = periodChoices(selectedProfile.year, form.frequency)
+  function sidebar() {
+    if (sidebarCollapsed) return null
     return (
-      <div key={entry.formCode} style={{ display: 'flex', flexDirection: 'column', gap: 12, width: '32.5%', minWidth: 340, flexGrow: 1, padding: 14, borderWidth: 1, borderColor: t.border, borderRadius: 10, backgroundColor: t.chrome }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
-          <text style={{ color: t.fg, fontSize: 22, fontWeight: 800, width: 100, minWidth: 100 }}>{displayFormCode(entry.formCode)}</text>
-          <text style={{ color: t.mutedFg, fontSize: 10, padding: 5, borderRadius: 12, backgroundColor: t.secondary }}>{formCategory(entry.formCode)}</text>
-        </div>
-        <text style={{ color: t.fg, fontSize: 12, minWidth: 0, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{cleanFormTitle(form.label)}</text>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-          <text style={{ color: t.mutedFg, fontSize: 11 }}>{`Year ${selectedProfile.year}:`}</text>
-          <text style={{ color: t.mutedFg, fontSize: 10, textAlign: 'right' }}>Dev preview (not yet certified)</text>
-        </div>
-        {form.frequency === 'annual' && (
+      <div
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          width: 248,
+          minWidth: 248,
+          padding: 8,
+          paddingTop: 4,
+          gap: 4,
+          backgroundColor: t.bg,
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           <div
-            testId={`period-${entry.formCode}-annual`}
-            onClick={() => navOpenForm(entry, choices[0].period)}
-            style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 9, borderWidth: 1, borderColor: t.border, borderRadius: 7, cursor: 'pointer', backgroundColor: t.bg }}
+            testId="sidebar-search"
+            onClick={() => setOverlay({ kind: 'search' })}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              flexGrow: 1,
+              height: 32,
+              paddingLeft: 9,
+              paddingRight: 6,
+              borderRadius: 7,
+              borderWidth: 1,
+              borderColor: t.borderStrong,
+              backgroundColor: t.surface,
+              cursor: 'pointer',
+              hover: { borderColor: t.fg3 },
+            }}
           >
-            <text style={{ color: t.primary, fontSize: 12, fontWeight: 600 }}>+ File Annual Return</text>
+            <Icon name="search" size={14} color={t.fg3} />
+            <text style={{ color: t.fg3, fontSize: F_BODY, flexGrow: 1 }}>Search</text>
+            <Kbd>Ctrl K</Kbd>
+          </div>
+          <IBtn testId="sidebar-new" icon="plus" size={32} iconSize={16} onClick={() => setOverlay({ kind: 'startReturn' })} />
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 1, paddingTop: 4 }}>
+          {navRow('home', 'Home', page === 'home', () => goto('home'), 'nav-home')}
+          {navRow('calendar', 'Calendar', page === 'calendar', () => goto('calendar'), 'nav-calendar')}
+          {navRow('file', 'Filings', page === 'filings', () => goto('filings'), 'nav-filings')}
+        </div>
+        {showRecent && recentDrafts.length > 0 && (
+          <div style={{ display: 'flex', flexDirection: 'column', paddingTop: 8 }}>
+            <text style={{ color: t.fg3, fontSize: F_CAP, fontWeight: 600, paddingLeft: 8, paddingBottom: 4 }}>
+              Recent
+            </text>
+            {recentDrafts.map((item) => {
+              const owner = profileById(item.profileId)
+              return (
+                <div
+                  key={item.id}
+                  testId={`recent-${item.id}`}
+                  onClick={() => openDraftById(item)}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 8,
+                    height: 32,
+                    paddingLeft: 8,
+                    paddingRight: 8,
+                    borderRadius: 7,
+                    cursor: 'pointer',
+                    hover: { backgroundColor: t.hover },
+                  }}
+                >
+                  <Icon name="file" size={14} color={t.fg3} />
+                  <text style={{ color: t.fg2, fontSize: F_META, ...NUM_STYLE, minWidth: 56 }}>
+                    {displayFormCode(item.formCode)}
+                  </text>
+                  <text
+                    style={{
+                      color: t.fg2,
+                      fontSize: F_META,
+                      flexGrow: 1,
+                      minWidth: 0,
+                      whiteSpace: 'nowrap',
+                      textOverflow: 'ellipsis',
+                      overflow: 'hidden',
+                    }}
+                  >
+                    {`${periodLabel(item.period)} · ${owner?.taxpayer.name ?? ''}`}
+                  </text>
+                </div>
+              )
+            })}
           </div>
         )}
-        {form.frequency !== 'annual' && (
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
-          {choices.map((choice) => {
-            const status = statusFor(entry, choice.period)
-            const statusTokens = statusStyle(status)
-            return (
-              <div
-                key={choice.period}
-                testId={`period-${entry.formCode}-${choice.period}`}
-                onClick={() => navOpenForm(entry, choice.period)}
-                style={{
-                  display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'center',
-                  padding: 7, width: 85, minWidth: 85, height: 60,
-                  borderWidth: 1, borderColor: statusTokens.borderColor, borderRadius: 7,
-                  cursor: 'pointer', backgroundColor: statusTokens.backgroundColor,
-                }}
-              >
-                <text style={{ color: t.fg, fontSize: 12 }}>{choice.label}</text>
-                <text style={{ color: statusTokens.color, fontSize: 10 }}>{statusLabel(status)}</text>
+        <div style={{ flexGrow: 1 }} />
+        {navRow('settings', 'Settings', page === 'settings', () => goto('settings'), 'nav-settings')}
+        <div style={{ position: 'relative' }}>
+          <div
+            testId="user-card"
+            onClick={() => setMenuOpen((value) => !value)}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 9,
+              padding: 8,
+              borderRadius: 8,
+              cursor: 'pointer',
+              hover: { backgroundColor: t.hover },
+            }}
+          >
+            <Avatar name={displayName || 'Devin'} size={28} />
+            <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
+              <text style={{ color: t.fg, fontSize: F_META, fontWeight: 600, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
+                {displayName || 'Set your name'}
+              </text>
+              <text style={{ color: t.fg3, fontSize: F_CAP, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
+                {email || 'No email set'}
+              </text>
+            </div>
+            <Icon name="chevDown" size={14} color={t.fg3} />
+          </div>
+          {menuOpen && (
+            <div
+              onMouseDownOutside={() => setMenuOpen(false)}
+              style={{
+                position: 'absolute',
+                bottom: 46,
+                left: 0,
+                right: 0,
+                display: 'flex',
+                flexDirection: 'column',
+                padding: 4,
+                borderRadius: 9,
+                borderWidth: 1,
+                borderColor: t.border,
+                backgroundColor: t.raised,
+              }}
+            >
+              <div style={{ padding: 8, paddingLeft: 10 }}>
+                <text style={{ color: t.fg3, fontSize: F_CAP }}>Signed in as {email || 'no email set'}</text>
               </div>
-            )
-          })}
+              <div
+                testId="menu-account"
+                onClick={() => {
+                  setMenuOpen(false)
+                  goto('settings')
+                }}
+                style={{ display: 'flex', alignItems: 'center', gap: 8, height: 30, paddingLeft: 8, paddingRight: 8, borderRadius: 6, cursor: 'pointer', hover: { backgroundColor: t.hover } }}
+              >
+                <Icon name="settings" size={14} color={t.fg2} />
+                <text style={{ color: t.fg, fontSize: F_META }}>Account settings</text>
+              </div>
+            </div>
+          )}
         </div>
+      </div>
+    )
+  }
+
+  // -- Right panel (taxpayer card / notifications) ---------------------------
+
+  function rightPanel() {
+    if (!panel) return null
+    if (panel === 'notifications') {
+      return (
+        <div style={{ display: 'flex', flexDirection: 'column', width: 320, minWidth: 320, backgroundColor: t.bg }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: 12, paddingLeft: 16, paddingRight: 12 }}>
+            <text style={{ color: t.fg, fontSize: F_EMPH, fontWeight: 600 }}>Notifications</text>
+            <div
+              testId="mark-all-read"
+              onClick={() => {
+                const now = String(Date.now())
+                store.setSetting('lastReadNotifs', now)
+                setLastRead(Number(now))
+              }}
+              style={{ cursor: 'pointer', padding: 4 }}
+            >
+              <text style={{ color: t.accent, fontSize: F_META }}>Mark all read</text>
+            </div>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 2, flexGrow: 1, minHeight: 0, overflow: 'scroll', paddingLeft: 8, paddingRight: 8, paddingBottom: 12 }}>
+            {notifications.length === 0 && (
+              <text style={{ color: t.fg3, fontSize: F_META, padding: 12 }}>Nothing to review.</text>
+            )}
+            {notifications.map((item) => {
+              const icon: IconName =
+                item.kind === 'warning' || item.kind === 'danger'
+                  ? 'alert'
+                  : item.kind === 'success'
+                    ? 'checkCircle'
+                    : item.kind === 'plain'
+                      ? 'box'
+                      : 'info'
+              const iconColor =
+                item.kind === 'warning'
+                  ? t.warning
+                  : item.kind === 'danger'
+                    ? t.danger
+                    : item.kind === 'success'
+                      ? t.success
+                      : t.fg3
+              const unread = item.ts > lastRead
+              return (
+                <div
+                  key={item.id}
+                  style={{
+                    display: 'flex',
+                    gap: 9,
+                    padding: 9,
+                    borderRadius: 8,
+                    hover: { backgroundColor: t.hover },
+                  }}
+                >
+                  <Icon name={icon} size={15} color={iconColor} />
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 2, flexGrow: 1, minWidth: 0 }}>
+                    <text style={{ color: t.fg, fontSize: F_META }}>{item.title}</text>
+                    <text style={{ color: t.fg3, fontSize: F_CAP, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{item.subtitle}</text>
+                    <text style={{ color: t.fg3, fontSize: 10 }}>{fmtDateTime(item.ts)}</text>
+                  </div>
+                  {unread && (
+                    <div style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: t.accent, marginTop: 4 }} />
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )
+    }
+    // panel === 'taxpayer'
+    const formsCount = selectedLibrary.length
+    const branches = taxpayer?.branches ?? []
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', width: 320, minWidth: 320, backgroundColor: t.bg, overflow: 'scroll' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 16 }}>
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
+            <Avatar name={taxpayer ? taxpayer.name : '?'} size={56} />
+            <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
+              <text style={{ color: t.fg, fontSize: F_EMPH, fontWeight: 600, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
+                {taxpayer?.name || 'No taxpayer'}
+              </text>
+              {taxpayer && (
+                <text style={{ color: t.fg3, fontSize: F_META, ...NUM_STYLE }}>{formatTin(taxpayer.tin9)}</text>
+              )}
+            </div>
+            {taxpayer && (
+              <IBtn
+                testId="panel-edit"
+                icon="pencil"
+                size={26}
+                iconSize={13}
+                onClick={() => {
+                  setPanel(null)
+                  goto('taxpayer', { tab: 'profile' })
+                }}
+              />
+            )}
+          </div>
+          {branch && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <Icon name="branch" size={14} color={t.fg3} />
+                <text style={{ color: t.fg2, fontSize: F_META }}>{`${branch.code} · ${branch.name}`}</text>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <Icon name="pin" size={14} color={t.fg3} />
+                <text style={{ color: t.fg2, fontSize: F_META }}>{branch.facts.address || 'No address'}</text>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <Icon name="building" size={14} color={t.fg3} />
+                <text style={{ color: t.fg2, fontSize: F_META }}>{branch.facts.rdo ? `RDO ${branch.facts.rdo}` : 'No RDO'}</text>
+              </div>
+            </div>
+          )}
+          {taxpayer && (
+            <div style={{ display: 'flex', flexDirection: 'column', borderTopWidth: 1, borderColor: t.border, paddingTop: 10 }}>
+              <text style={{ color: t.fg3, fontSize: F_CAP, fontWeight: 600, paddingBottom: 4 }}>Open</text>
+              {([['profile', 'Profile'], ['forms', `Forms${formsCount ? ` · ${formsCount}` : ''}`], ['templates', 'Templates']] as const).map(([tpTab, label]) => (
+                <div
+                  key={tpTab}
+                  testId={`panel-open-${tpTab}`}
+                  onClick={() => {
+                    setPanel(null)
+                    goto('taxpayer', { tab: tpTab })
+                  }}
+                  style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', height: 30, paddingLeft: 8, paddingRight: 8, borderRadius: 6, cursor: 'pointer', hover: { backgroundColor: t.hover } }}
+                >
+                  <text style={{ color: t.fg, fontSize: F_META }}>{label}</text>
+                  <Icon name="chevRight" size={14} color={t.fg3} />
+                </div>
+              ))}
+            </div>
+          )}
+          {branches.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', borderTopWidth: 1, borderColor: t.border, paddingTop: 10 }}>
+              <text style={{ color: t.fg3, fontSize: F_CAP, fontWeight: 600, paddingBottom: 4 }}>Branches</text>
+              {branches.map((itemBranch) => {
+                const active = selectedBranchId === branchId(taxpayer!.tin9, itemBranch.code)
+                return (
+                  <div
+                    key={itemBranch.code}
+                    testId={`panel-branch-${itemBranch.code}`}
+                    onClick={() => {
+                      setPanel(null)
+                      chooseBranch(taxpayer!.tin9, itemBranch.code)
+                    }}
+                    style={{ display: 'flex', alignItems: 'center', gap: 8, height: 30, paddingLeft: 8, paddingRight: 8, borderRadius: 6, cursor: 'pointer', backgroundColor: active ? t.selected : 'rgba(0,0,0,0)', hover: { backgroundColor: active ? t.selected : t.hover } }}
+                  >
+                    <text style={{ color: t.fg, fontSize: F_META, flexGrow: 1 }}>{itemBranch.name}</text>
+                    <text style={{ color: t.fg3, fontSize: F_CAP, ...NUM_STYLE }}>{itemBranch.code}</text>
+                    {active && <Icon name="check" size={14} color={t.accent} />}
+                  </div>
+                )
+              })}
+              <div
+                testId="panel-add-branch"
+                onClick={() => {
+                  setPanel(null)
+                  setShowNewBranch(true)
+                  goto('taxpayer', { tab: 'profile' })
+                }}
+                style={{ display: 'flex', alignItems: 'center', gap: 8, height: 30, paddingLeft: 8, borderRadius: 6, cursor: 'pointer', hover: { backgroundColor: t.hover } }}
+              >
+                <Icon name="plus" size={14} color={t.fg3} />
+                <text style={{ color: t.fg3, fontSize: F_META }}>Add branch</text>
+              </div>
+            </div>
+          )}
+          {tree.length > 1 && (
+            <div style={{ display: 'flex', flexDirection: 'column', borderTopWidth: 1, borderColor: t.border, paddingTop: 10 }}>
+              <text style={{ color: t.fg3, fontSize: F_CAP, fontWeight: 600, paddingBottom: 4 }}>Switch taxpayer</text>
+              {tree.filter((item) => item.tin9 !== selectedTin).map((item) => (
+                <div
+                  key={item.tin9}
+                  testId={`panel-switch-${item.tin9}`}
+                  onClick={() => chooseTaxpayer(item.tin9)}
+                  style={{ display: 'flex', alignItems: 'center', gap: 8, height: 32, paddingLeft: 4, paddingRight: 8, borderRadius: 6, cursor: 'pointer', hover: { backgroundColor: t.hover } }}
+                >
+                  <Avatar name={item.name || item.tin9} size={20} />
+                  <text style={{ color: t.fg, fontSize: F_META, flexGrow: 1, minWidth: 0, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{item.name || formatTin(item.tin9)}</text>
+                  <text style={{ color: t.fg3, fontSize: F_CAP, ...NUM_STYLE }}>{formatTin(item.tin9).slice(0, 11)}</text>
+                </div>
+              ))}
+            </div>
+          )}
+          <div
+            testId="panel-new-taxpayer"
+            onClick={() => {
+              setPanel(null)
+              setShowNewTaxpayer(true)
+              goto('taxpayer', { tab: 'profile' })
+            }}
+            style={{ display: 'flex', alignItems: 'center', gap: 8, height: 30, paddingLeft: 8, borderTopWidth: 1, borderColor: t.border, paddingTop: 10, cursor: 'pointer' }}
+          >
+            <Icon name="plus" size={14} color={t.fg3} />
+            <text style={{ color: t.fg3, fontSize: F_META }}>New taxpayer</text>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // -- Due/filed row renderer (shared by Home, Calendar, Filings) ------------
+
+  function dateBox(iso: string) {
+    const date = new Date(`${iso}T00:00:00`)
+    return (
+      <div
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          width: 44,
+          minWidth: 44,
+          height: 44,
+          borderRadius: 8,
+          borderWidth: 1,
+          borderColor: t.border,
+          backgroundColor: t.surface,
+        }}
+      >
+        <text style={{ color: t.fg3, fontSize: 9, fontWeight: 600 }}>{MONTH_ABBR[date.getMonth()]}</text>
+        <text style={{ color: t.fg, fontSize: 15, fontWeight: 700 }}>{date.getDate()}</text>
+      </div>
+    )
+  }
+
+  function statusPill(kind: 'draft' | 'notStarted' | 'filed' | 'overdue' | 'days' | string, label: string) {
+    const tone =
+      kind === 'draft'
+        ? 'accent'
+        : kind === 'filed'
+          ? 'success'
+          : kind === 'overdue'
+            ? 'danger'
+            : kind === 'days'
+              ? 'warning'
+              : 'muted'
+    return <Chip tone={tone as 'accent'}>{label}</Chip>
+  }
+
+  function dueRow(row: (typeof dueRows)[number], key: string) {
+    const owner = profileById(row.profileId)
+    const days = daysUntil(row.dueDate)
+    const entry = catalogByCode.get(row.formCode)
+    return (
+      <div
+        key={key}
+        testId={`due-${row.formCode}-${row.period}`}
+        onClick={() => openDueRow(row)}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 12,
+          height: 60,
+          paddingLeft: 8,
+          paddingRight: 8,
+          borderRadius: 9,
+          cursor: 'pointer',
+          hover: { backgroundColor: t.hover },
+        }}
+      >
+        {dateBox(row.dueDate)}
+        <text style={{ color: t.fg3, fontSize: F_META, ...NUM_STYLE, width: 68, minWidth: 68 }}>
+          {displayFormCode(row.formCode)}
+        </text>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 1, flexGrow: 1, minWidth: 0 }}>
+          <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 500, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
+            {`${displayFormCode(row.formCode)} · ${periodLabel(row.period)}`}
+          </text>
+          <text style={{ color: t.fg3, fontSize: F_META, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
+            {`${cleanFormTitle(entry?.label ?? '')} — ${owner?.taxpayer.name ?? row.tin9} · ${owner?.branchName ?? row.branchCode}`}
+          </text>
+        </div>
+        <text style={{ color: days < 0 ? t.danger : days <= 14 ? t.warning : t.fg3, fontSize: F_META, width: 88, minWidth: 88, textAlign: 'right' }}>
+          {days < 0 ? `${-days}d overdue` : days === 0 ? 'Due today' : `In ${days} day${days === 1 ? '' : 's'}`}
+        </text>
+        <div style={{ width: 96, minWidth: 96, display: 'flex', justifyContent: 'flex-end' }}>
+          {row.draftStatus === 'draft' ? statusPill('draft', 'Draft') : statusPill('notStarted', 'Not started')}
+        </div>
+      </div>
+    )
+  }
+
+  function filedRow(item: Draft, key: string) {
+    const owner = profileById(item.profileId)
+    const inLibrary = owner
+      ? store.listLibrary(item.profileId).some((entry) => entry.formCode === item.formCode)
+      : false
+    const entry = catalogByCode.get(item.formCode)
+    return (
+      <div
+        key={key}
+        testId={`filed-${item.id}`}
+        onClick={() => openDraftById(item)}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 12,
+          height: 52,
+          paddingLeft: 8,
+          paddingRight: 8,
+          borderRadius: 9,
+          cursor: 'pointer',
+          hover: { backgroundColor: t.hover },
+        }}
+      >
+        <text style={{ color: t.fg3, fontSize: F_META, ...NUM_STYLE, width: 68, minWidth: 68 }}>
+          {displayFormCode(item.formCode)}
+        </text>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 1, flexGrow: 1, minWidth: 0 }}>
+          <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 500, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
+            {`${displayFormCode(item.formCode)} · ${periodLabel(item.period)}`}
+          </text>
+          <text style={{ color: t.fg3, fontSize: F_META, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
+            {`${cleanFormTitle(entry?.label ?? '')} — ${owner?.taxpayer.name ?? ''} · ${owner?.branchName ?? ''}`}
+          </text>
+        </div>
+        <text style={{ color: t.fg3, fontSize: F_META, width: 88, minWidth: 88, textAlign: 'right' }}>
+          {fmtDate(item.updatedAt)}
+        </text>
+        <div style={{ width: 110, minWidth: 110, display: 'flex', justifyContent: 'flex-end' }}>
+          {inLibrary ? (
+            <Btn small kind="secondary" onClick={() => useAsTemplate(item)}>Use as template</Btn>
+          ) : (
+            statusPill('filed', '✓ Filed')
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  // -- Views -----------------------------------------------------------------
+
+  function homePage() {
+    const hour = new Date().getHours()
+    const greeting = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening'
+    const first = (displayName || 'there').split(' ')[0]
+    const next30 = dueRows.filter((row) => daysUntil(row.dueDate) <= 30)
+    const taxpayerCount = new Set(next30.map((row) => row.tin9)).size
+    const today = new Date().toLocaleDateString('en', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+        <text style={{ color: t.fg, fontSize: F_PAGE, fontWeight: 700 }}>{`${greeting}, ${first}`}</text>
+        <text style={{ color: t.fg3, fontSize: F_BODY, paddingBottom: 18 }}>
+          {`${next30.length} return${next30.length === 1 ? '' : 's'} are due in the next 30 days across ${taxpayerCount} taxpayer${taxpayerCount === 1 ? '' : 's'}. ${today}.`}
+        </text>
+        <SectionLabel first>Due in the next 30 days</SectionLabel>
+        <div style={{ display: 'flex', flexDirection: 'column' }}>
+          {next30.length === 0 && (
+            <text style={{ color: t.fg3, fontSize: F_META, padding: 14 }}>Nothing due in the next 30 days.</text>
+          )}
+          {next30.map((row) => dueRow(row, `${row.profileId}-${row.formCode}-${row.period}`))}
+        </div>
+        <SectionLabel>Recently filed</SectionLabel>
+        <div style={{ display: 'flex', flexDirection: 'column' }}>
+          {filedDrafts.length === 0 && (
+            <text style={{ color: t.fg3, fontSize: F_META, padding: 14 }}>No filed returns yet.</text>
+          )}
+          {filedDrafts.slice(0, 8).map((item) => filedRow(item, item.id))}
+        </div>
+      </div>
+    )
+  }
+
+  function calendarPage() {
+    const years = [...new Set(allProfiles(tree).map((profile) => profile.year))].sort()
+    const yearLabel = years.length ? String(Math.max(...years)) : String(new Date().getFullYear())
+    const byMonth = new Map<string, typeof dueRows>()
+    for (const row of dueRows) {
+      const month = row.dueDate.slice(0, 7)
+      const list = byMonth.get(month) ?? []
+      list.push(row)
+      byMonth.set(month, list)
+    }
+    const months = [...byMonth.keys()].sort()
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+        <text style={{ color: t.fg, fontSize: F_PAGE, fontWeight: 700 }}>Calendar</text>
+        <text style={{ color: t.fg3, fontSize: F_BODY, paddingBottom: 18 }}>
+          {`Every deadline for the forms your taxpayers file, from the ${yearLabel} BIR tax calendar.`}
+        </text>
+        {months.length === 0 && (
+          <text style={{ color: t.fg3, fontSize: F_META, padding: 14 }}>No pending deadlines.</text>
+        )}
+        {months.map((month) => {
+          const [year, mm] = month.split('-')
+          const label = `${['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'][Number(mm) - 1]} ${year}`
+          return (
+            <div key={month} style={{ display: 'flex', flexDirection: 'column' }}>
+              <SectionLabel first={month === months[0]}>{label}</SectionLabel>
+              {byMonth.get(month)!.map((row) => dueRow(row, `${month}-${row.profileId}-${row.formCode}-${row.period}`))}
+            </div>
+          )
+        })}
+      </div>
+    )
+  }
+
+  function filingsPage() {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+        <text style={{ color: t.fg, fontSize: F_PAGE, fontWeight: 700 }}>Filings</text>
+        <text style={{ color: t.fg3, fontSize: F_BODY, paddingBottom: 18 }}>
+          Filed returns stay exactly as submitted. Use one as a template to prefill the next period.
+        </text>
+        {filedDrafts.length === 0 && (
+          <text style={{ color: t.fg3, fontSize: F_META, padding: 14 }}>No filed returns yet.</text>
+        )}
+        {filedDrafts.map((item) => filedRow(item, item.id))}
+      </div>
+    )
+  }
+
+  // -- Taxpayer page ---------------------------------------------------------
+
+  function disclosure(id: string, title: string, subtitle: string, aside: ReactNode, body: ReactNode, first = false) {
+    const open = openSecs.has(id)
+    const toggle = () =>
+      setOpenSecs((current) => {
+        const next = new Set(current)
+        if (next.has(id)) next.delete(id)
+        else next.add(id)
+        return next
+      })
+    return (
+      <div>
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            height: 44,
+            paddingLeft: 12,
+            paddingRight: 16,
+            borderTopWidth: first ? 0 : 1,
+            borderColor: t.border,
+          }}
+        >
+          <div
+            onClick={toggle}
+            style={{ display: 'flex', alignItems: 'center', gap: 8, flexGrow: 1, minWidth: 0, height: 44, cursor: 'pointer' }}
+          >
+            <Icon name={open ? 'chevDown' : 'chevRight'} size={16} color={t.fg3} />
+            <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
+              <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 600 }}>{title}</text>
+              <text style={{ color: t.fg3, fontSize: F_META }}>{subtitle}</text>
+            </div>
+          </div>
+          {open && aside}
+        </div>
+        {open && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, paddingTop: 4, paddingRight: 20, paddingBottom: 20, paddingLeft: 36 }}>{body}</div>
         )}
       </div>
     )
   }
 
-  function detailsContent() {
-    if (showNewTaxpayer) {
-      const setNew = (field: keyof NewTaxpayerForm, value: string) =>
-        setNewTaxpayer((current) => ({ ...current, [field]: value }))
+  function factRow(label: string, value: string, opts: { mono?: boolean; copy?: string; hint?: string } = {}) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, minHeight: 26 }}>
+        <text style={{ color: t.fg2, fontSize: F_META, width: 130, minWidth: 130 }}>{label}</text>
+        <text style={{ color: opts.hint ? t.fg2 : t.fg, fontSize: F_BODY, flexGrow: 1, minWidth: 0, ...(opts.mono ? NUM_STYLE : {}) }}>
+          {value || '—'}
+        </text>
+        {opts.hint && <Chip tone="muted">{opts.hint}</Chip>}
+        {opts.copy && (
+          <IBtn
+            icon="copy"
+            size={24}
+            iconSize={12}
+            onClick={() => showToast('TIN copied.')}
+          />
+        )}
+      </div>
+    )
+  }
+
+  function editRow(label: string, value: string, onChange: (value: string) => void, opts: { mono?: boolean; disabled?: boolean } = {}) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, minHeight: 30 }}>
+        <text style={{ color: t.fg2, fontSize: F_META, width: 130, minWidth: 130 }}>{label}</text>
+        <input
+          value={value}
+          readOnly={opts.disabled}
+          onChange={(event) => onChange(event.value ?? '')}
+          style={{
+            height: 30,
+            padding: 6,
+            paddingLeft: 8,
+            flexGrow: 1,
+            minWidth: 0,
+            color: opts.disabled ? t.fg3 : t.fg,
+            backgroundColor: opts.disabled ? t.hover : t.surface,
+            borderWidth: 1,
+            borderColor: t.borderStrong,
+            borderRadius: 6,
+            fontSize: F_BODY,
+            ...(opts.mono ? NUM_STYLE : {}),
+          }}
+        />
+      </div>
+    )
+  }
+
+  function editActions(onSave: () => void, section: string) {
+    if (editSec !== section) return null
+    return (
+      <div style={{ display: 'flex', gap: 8, paddingTop: 4, justifyContent: 'flex-end' }}>
+        <Btn small kind="ghost" onClick={() => setEditSec(null)}>Cancel</Btn>
+        <Btn small onClick={onSave}>Save changes</Btn>
+      </div>
+    )
+  }
+
+  function inheritEditRow(label: string, key: 'rdo' | 'zip' | 'address' | 'phone' | 'email', resolvedValue: string) {
+    const inheriting = branchInherit[key] !== false
+    return (
+      <div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, minHeight: 30 }}>
+          <text style={{ color: t.fg2, fontSize: F_META, width: 130, minWidth: 130 }}>{label}</text>
+          <input
+            value={inheriting ? resolvedValue : String(branchEdit[key] ?? '')}
+            readOnly={inheriting}
+            onChange={(event) => setBranchEdit((current) => ({ ...current, [key]: event.value ?? '' }))}
+            style={{
+              height: 30,
+              padding: 6,
+              paddingLeft: 8,
+              flexGrow: 1,
+              minWidth: 0,
+              color: inheriting ? t.fg3 : t.fg,
+              backgroundColor: inheriting ? t.hover : t.surface,
+              borderWidth: 1,
+              borderColor: t.borderStrong,
+              borderRadius: 6,
+              fontSize: F_BODY,
+            }}
+          />
+        </div>
+        <div
+          style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 140, minHeight: 24 }}
+        >
+          <Switch on={inheriting} onToggle={(value) => setBranchInherit((current) => ({ ...current, [key]: value }))} />
+          <text style={{ color: t.fg3, fontSize: F_META }}>Same as head office</text>
+        </div>
+      </div>
+    )
+  }
+
+  function taxpayerProfileTab() {
+    if (!taxpayer || !branch) {
       return (
-        <Panel title="New taxpayer" subtitle="Add a taxpayer and its head office facts.">
+        <Card title="No taxpayer selected" subtitle="Choose a taxpayer from the taxpayer menu or add a new one.">
+          <Btn kind="secondary" onClick={() => setShowNewTaxpayer(true)}>New taxpayer</Btn>
+        </Card>
+      )
+    }
+    const facts = branch.facts
+    const inherited = facts.inherited
+    const editBtn = (sec: string) => (
+      <IBtn
+        testId={`edit-${sec}`}
+        icon="pencil"
+        size={26}
+        iconSize={13}
+        onClick={() => setEditSec(editSec === sec ? null : sec)}
+      />
+    )
+    const sections = (
+      <div style={{ borderWidth: 1, borderColor: t.border, borderRadius: 12, backgroundColor: t.surface, overflow: 'hidden' }}>
+        {disclosure(
+          'taxpayer',
+          'Taxpayer',
+          'Shared by every branch',
+          editBtn('taxpayer'),
+          editSec === 'taxpayer' ? (
+            <>
+              {editRow('Registered name', taxpayerEdit.name, (value) => setTaxpayerEdit((current) => ({ ...current, name: value })))}
+              {factRow('TIN', formatTin(taxpayer.tin9), { mono: true })}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, minHeight: 30 }}>
+                <text style={{ color: t.fg2, fontSize: F_META, width: 130, minWidth: 130 }}>Type</text>
+                <Seg<'individual' | 'non-individual'>
+                  options={[
+                    { value: 'individual', label: 'Individual' },
+                    { value: 'non-individual', label: 'Non-individual' },
+                  ]}
+                  value={taxpayerEdit.type}
+                  onChange={(value) => setTaxpayerEdit((current) => ({ ...current, type: value }))}
+                />
+              </div>
+              {editRow('Birth date', taxpayerEdit.birthDate, (value) => setTaxpayerEdit((current) => ({ ...current, birthDate: value })))}
+              {editActions(saveTaxpayerDetails, 'taxpayer')}
+            </>
+          ) : (
+            <>
+              {factRow('Registered name', taxpayer.name)}
+              {factRow('TIN', formatTin(taxpayer.tin9), { mono: true, copy: formatTin(taxpayer.tin9) })}
+              {factRow('Type', taxpayer.type === 'individual' ? 'Individual' : 'Non-individual')}
+              {factRow('Birth date', taxpayer.birthDate ?? '')}
+            </>
+          ),
+          true,
+        )}
+        {disclosure(
+          'branch',
+          `Branch · ${branch.name}`,
+          `${branch.code === '00000' ? 'Head office' : `Branch ${branch.code}`}`,
+          editBtn('branch'),
+          editSec === 'branch' ? (
+            <>
+              {factRow('Branch code', branch.code, { mono: true })}
+              {editRow('Branch name', branchEdit.name, (value) => setBranchEdit((current) => ({ ...current, name: value })))}
+              {branch.code === '00000'
+                ? editRow('RDO', branchEdit.rdo, (value) => setBranchEdit((current) => ({ ...current, rdo: value })))
+                : inheritEditRow('RDO', 'rdo', facts.rdo)}
+              {editActions(saveBranchDetails, 'branch')}
+            </>
+          ) : (
+            <>
+              {factRow('Branch code', branch.code, { mono: true })}
+              {factRow('Branch name', branch.name)}
+              {factRow('RDO', facts.rdo, { hint: inherited.rdo ? 'Head office' : undefined })}
+            </>
+          ),
+        )}
+        {disclosure(
+          'contact',
+          'Address and contact',
+          'Used on every return',
+          editBtn('contact'),
+          editSec === 'contact' ? (
+            <>
+              {branch.code === '00000' ? (
+                <>
+                  {editRow('Registered address', branchEdit.address, (value) => setBranchEdit((current) => ({ ...current, address: value })))}
+                  {editRow('ZIP', branchEdit.zip, (value) => setBranchEdit((current) => ({ ...current, zip: value })))}
+                  {editRow('Phone', branchEdit.phone, (value) => setBranchEdit((current) => ({ ...current, phone: value })))}
+                  {editRow('Email', branchEdit.email, (value) => setBranchEdit((current) => ({ ...current, email: value })))}
+                </>
+              ) : (
+                <>
+                  {inheritEditRow('Registered address', 'address', facts.address)}
+                  {inheritEditRow('ZIP', 'zip', facts.zip)}
+                  {inheritEditRow('Phone', 'phone', facts.phone)}
+                  {inheritEditRow('Email', 'email', facts.email)}
+                </>
+              )}
+              {editActions(saveBranchDetails, 'contact')}
+            </>
+          ) : (
+            <>
+              {factRow('Registered address', facts.address, { hint: inherited.address ? 'Head office' : undefined })}
+              {factRow('ZIP', facts.zip, { hint: inherited.zip ? 'Head office' : undefined })}
+              {factRow('Phone', facts.phone, { hint: inherited.phone ? 'Head office' : undefined })}
+              {factRow('Email', facts.email, { hint: inherited.email ? 'Head office' : undefined })}
+            </>
+          ),
+        )}
+        {disclosure(
+          'email',
+          'Email, security and export',
+          'Set once for the taxpayer',
+          null,
+          <text style={{ color: t.fg3, fontSize: F_META }}>eBIR notification email, signing and export options arrive with the filing pipeline.</text>,
+        )}
+      </div>
+    )
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        {sections}
+        {showNewBranch && (
+          <Card title="New branch" subtitle="Branches inherit head-office facts until overridden.">
+            <div style={{ display: 'flex', gap: 10 }}>
+              <FieldInput label="Branch code" value={newBranch.code} placeholder="00001" onChange={(value) => setNewBranch((current) => ({ ...current, code: value.replace(/\D/g, '').slice(0, 5) }))} />
+              <FieldInput label="Branch name" value={newBranch.name} placeholder="Cebu" onChange={(value) => setNewBranch((current) => ({ ...current, name: value }))} />
+            </div>
+            <div style={{ display: 'flex', gap: 10 }}>
+              <FieldInput label="RDO override" value={newBranch.rdo} onChange={(value) => setNewBranch((current) => ({ ...current, rdo: value }))} />
+              <FieldInput label="ZIP override" value={newBranch.zip} onChange={(value) => setNewBranch((current) => ({ ...current, zip: value }))} />
+            </div>
+            <FieldInput label="Address override" value={newBranch.address} onChange={(value) => setNewBranch((current) => ({ ...current, address: value }))} />
+            {branchError && <text style={{ color: t.danger, fontSize: F_META }}>{branchError}</text>}
+            <div style={{ display: 'flex', gap: 8 }}>
+              <Btn small onClick={addBranch} testId="add-branch-save">Create branch</Btn>
+              <Btn small kind="ghost" onClick={() => setShowNewBranch(false)}>Cancel</Btn>
+            </div>
+          </Card>
+        )}
+      </div>
+    )
+  }
+
+  function taxpayerFormsTab() {
+    if (!taxpayer || !branch) {
+      return <text style={{ color: t.fg3, fontSize: F_META, padding: 14 }}>Select a taxpayer first.</text>
+    }
+    if (!selectedProfile) {
+      return (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <Card title="No tax year yet" subtitle="A year opens the form library for this branch.">
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <FieldInput label="Tax year" value={yearInput} onChange={(value) => setYearInput(value.replace(/\D/g, '').slice(0, 4))} />
+              <Btn small onClick={addYear} testId="add-year-save">Create year</Btn>
+            </div>
+          </Card>
+        </div>
+      )
+    }
+    const catalogFiltered = catalog.filter((entry) => {
+      const needle = formSearch.trim().toLowerCase()
+      if (!needle) return true
+      return entry.code.toLowerCase().includes(needle) || entry.label.toLowerCase().includes(needle)
+    })
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          {branch.years.map((profile) => (
+            <div
+              key={profile.id}
+              testId={`year-${profile.year}`}
+              onClick={() => navTo({ ...navNow, profileId: profile.id })}
+              style={{ display: 'flex', alignItems: 'center', height: 24, paddingLeft: 10, paddingRight: 10, borderRadius: 12, cursor: 'pointer', backgroundColor: profile.id === selectedProfile.id ? t.accentSoft : t.hover }}
+            >
+              <text style={{ color: profile.id === selectedProfile.id ? t.accent : t.fg2, fontSize: F_META, fontWeight: 500 }}>{profile.year}</text>
+            </div>
+          ))}
+          <Btn small kind="ghost" icon="plus" testId="add-year-toggle" onClick={() => setShowNewYear((value) => !value)}>Add year</Btn>
+          {showNewYear && (
+            <>
+              <input
+                value={yearInput}
+                onChange={(event) => setYearInput((event.value ?? '').replace(/\D/g, '').slice(0, 4))}
+                style={{ width: 76, height: 28, padding: 5, color: t.fg, backgroundColor: t.surface, borderWidth: 1, borderColor: t.borderStrong, borderRadius: 6, fontSize: F_META }}
+              />
+              <Btn small kind="secondary" testId="add-year-save" onClick={addYear}>Create</Btn>
+            </>
+          )}
+          <div style={{ flexGrow: 1 }} />
+          <input
+            testId="form-filter"
+            value={formSearch}
+            placeholder="Filter forms"
+            onChange={(event) => setFormSearch(event.value ?? '')}
+            style={{ width: 190, height: 32, paddingLeft: 9, color: t.fg, backgroundColor: t.surface, borderWidth: 1, borderColor: t.borderStrong, borderRadius: 7, fontSize: F_BODY }}
+          />
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+          <text style={{ color: t.fg3, fontSize: F_CAP }}>Starter packs</text>
+          {Object.keys(STARTER_PACKS).map((pack) => (
+            <div
+              key={pack}
+              testId={`pack-${pack}`}
+              onClick={() => applyPack(pack)}
+              style={{ display: 'flex', alignItems: 'center', height: 24, paddingLeft: 10, paddingRight: 10, borderRadius: 12, borderWidth: 1, borderColor: t.border, backgroundColor: t.surface, cursor: 'pointer', hover: { backgroundColor: t.hover } }}
+            >
+              <text style={{ color: t.fg2, fontSize: F_META }}>{pack}</text>
+            </div>
+          ))}
+        </div>
+        <Card>
+          <div style={{ display: 'flex', flexDirection: 'column' }}>
+            {catalogFiltered.map((entry) => {
+              const inLibrary = selectedLibrary.some((item) => item.formCode === entry.code)
+              const pending = pendingCodes.includes(entry.code)
+              const due = dueByKey.get(`${selectedProfile.id}:${entry.code}`)
+              const checked = inLibrary || pending
+              return (
+                <div
+                  key={entry.code}
+                  testId={`lib-${entry.code}`}
+                  onClick={() => toggleLibraryForm(entry.code)}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 10,
+                    minHeight: 38,
+                    borderBottomWidth: 1,
+                    borderColor: t.border,
+                    cursor: 'pointer',
+                    hover: { backgroundColor: t.hover },
+                  }}
+                >
+                  <Check on={checked} />
+                  <text style={{ color: t.fg3, fontSize: F_META, ...NUM_STYLE, width: 76, minWidth: 76 }}>
+                    {displayFormCode(entry.code)}
+                  </text>
+                  <text style={{ color: t.fg, fontSize: F_BODY, flexGrow: 1, minWidth: 0, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
+                    {cleanFormTitle(entry.label)}
+                  </text>
+                  <text style={{ color: t.fg2, fontSize: F_META, width: 130, minWidth: 130 }}>
+                    {due ? `Next: ${periodLabel(due.period)}` : 'Not filed this year'}
+                  </text>
+                  <Chip tone="muted">{freqLabel(entry.frequency)}</Chip>
+                  <text style={{ color: t.fg3, fontSize: F_META, width: 86, minWidth: 86, textAlign: 'right' }}>
+                    {due ? fmtDateShort(due.dueDate) : '—'}
+                  </text>
+                </div>
+              )
+            })}
+          </div>
+        </Card>
+        {pendingCodes.length > 0 && (
+          <div style={{ display: 'flex', gap: 8 }}>
+            <Btn small testId="add-selected-forms" onClick={() => {
+              if (!selectedProfile) return
+              store.addForms(selectedProfile.id, pendingCodes)
+              setPendingCodes([])
+            }}>{`Add selected (${pendingCodes.length})`}</Btn>
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  function taxpayerTemplatesTab() {
+    if (!taxpayer || !selectedProfile) {
+      return <text style={{ color: t.fg3, fontSize: F_META, padding: 14 }}>Select a taxpayer and year first.</text>
+    }
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <text style={{ color: t.fg3, fontSize: F_META }}>
+          One template per form for this taxpayer and branch — a saved return becomes the starting point for the next period.
+        </text>
+        <Card>
+          <div style={{ display: 'flex', flexDirection: 'column' }}>
+            {selectedLibrary.length === 0 && (
+              <text style={{ color: t.fg3, fontSize: F_META, padding: 10 }}>Add forms to the library first.</text>
+            )}
+            {selectedLibrary.map((entry) => {
+              const item = catalogByCode.get(entry.formCode)
+              return (
+                <div
+                  key={entry.formCode}
+                  style={{ display: 'flex', alignItems: 'center', gap: 10, minHeight: 40, borderBottomWidth: 1, borderColor: t.border }}
+                >
+                  <Icon name="template" size={15} color={t.fg3} />
+                  <text style={{ color: t.fg3, fontSize: F_META, ...NUM_STYLE, width: 76, minWidth: 76 }}>
+                    {displayFormCode(entry.formCode)}
+                  </text>
+                  <text style={{ color: t.fg, fontSize: F_BODY, flexGrow: 1, minWidth: 0, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
+                    {cleanFormTitle(item?.label ?? '')}
+                  </text>
+                  <text style={{ color: t.fg3, fontSize: F_META, width: 110, minWidth: 110 }}>No template yet</text>
+                  <Btn
+                    small
+                    kind="secondary"
+                    onClick={() => showToast('Templates arrive with the guided-mode phase.')}
+                  >
+                    + Create
+                  </Btn>
+                </div>
+              )
+            })}
+          </div>
+        </Card>
+      </div>
+    )
+  }
+
+  function newTaxpayerPage() {
+    const setNew = (field: keyof NewTaxpayerForm, value: string) =>
+      setNewTaxpayer((current) => ({ ...current, [field]: value }))
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+        <text style={{ color: t.fg, fontSize: F_PAGE, fontWeight: 700 }}>New taxpayer</text>
+        <text style={{ color: t.fg3, fontSize: F_BODY, paddingBottom: 18 }}>Add a taxpayer and its head-office facts.</text>
+        <Card>
           <div style={{ display: 'flex', gap: 8 }}>
             {(['tin1', 'tin2', 'tin3'] as const).map((part, index) => (
-              <Field
+              <FieldInput
                 key={part}
                 label={`TIN ${index + 1}`}
                 value={newTaxpayer[part]}
                 placeholder={['123', '456', '788'][index]}
-                onChange={(value) => setNew(part, value.replace(/\D/g, '').slice(0, 3))}
-                error={index === 0 ? newTaxpayerErrors.tin ?? '' : ''}
+                mono
+                onChange={(value) => setNew(part, (value ?? '').replace(/\D/g, '').slice(0, 3))}
+                hint={index === 0 ? newTaxpayerErrors.tin : undefined}
                 testId={`new-taxpayer-${part}`}
               />
             ))}
           </div>
-          <div style={{ display: 'flex', gap: 4, padding: 4, borderRadius: 8, backgroundColor: t.muted, width: 280 }}>
-            {(['individual', 'non-individual'] as const).map((type) => (
-              <div key={type} onClick={() => setNewTaxpayer((current) => ({ ...current, type }))} style={{ flexGrow: 1, padding: 9, borderRadius: 6, backgroundColor: newTaxpayer.type === type ? t.chrome : t.muted }}>
-                <text style={{ color: t.fg, fontSize: 12, textAlign: 'center' }}>{type === 'individual' ? 'Individual' : 'Non-individual'}</text>
-              </div>
-            ))}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <text style={{ color: t.fg2, fontSize: F_META, width: 130, minWidth: 130 }}>Type</text>
+            <Seg<'individual' | 'non-individual'>
+              options={[
+                { value: 'individual', label: 'Individual' },
+                { value: 'non-individual', label: 'Non-individual' },
+              ]}
+              value={newTaxpayer.type}
+              onChange={(value) => setNewTaxpayer((current) => ({ ...current, type: value }))}
+            />
           </div>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12 }}>
-            <Field label="Taxpayer name" value={newTaxpayer.name} onChange={(value) => setNew('name', value)} error={newTaxpayerErrors.name ?? ''} />
-            <Field label="Birth date" value={newTaxpayer.birthDate} onChange={(value) => setNew('birthDate', value)} />
-            <Field label="Head office RDO" value={newTaxpayer.rdo} onChange={(value) => setNew('rdo', value)} />
-            <Field label="ZIP" value={newTaxpayer.zip} onChange={(value) => setNew('zip', value)} />
-            <Field label="Address" value={newTaxpayer.address} onChange={(value) => setNew('address', value)} />
-            <Field label="Telephone" value={newTaxpayer.phone} onChange={(value) => setNew('phone', value)} />
-            <Field label="Email" value={newTaxpayer.email} onChange={(value) => setNew('email', value)} />
+          <FieldInput label="Taxpayer name" value={newTaxpayer.name} onChange={(value) => setNew('name', value)} hint={newTaxpayerErrors.name} />
+          <FieldInput label="Birth date" value={newTaxpayer.birthDate} placeholder="YYYY-MM-DD (individuals)" onChange={(value) => setNew('birthDate', value)} />
+          <div style={{ display: 'flex', gap: 10 }}>
+            <FieldInput label="Head-office RDO" value={newTaxpayer.rdo} onChange={(value) => setNew('rdo', value)} />
+            <FieldInput label="ZIP" value={newTaxpayer.zip} onChange={(value) => setNew('zip', value)} />
           </div>
-          <div style={{ display: 'flex', gap: 8 }}>
-            <Button testId="new-taxpayer-save" onClick={saveNewTaxpayer}>Add taxpayer</Button>
-            <Button quiet onClick={() => setShowNewTaxpayer(false)}>Cancel</Button>
-          </div>
-        </Panel>
-      )
-    }
-    if (!taxpayer || !branch) {
-      return (
-        <Panel title="No taxpayer selected" subtitle="Choose a taxpayer from the sidebar or add a new one.">
-          <Button onClick={() => setShowNewTaxpayer(true)}>New taxpayer</Button>
-        </Panel>
-      )
-    }
-    return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-        <Panel title="Taxpayer" aside="Shared by all branches">
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
-            <Field label="TIN" value={formatTin(taxpayer.tin9)} disabled auto />
-            <Field label="Name" value={taxpayerEdit.name} onChange={(value) => setTaxpayerEdit((current) => ({ ...current, name: value }))} />
-            <Field label="Birth date" value={taxpayerEdit.birthDate} onChange={(value) => setTaxpayerEdit((current) => ({ ...current, birthDate: value }))} />
-          </div>
-          <div style={{ display: 'flex', gap: 4, padding: 4, borderRadius: 8, backgroundColor: t.muted, width: 280 }}>
-            {(['individual', 'non-individual'] as const).map((type) => (
-              <div key={type} onClick={() => setTaxpayerEdit((current) => ({ ...current, type }))} style={{ flexGrow: 1, padding: 9, borderRadius: 6, backgroundColor: taxpayerEdit.type === type ? t.chrome : t.muted }}>
-                <text style={{ color: t.fg, fontSize: 12, textAlign: 'center' }}>{type === 'individual' ? 'Individual' : 'Non-individual'}</text>
-              </div>
-            ))}
-          </div>
-          <div style={{ display: 'flex', justifyContent: 'flex-start', width: '100%' }}>
-            <Button testId="save-taxpayer" onClick={saveTaxpayerDetails}>Save</Button>
-          </div>
-        </Panel>
-        <Panel title="Branch" aside={branch.name}>
-          <div style={{ display: 'flex', gap: 12 }}>
-            <div style={{ width: '30%' }}><Field label="Branch code" value={branch.code} disabled /></div>
-            <div style={{ width: '66%' }}><Field label="Branch name" value={branchEdit.name} onChange={(value) => setBranchEdit((current) => ({ ...current, name: value }))} /></div>
-          </div>
-          <div style={{ display: 'flex', gap: 12 }}>
-            <div style={{ width: '48%' }}><Field label="RDO" value={branchEdit.rdo} onChange={(value) => setBranchEdit((current) => ({ ...current, rdo: value }))} /></div>
-            <div style={{ width: '48%' }}><Field label="Zip" value={branchEdit.zip} onChange={(value) => setBranchEdit((current) => ({ ...current, zip: value }))} /></div>
-          </div>
-          <div style={{ width: '100%' }}>
-            <Field label="Address" value={branchEdit.address} onChange={(value) => setBranchEdit((current) => ({ ...current, address: value }))} />
-          </div>
-          <div style={{ display: 'flex', gap: 12 }}>
-            <div style={{ width: '48%' }}><Field label="Phone" value={branchEdit.phone} onChange={(value) => setBranchEdit((current) => ({ ...current, phone: value }))} /></div>
-            <div style={{ width: '48%' }}><Field label="Email" value={branchEdit.email} onChange={(value) => setBranchEdit((current) => ({ ...current, email: value }))} /></div>
+          <FieldInput label="Registered address" value={newTaxpayer.address} onChange={(value) => setNew('address', value)} />
+          <div style={{ display: 'flex', gap: 10 }}>
+            <FieldInput label="Telephone" value={newTaxpayer.phone} onChange={(value) => setNew('phone', value)} />
+            <FieldInput label="Email" value={newTaxpayer.email} onChange={(value) => setNew('email', value)} />
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
-            <Button quiet onClick={() => setShowNewBranch((current) => !current)}>Add branch</Button>
+            <Btn testId="new-taxpayer-save" onClick={saveNewTaxpayer}>Add taxpayer</Btn>
+            <Btn kind="ghost" onClick={() => setShowNewTaxpayer(false)}>Cancel</Btn>
           </div>
-          {showNewBranch && (
-            <Panel title="New branch">
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
-                <Field label="Branch code" value={newBranch.code} onChange={(value) => setNewBranch((current) => ({ ...current, code: value.replace(/\D/g, '').slice(0, 5) }))} error={branchError} />
-                <Field label="Branch name" value={newBranch.name} onChange={(value) => setNewBranch((current) => ({ ...current, name: value }))} />
-                {(['rdo', 'zip', 'address', 'phone', 'email'] as const).map((field) => (
-                  <Field key={field} label={field === 'rdo' ? 'RDO' : field === 'zip' ? 'ZIP' : field[0].toUpperCase() + field.slice(1)} value={newBranch[field]} onChange={(value) => setNewBranch((current) => ({ ...current, [field]: value }))} />
-                ))}
-              </div>
-              <Button onClick={addBranch}>Create branch</Button>
-            </Panel>
-          )}
-          <div style={{ display: 'flex', justifyContent: 'flex-start', width: '100%' }}>
-            <Button testId="save-branch" onClick={saveBranchDetails}>Save</Button>
-          </div>
-        </Panel>
-        {statusMessage && <text style={{ color: t.success, fontSize: 12 }}>{statusMessage}</text>}
+        </Card>
       </div>
     )
   }
 
   function taxpayerPage() {
-    return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 16, flexGrow: 1, minHeight: 0 }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <div>
-            <text style={{ color: t.fg, fontSize: 25, fontWeight: 700 }}>{taxpayer?.name || 'Taxpayers'}</text>
-            <text style={{ color: t.mutedFg, fontSize: 12 }}>{taxpayer ? `TIN: ${formatTin(taxpayer.tin9)} · ${taxpayer.type === 'individual' ? 'Individual' : 'Non-individual'} · Tax Year ${selectedProfile?.year ?? '-'} · ${branch?.name ?? ''}` : 'Taxpayer, branch, and return workspace'}</text>
-          </div>
-        </div>
-        <div style={{ display: 'flex', gap: 6, borderBottomWidth: 1, borderColor: t.border }}>
-          {(['details', 'forms', 'templates', 'email', 'export'] as const).map((item) => (
-            <div key={item} testId={`tab-${item}`} onClick={() => navTo({ ...navNow, tab: item })} style={{ padding: 12, borderBottomWidth: tab === item ? 2 : 0, borderColor: t.primary }}>
-              <text style={{ color: tab === item ? t.fg : t.mutedFg, fontSize: 13, fontWeight: tab === item ? 700 : 500 }}>{item === 'forms' ? 'Forms' : item === 'email' ? 'Email Settings' : item[0].toUpperCase() + item.slice(1)}</text>
-            </div>
-          ))}
-        </div>
-        <div style={{ flexGrow: 1, minHeight: 0, overflow: 'scroll' }}>
-          {tab === 'details' && detailsContent()}
-          {tab === 'templates' && (
-            <Panel title="Templates" subtitle="P4b">
-              <text style={{ color: t.mutedFg, fontSize: 13 }}>Guided templates and filing workflows are planned for P4b.</text>
-            </Panel>
-          )}
-          {tab === 'email' && (
-            <Panel title="Email Settings" subtitle="P5">
-              <text style={{ color: t.mutedFg, fontSize: 13 }}>eBIR notification email settings arrive with the filing pipeline.</text>
-            </Panel>
-          )}
-          {tab === 'export' && (
-            <Panel title="Export" subtitle="P5">
-              <text style={{ color: t.mutedFg, fontSize: 13 }}>Return export packages arrive with the filing pipeline.</text>
-            </Panel>
-          )}
-          {tab === 'forms' && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-              {!selectedProfile && (
-                <>
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                    <text style={{ color: t.fg, fontSize: 22, fontWeight: 700 }}>Forms</text>
-                    <Button quiet testId="add-year-toggle" onClick={() => setShowNewYear((value) => !value)}>+ Add year</Button>
-                  </div>
-                  {showNewYear && (
-                    <Panel title="Add tax year" subtitle="A new year starts with the selected branch facts.">
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                        <Field label="Tax year" value={yearInput} onChange={(value) => setYearInput(value.replace(/\D/g, '').slice(0, 4))} />
-                        <Button testId="add-year-save" onClick={addYear}>Create year</Button>
-                      </div>
-                    </Panel>
-                  )}
-                  <Panel title="Select a tax year"><text style={{ color: t.mutedFg }}>Select or add a year for this branch.</text></Panel>
-                </>
-              )}
-              {selectedProfile && (
-                <>
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                    <text style={{ color: t.fg, fontSize: 22, fontWeight: 700 }}>Forms</text>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-                      {branch?.years.map((profile) => (
-              <div key={profile.id} testId={`year-${profile.year}-${profile.branch}`} onClick={() => navTo({ ...navNow, profileId: profile.id })} style={{ padding: 8, borderRadius: 16, borderWidth: 1, borderColor: profile.id === selectedProfile.id ? t.primary : t.border, backgroundColor: profile.id === selectedProfile.id ? t.secondary : t.chrome }}>
-                          <text style={{ color: t.fg, fontSize: 11, fontWeight: profile.id === selectedProfile.id ? 700 : 500 }}>Tax Year {profile.year}</text>
-                        </div>
-                      ))}
-                      <Button quiet testId="add-year-toggle" onClick={() => setShowNewYear((value) => !value)}>+ Add year</Button>
-                    </div>
-                  </div>
-                  {showNewYear && (
-                    <Panel title="Add tax year" subtitle="A new year starts with the selected branch facts.">
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                        <Field label="Tax year" value={yearInput} onChange={(value) => setYearInput(value.replace(/\D/g, '').slice(0, 4))} />
-                        <Button testId="add-year-save" onClick={addYear}>Create year</Button>
-                      </div>
-                    </Panel>
-                  )}
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <input
-                      testId="form-filter"
-                      value={formFilter}
-                      placeholder="Filter forms…"
-                      onChange={(event) => setFormFilter(event.value ?? '')}
-                      style={{ height: 36, minHeight: 36, padding: 9, flexGrow: 1, minWidth: 0, color: t.fg, backgroundColor: t.bg, borderWidth: 1, borderColor: t.input, borderRadius: 6 }}
-                    />
-                    <Button quiet testId="choose-forms" onClick={() => setPickerOpen((current) => !current)}>{pickerOpen ? 'Close' : 'Filters'}</Button>
-                  </div>
-                  {pickerOpen && (
-                    <Panel title="Choose forms" subtitle="Pick the returns used for this branch and tax year.">
-                      <div style={{ display: 'flex', gap: 6 }}>
-                        {Object.keys(supportedPresets).map((name) => (
-                          <div key={name} onClick={() => setPreset(name)} style={{ padding: 8, backgroundColor: preset === name ? t.secondary : t.bg, borderRadius: 6 }}>
-                            <text style={{ color: t.fg, fontSize: 11 }}>{name}</text>
-                          </div>
-                        ))}
-                      </div>
-                      <input testId="catalog-search" value={search} placeholder="Search by form name or code" onChange={(event) => setSearch(event.value ?? '')} style={{ height: 36, minHeight: 36, padding: 9, color: t.fg, backgroundColor: t.bg, borderWidth: 1, borderColor: t.input, borderRadius: 6 }} />
-                      <div style={{ maxHeight: 300, overflow: 'scroll', borderWidth: 1, borderColor: t.border, borderRadius: 8 }}>
-                        {(search ? filteredCatalog : visibleCatalog).filter((entry) => search || availablePresetCodes.has(entry.code)).map(pickerRow)}
-                      </div>
-                      <Button testId="add-selected-forms" disabled={!pendingCodes.length} onClick={addSelectedForms}>{`Add selected ${pendingCodes.length || ''}`}</Button>
-                    </Panel>
-                  )}
-                  {selectedLibrary.length === 0 && <Panel title="Your form library is empty" subtitle="Choose forms to add returns for this year." />}
-                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 14 }}>
-                    {selectedLibrary
-                      .filter((entry) => {
-                        const needle = formFilter.trim().toLowerCase()
-                        if (!needle) return true
-                        const catalogEntry = catalog.find((item) => item.code === entry.formCode)
-                        return (
-                          entry.formCode.toLowerCase().includes(needle) ||
-                          (catalogEntry?.label ?? '').toLowerCase().includes(needle)
-                        )
-                      })
-                      .map(periodCard)}
-                  </div>
-                </>
-              )}
-            </div>
-          )}
-        </div>
+    if (showNewTaxpayer) return newTaxpayerPage()
+    if (!taxpayer) return newTaxpayerPage()
+    const formsCount = selectedLibrary.length
+    const tabItem = (id: TpTab, label: string) => (
+      <div
+        key={id}
+        testId={`tab-${id}`}
+        onClick={() => navTo({ ...navNow, tab: id })}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          height: 34,
+          paddingLeft: 2,
+          paddingRight: 2,
+          marginRight: 16,
+          cursor: 'pointer',
+          borderBottomWidth: 2,
+          borderColor: tab === id ? t.fg : 'rgba(0,0,0,0)',
+        }}
+      >
+        <text style={{ color: tab === id ? t.fg : t.fg3, fontSize: F_BODY, fontWeight: tab === id ? 600 : 400 }}>
+          {label}
+        </text>
       </div>
     )
-  }
-
-  function legacyFormPage() {
-    const currentStatus = draft?.status ?? 'draft'
-    const stages: DraftStatus[] = ['draft', 'queued', 'submitted', 'confirmed', 'paid']
     return (
       <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minHeight: 0 }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', paddingBottom: 12, borderBottomWidth: 1, borderColor: t.border }}>
-          <Button quiet onClick={() => void closeForm()}>← Back</Button>
-          <text style={{ color: t.fg, fontSize: 17, fontWeight: 700 }}>{formEntry?.label ?? 'Return'}</text>
-          <div
-            onMouseEnter={() => setShowPrintTip(true)}
-            onMouseLeave={() => setShowPrintTip(false)}
-            style={{ position: 'relative' }}
-          >
-            <Button quiet disabled onClick={() => {}}>Print preview</Button>
-            {showPrintTip && (
-              <div style={{
-                position: 'absolute', top: 42, right: 0,
-                padding: 8, borderWidth: 1, borderColor: t.border,
-                borderRadius: 6, backgroundColor: t.chrome,
-              }}>
-                <text style={{ color: t.fg, fontSize: 11 }}>Coming in P5</text>
-              </div>
-            )}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, paddingBottom: 14 }}>
+          <Avatar name={taxpayer.name || '?'} size={40} />
+          <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
+            <text style={{ color: t.fg, fontSize: F_PAGE, fontWeight: 700, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>
+              {taxpayer.name || formatTin(taxpayer.tin9)}
+            </text>
+            <text style={{ color: t.fg3, fontSize: F_META, ...NUM_STYLE }}>{formatTin(taxpayer.tin9, branch?.code ?? '00000')}</text>
           </div>
+          <Btn
+            testId="copy-tin"
+            kind="secondary"
+            icon="copy"
+            onClick={() => showToast('TIN copied.')}
+          >
+            Copy TIN
+          </Btn>
+          <Btn testId="new-return" icon="plus" onClick={() => setOverlay({ kind: 'startReturn' })}>New return</Btn>
         </div>
-        <div style={{ display: 'flex', justifyContent: 'center', gap: 8, padding: 12, borderBottomWidth: 1, borderColor: t.border }}>
-          {stages.map((stage, index) => (
-              <div key={stage} onClick={() => updateDraftStatus(stage)} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <div style={{ width: 8, height: 8, borderRadius: 8, backgroundColor: index <= stages.indexOf(currentStatus) ? t.primary : t.border }} />
-              <text style={{ color: index <= stages.indexOf(currentStatus) ? t.fg : t.mutedFg, fontSize: 11 }}>{stage[0].toUpperCase() + stage.slice(1)}</text>
-              {index < stages.length - 1 && <text style={{ color: t.border }}>—</text>}
-            </div>
-          ))}
+        <div style={{ display: 'flex', borderBottomWidth: 1, borderColor: t.border, marginBottom: 14 }}>
+          {tabItem('profile', 'Profile')}
+          {tabItem('forms', `Forms${formsCount ? ` ${formsCount}` : ''}`)}
+          {tabItem('templates', 'Templates')}
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 14, padding: 18, flexGrow: 1, minHeight: 0, overflow: 'scroll' }}>
-          {draft && (
-            <Panel title="Taxpayer facts · auto-filled" subtitle={`${formatTin(selectedProfile?.tin9 ?? '', selectedProfile?.branch)} · ${draft.period}`}>
-              <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap' }}>
-                <text style={{ color: t.mutedFg, fontSize: 12 }}>{taxpayer?.name ?? selectedProfile?.registeredName}</text>
-                <text style={{ color: t.mutedFg, fontSize: 12 }}>{branch?.facts.rdo ? `RDO ${branch.facts.rdo}` : 'RDO —'}</text>
-                <text style={{ color: t.mutedFg, fontSize: 12 }}>{branch?.facts.address ?? 'Address —'}</text>
-                <text style={{ color: t.mutedFg, fontSize: 12 }}>{branch?.facts.zip ?? 'ZIP —'}</text>
-              </div>
-            </Panel>
-          )}
-          {editorModel.bannerErrorText && (
-            <Panel title="Review required"><text style={{ color: t.danger, fontSize: 12 }}>{editorModel.bannerErrorText}</text></Panel>
-          )}
-          {formLoading && <text style={{ color: t.mutedFg }}>Opening official form…</text>}
-          {editorModel.sections.map((section, index) => (
-            <Panel key={`${section.section ?? 'other'}-${index}`} title={section.section ?? 'Return fields'}>
-              {section.rows.map((row) => (
-                <div key={row.id} style={{ display: 'flex', flexDirection: 'column', gap: 4, paddingBottom: 8, borderBottomWidth: 1, borderColor: t.border }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    {row.item && <text style={{ color: t.mutedFg, fontSize: 10, width: 48 }}>{row.item}</text>}
-                    <text style={{ color: t.fg, fontSize: 12, flexGrow: 1 }}>{row.label || row.name}</text>
-                    {row.locked && <text style={{ color: t.mutedFg, fontSize: 9 }}>AUTO</text>}
-                    {row.type === 'checkbox' ? (
-                      <div onClick={() => editField(row.fields[0], !Boolean(editorValues[row.fields[0].id]))} style={{ width: 30, height: 25, display: 'flex', justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: t.border, borderRadius: 5, backgroundColor: t.bg }}>
-                        <text style={{ color: t.fg }}>{editorValues[row.fields[0].id] ? '✓' : ''}</text>
-                      </div>
-                    ) : row.type === 'radio' ? (
-                      <div style={{ display: 'flex', gap: 4 }}>
-                        {row.fields.map((field) => (
-                          <div key={field.id} onClick={() => editField(field, true)} style={{ padding: 8, borderWidth: 1, borderColor: Boolean(editorValues[field.id]) ? t.primary : t.border, borderRadius: 5, backgroundColor: Boolean(editorValues[field.id]) ? t.secondary : t.bg }}>
-                            <text style={{ color: t.fg, fontSize: 11 }}>{field.label || field.value || field.id}</text>
-                          </div>
-                        ))}
-                      </div>
-                    ) : row.type === 'select-one' ? (
-                      <Select value={String(editorValues[row.fields[0].id] ?? '')} onValueChange={(value) => editField(row.fields[0], value)} disabled={row.locked || row.fields[0].disabled}>
-                        <SelectTrigger style={{ width: 250, height: 32 }}><SelectValue placeholder="Select" /></SelectTrigger>
-                        <SelectContent>{row.fields[0].options?.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
-                      </Select>
-                    ) : (
-                      <input
-                        testId={`field-${row.fields[0].id}`}
-                        value={String(editorValues[row.fields[0].id] ?? '')}
-                        readOnly={row.locked || row.fields[0].disabled}
-                        onChange={(event) => editField(row.fields[0], event.value ?? '')}
-                        style={{
-                          width: row.label.toLowerCase().includes('amount') ? 180 : 280,
-                          height: 32, padding: 8, textAlign: row.label.toLowerCase().includes('amount') ? 'right' : 'left',
-                          color: row.locked || row.fields[0].disabled ? t.mutedFg : t.fg,
-                          backgroundColor: row.locked || row.fields[0].disabled ? t.muted : t.bg,
-                          borderWidth: 1, borderColor: t.input, borderRadius: 5,
-                        }}
-                      />
-                    )}
-                  </div>
-                  <div style={{ minHeight: 16, height: 16 }}>
-                    <text style={{ color: row.errorText ? t.danger : t.mutedFg, fontSize: 10 }}>{row.errorText}</text>
-                  </div>
-                </div>
-              ))}
-            </Panel>
-          ))}
-        </div>
-        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, padding: 12, borderTopWidth: 1, borderColor: t.border, backgroundColor: t.chrome }}>
-          <Button quiet testId="validate-return" onClick={() => formInstance && refreshEditor(formInstance)}>Validate</Button>
-          <Button testId="save-return" onClick={saveDraft}>Save draft</Button>
+        <div style={{ flexGrow: 1, minHeight: 0, overflow: 'scroll' }}>
+          {tab === 'profile' && taxpayerProfileTab()}
+          {tab === 'forms' && taxpayerFormsTab()}
+          {tab === 'templates' && taxpayerTemplatesTab()}
         </div>
       </div>
     )
   }
 
+  // -- Settings / jobs / logs -------------------------------------------------
+
+  function settingsRow(title: string, subtitle: string, control: ReactNode, testId?: string) {
+    return (
+      <div
+        testId={testId}
+        style={{ display: 'flex', alignItems: 'center', gap: 12, minHeight: 40, borderBottomWidth: 1, borderColor: t.border }}
+      >
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 1, flexGrow: 1, minWidth: 0 }}>
+          <text style={{ color: t.fg, fontSize: F_BODY }}>{title}</text>
+          <text style={{ color: t.fg3, fontSize: F_META }}>{subtitle}</text>
+        </div>
+        {control}
+      </div>
+    )
+  }
+
+  function settingsPage() {
+    const stateChip = (state: Job['state']) =>
+      state === 'running' ? 'Running' : state === 'dead' ? 'Failed' : state === 'succeeded' ? 'Done' : 'Queued'
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <text style={{ color: t.fg, fontSize: F_PAGE, fontWeight: 700, paddingBottom: 8 }}>Settings</text>
+        <Card title="Appearance">
+          {settingsRow(
+            'Theme',
+            'Light, dark, or match Windows.',
+            <Seg<ThemeMode>
+              testId="theme-seg"
+              options={[
+                { value: 'light', label: 'Light', icon: 'sun' },
+                { value: 'dark', label: 'Dark', icon: 'moon' },
+                { value: 'system', label: 'System', icon: 'monitor' },
+              ]}
+              value={themeMode}
+              onChange={setThemeMode}
+            />,
+          )}
+          {settingsRow(
+            'Show recent returns in the sidebar',
+            'Last four returns you opened.',
+            <Switch testId="show-recent" on={showRecent} onToggle={toggleRecent} />,
+          )}
+          {settingsRow('Display name', 'Used for the greeting on Home.', <div style={{ width: 200 }}><FieldInput value={displayName} onChange={setDisplayName} /></div>)}
+          {settingsRow('Email', 'Shown on the account card.', <div style={{ width: 200 }}><FieldInput value={email} onChange={setEmail} /></div>)}
+          <div style={{ display: 'flex', justifyContent: 'flex-end', paddingTop: 6 }}>
+            <Btn small kind="secondary" onClick={() => {
+              store.setSetting('displayName', displayName.trim())
+              store.setSetting('email', email.trim())
+              showToast('Account details saved.')
+            }}>Save</Btn>
+          </div>
+        </Card>
+        <Card title="Returns">
+          {settingsRow(
+            'Ask to update the template on save',
+            'When a return is saved, offer to keep it as the branch template.',
+            <Switch testId="ask-template" on={askTemplate} onToggle={toggleAskTemplate} />,
+          )}
+        </Card>
+        <Card title="Data">
+          {settingsRow(
+            'Import data',
+            'Bring in returns saved by the official eBIRForms app.',
+            <Btn small kind="secondary" onClick={() => showToast('Import arrives with the filing pipeline.')}>Import</Btn>,
+            'import-row',
+          )}
+          {settingsRow(
+            'Back up now',
+            lastBackup ? `Last backup ${fmtDateTime(Number(lastBackup))}` : 'No backup yet — copies the database next to itself.',
+            <Btn small kind="secondary" onClick={backupNow} testId="backup-now">Back up</Btn>,
+            'backup-row',
+          )}
+          {settingsRow('Jobs', 'Background task queue.', <Btn small kind="ghost" onClick={() => goto('jobs')}>Open</Btn>)}
+          {settingsRow('Logs', 'Application log entries.', <Btn small kind="ghost" onClick={() => goto('logs')}>Open</Btn>)}
+          <text style={{ color: t.fg3, fontSize: F_CAP, paddingTop: 6 }}>{sftpMode}</text>
+        </Card>
+        <Card title="Background tasks" subtitle="Live rows from the job queue.">
+          <div style={{ display: 'flex', flexDirection: 'column' }}>
+            {queueJobs.length === 0 && (
+              <text style={{ color: t.fg3, fontSize: F_META, padding: 6 }}>No background tasks queued.</text>
+            )}
+            {queueJobs.map((job) => (
+              <div key={job.id} style={{ display: 'flex', alignItems: 'center', gap: 10, minHeight: 34, borderBottomWidth: 1, borderColor: t.border }}>
+                <Icon name={job.state === 'running' ? 'history' : job.state === 'dead' ? 'alert' : job.state === 'succeeded' ? 'checkCircle' : 'box'} size={14} color={job.state === 'dead' ? t.danger : job.state === 'succeeded' ? t.success : t.fg3} />
+                <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
+                  <text style={{ color: t.fg, fontSize: F_META }}>{job.kind}</text>
+                  <text style={{ color: t.fg3, fontSize: F_CAP }}>{`attempts ${job.attempts}/${job.maxAttempts}${job.lastError ? ` · ${job.lastError}` : ''}`}</text>
+                </div>
+                <Chip tone={job.state === 'running' ? 'accent' : job.state === 'dead' ? 'danger' : 'muted'}>{stateChip(job.state)}</Chip>
+              </div>
+            ))}
+          </div>
+        </Card>
+      </div>
+    )
+  }
+
+  function jobsPage() {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <text style={{ color: t.fg, fontSize: F_PAGE, fontWeight: 700 }}>Jobs</text>
+        {queueJobs.length === 0 && <text style={{ color: t.fg3, fontSize: F_META }}>No background tasks queued.</text>}
+        {queueJobs.map((job) => (
+          <Card key={job.id} title={`${job.kind} · ${job.state}`} subtitle={`Attempts ${job.attempts}/${job.maxAttempts}`}>
+            <text style={{ color: job.lastError ? t.danger : t.fg3, fontSize: F_META }}>{job.lastError ?? JSON.stringify(job.payload)}</text>
+          </Card>
+        ))}
+      </div>
+    )
+  }
+
+  function logsPage() {
+    const shownLogs = logFilter === 'all' ? logs : logs.filter((entry) => entry.level === logFilter)
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10, flexGrow: 1, minHeight: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <text style={{ color: t.fg, fontSize: F_PAGE, fontWeight: 700 }}>Logs</text>
+          <Select value={logFilter} onValueChange={(value) => setLogFilter(value as LogFilter)}>
+            <SelectTrigger style={{ width: 130, height: 30 }}><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {(['all', 'debug', 'info', 'warn', 'error'] as LogFilter[]).map((level) => (
+                <SelectItem key={level} value={level}>{level}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 2, overflow: 'scroll' }}>
+          {shownLogs.map((entry, index) => (
+            <div key={`${entry.ts}-${index}`} style={{ display: 'flex', gap: 10, padding: 7, borderRadius: 6, hover: { backgroundColor: t.hover } }}>
+              <text style={{ color: t.fg3, fontSize: F_CAP }}>{new Date(entry.ts).toLocaleTimeString()}</text>
+              <text style={{ color: entry.level === 'error' ? t.danger : entry.level === 'warn' ? t.warning : t.fg2, fontSize: F_CAP, width: 44 }}>{entry.level}</text>
+              <text style={{ color: t.fg3, fontSize: F_CAP, width: 70 }}>{entry.scope}</text>
+              <text style={{ color: t.fg, fontSize: F_META, flexGrow: 1 }}>{entry.msg}</text>
+            </div>
+          ))}
+        </div>
+      </div>
+    )
+  }
+
+  // -- Form page (editor logic unchanged, restyled to the tokens) ------------
+
   function formPage() {
-    if (!formEntry) return legacyFormPage()
     const currentStatus = draft?.status ?? 'draft'
     const stages: DraftStatus[] = ['draft', 'queued', 'submitted', 'confirmed', 'paid']
     const currentIndex = stages.indexOf(currentStatus)
     const trackerDots = [
-      { left: 12, top: 0 },
-      { left: 20, top: 4 },
-      { left: 24, top: 12 },
-      { left: 20, top: 20 },
-      { left: 12, top: 24 },
-      { left: 4, top: 20 },
-      { left: 0, top: 12 },
-      { left: 4, top: 4 },
+      { left: 12, top: 0 }, { left: 20, top: 4 }, { left: 24, top: 12 }, { left: 20, top: 20 },
+      { left: 12, top: 24 }, { left: 4, top: 20 }, { left: 0, top: 12 }, { left: 4, top: 4 },
     ]
     const revision =
-      formEntry.formCode === '1601Cv2018' || formEntry.formCode === '2551Qv2018'
+      formEntry?.formCode === '1601Cv2018' || formEntry?.formCode === '2551Qv2018'
         ? 'January 2018 (ENCS)'
-        : formEntry.formCode === '0619E'
+        : formEntry?.formCode === '0619E'
           ? 'January 2018'
           : ''
+    const isMoneyLabel = (label: string) =>
+      /amount|tax due|taxable|sales|receipts|income|compensation|withheld|remittance|premium|cost|payment|proceeds|balance|total/i.test(label)
+    const isPctLabel = (label: string) => /%|rate\b/i.test(label)
 
-    function control(field: FieldSnapshot, width = 270) {
-      const locked = editorModel.sections.some((section) =>
-        section.rows.some((row) => row.fields.some((entry) => entry.id === field.id && row.locked)),
-      ) || field.disabled
-      if (field.type === 'select-one') {
-        return (
-          <Select value={String(editorValues[field.id] ?? '')} onValueChange={(value) => editField(field, value)} disabled={locked}>
-            <SelectTrigger style={{ width, height: 36 }}><SelectValue placeholder="Select" /></SelectTrigger>
-            <SelectContent>{field.options?.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
-          </Select>
-        )
-      }
-      if (field.type === 'checkbox') {
-        return (
-          <div onClick={() => !locked && editField(field, !Boolean(editorValues[field.id]))} style={{ width: 30, height: 30, display: 'flex', justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: t.border, borderRadius: 5, backgroundColor: locked ? t.muted : t.bg }}>
-            <text style={{ color: t.fg, fontSize: 15 }}>{editorValues[field.id] ? '✓' : ''}</text>
-          </div>
-        )
-      }
+    function fieldLocked(field: FieldSnapshot) {
       return (
+        editorModel.sections.some((section) =>
+          section.rows.some((row) => row.fields.some((entry) => entry.id === field.id && row.locked)),
+        ) || field.disabled
+      )
+    }
+
+    function input(field: FieldSnapshot, width: number, money = false, pct = false) {
+      const locked = fieldLocked(field)
+      const el = (
         <input
           testId={`field-${field.id}`}
           value={String(editorValues[field.id] ?? '')}
@@ -1254,95 +2800,274 @@ function App() {
           onChange={(event) => editField(field, event.value ?? '')}
           style={{
             width,
-            height: 36,
-            padding: 8,
-            textAlign: field.label.toLowerCase().includes('amount') ? 'right' : 'left',
-            color: locked ? t.mutedFg : t.fg,
-            backgroundColor: locked ? t.muted : t.bg,
+            height: 32,
+            padding: 7,
+            paddingLeft: money ? 24 : 8,
+            paddingRight: pct ? 24 : 8,
+            textAlign: money || pct ? 'right' : 'left',
+            color: locked ? t.fg3 : t.fg,
+            backgroundColor: locked ? t.hover : t.surface,
             borderWidth: 1,
-            borderColor: t.input,
-            borderRadius: 5,
+            borderColor: t.borderStrong,
+            borderRadius: 6,
+            fontSize: F_BODY,
+            ...(money || pct ? NUM_STYLE : {}),
           }}
         />
       )
+      if (!money && !pct) return el
+      return (
+        <div style={{ position: 'relative', width }}>
+          <text
+            style={{
+              position: 'absolute',
+              top: 8,
+              ...(money ? { left: 10 } : { right: 10 }),
+              color: t.fg3,
+              fontSize: F_META,
+            }}
+          >
+            {money ? '₱' : '%'}
+          </text>
+          {el}
+        </div>
+      )
     }
+
+    function control(field: FieldSnapshot, subLabel?: string) {
+      const locked = fieldLocked(field)
+      const labelWidth =
+        field.type === 'select-one' ? 220 : isMoneyLabel(field.label) ? 230 : field.maxLength && field.maxLength <= 4 ? 88 : field.label.length > 30 ? 300 : 220
+      const body =
+        field.type === 'select-one' ? (
+          <Select value={String(editorValues[field.id] ?? '')} onValueChange={(value) => editField(field, value)} disabled={locked}>
+            <SelectTrigger style={{ width: labelWidth, height: 32 }}><SelectValue placeholder="Select" /></SelectTrigger>
+            <SelectContent>{field.options?.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
+          </Select>
+        ) : field.type === 'checkbox' ? (
+          <div onClick={() => !locked && editField(field, !Boolean(editorValues[field.id]))} style={{ width: 28, height: 28, display: 'flex', justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: t.borderStrong, borderRadius: 6, backgroundColor: locked ? t.hover : t.surface, cursor: locked ? 'default' : 'pointer' }}>
+            {Boolean(editorValues[field.id]) && <Icon name="check" size={14} color={t.fg} strokeWidth={2.5} />}
+          </div>
+        ) : field.type === 'textarea' ? (
+          <input
+            testId={`field-${field.id}`}
+            value={String(editorValues[field.id] ?? '')}
+            readOnly={locked}
+            onChange={(event) => editField(field, event.value ?? '')}
+            style={{ width: Math.max(labelWidth, 320), height: 56, padding: 8, color: locked ? t.fg3 : t.fg, backgroundColor: locked ? t.hover : t.surface, borderWidth: 1, borderColor: t.borderStrong, borderRadius: 6, fontSize: F_BODY }}
+          />
+        ) : (
+          input(field, labelWidth, isMoneyLabel(field.label), !isMoneyLabel(field.label) && isPctLabel(field.label))
+        )
+      if (!subLabel) return body
+      return (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          <text style={{ color: t.fg2, fontSize: F_META }}>{subLabel}</text>
+          {body}
+        </div>
+      )
+    }
+
+    function rowControls(row: (typeof editorModel.sections)[number]['rows'][number]) {
+      const fields = row.fields
+      if (row.kind === 'tin') {
+        return (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            {fields.map((field, fieldIndex) => (
+              <div key={field.id} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                {fieldIndex > 0 && <text style={{ color: t.fg3, fontSize: F_META }}>-</text>}
+                <input
+                  testId={`field-${field.id}`}
+                  value={String(editorValues[field.id] ?? '')}
+                  readOnly
+                  style={{
+                    width: fieldIndex === 3 ? 76 : 58,
+                    height: 32,
+                    padding: 6,
+                    textAlign: 'center',
+                    color: t.fg2,
+                    backgroundColor: t.hover,
+                    borderWidth: 1,
+                    borderColor: t.borderStrong,
+                    borderRadius: 6,
+                    fontSize: F_META,
+                    ...NUM_STYLE,
+                  }}
+                />
+              </div>
+            ))}
+          </div>
+        )
+      }
+      if (row.kind === 'radio' || (row.kind === 'period' && fields.some((field) => field.type === 'radio'))) {
+        return (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+            {fields.map((field) => {
+              if (field.type === 'radio') {
+                const checked = Boolean(editorValues[field.id])
+                return (
+                  <div
+                    key={field.id}
+                    testId={`radio-${field.id}`}
+                    onClick={() => editField(field, true)}
+                    style={{
+                      display: 'flex', alignItems: 'center', height: 28, paddingLeft: 12, paddingRight: 12,
+                      borderWidth: 1,
+                      borderColor: checked ? t.primary : t.borderStrong,
+                      borderRadius: 999,
+                      backgroundColor: checked ? t.primary : t.surface,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <text style={{ color: checked ? t.primaryFg : t.fg2, fontSize: F_META, fontWeight: 500, whiteSpace: 'nowrap' }}>
+                      {field.optionLabel || 'Option'}
+                    </text>
+                  </div>
+                )
+              }
+              return <div key={field.id}>{control(field, field.label)}</div>
+            })}
+          </div>
+        )
+      }
+      if (row.kind === 'period') {
+        return (
+          <div style={{ display: 'flex', alignItems: 'flex-end', gap: 12, flexWrap: 'wrap' }}>
+            {fields.map((field) => <div key={field.id}>{control(field, field.label)}</div>)}
+          </div>
+        )
+      }
+      if (fields.length > 1) {
+        return (
+          <div style={{ display: 'flex', alignItems: 'flex-end', gap: 12, flexWrap: 'wrap' }}>
+            {fields.map((field) => <div key={field.id}>{control(field, field.label)}</div>)}
+          </div>
+        )
+      }
+      return control(fields[0])
+    }
+
+    const periodText = draft ? periodLabel(draft.period) : ''
+    const catalogEntry = formEntry ? catalogByCode.get(formEntry.formCode) : undefined
+    const visibleFieldCount = fieldSnapshot.filter((field) => field.visible !== false).length
 
     return (
       <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minHeight: 0 }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', paddingBottom: 12, borderBottomWidth: 1, borderColor: t.border }}>
-          <Button quiet testId="form-back" onClick={() => closeForm()}>‹ Back</Button>
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, paddingBottom: 8 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <Btn kind="ghost" icon="chevLeft" testId="form-back" small onClick={() => closeForm()}>Back</Btn>
+              <text style={{ color: t.fg3, fontSize: F_META }}>
+                BIR Form {formEntry ? displayFormCode(formEntry.formCode) : ''}
+                {revision ? ` · Revision ${revision}` : ''}
+              </text>
+            </div>
+            <text style={{ color: t.fg, fontSize: F_PAGE, fontWeight: 600 }}>{formEntry ? cleanFormTitle(formEntry.label) : 'Return'}</text>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+              {catalogEntry && <Chip tone="muted">{catalogEntry.frequency === 'monthly' ? 'Monthly' : catalogEntry.frequency === 'quarterly' ? 'Quarterly' : 'Annual'}</Chip>}
+              <Chip tone="muted">{visibleFieldCount} fields</Chip>
+            </div>
+          </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-            <Button quiet testId="form-dismiss" onClick={() => closeForm()}>Dismiss</Button>
-            <Button quiet testId="form-overflow" onClick={() => {}}>⋯</Button>
-          <div
-            onMouseEnter={() => setShowPrintTip(true)}
-            onMouseLeave={() => setShowPrintTip(false)}
-            style={{ position: 'relative' }}
-          >
-            <Button quiet disabled onClick={() => {}}>Print Preview</Button>
-            {showPrintTip && <div style={{ position: 'absolute', top: 42, right: 0, padding: 8, borderWidth: 1, borderColor: t.border, borderRadius: 6, backgroundColor: t.chrome }}><text style={{ color: t.fg, fontSize: 11 }}>Coming in P5</text></div>}
-          </div>
+            <Btn kind="ghost" testId="form-dismiss" small onClick={() => closeForm()}>Dismiss</Btn>
+            <Btn small testId="save-return-top" onClick={saveDraft}>Save draft</Btn>
           </div>
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4, padding: 14 }}>
-          <text style={{ color: t.fg, fontSize: 25, fontWeight: 800, whiteSpace: 'nowrap' }}>BIR Form No. {displayFormCode(formEntry.formCode)}</text>
-          <text style={{ color: t.fg, fontSize: 15, textAlign: 'center' }}>{cleanFormTitle(formEntry.label)}</text>
-          {revision && <text style={{ color: t.mutedFg, fontSize: 11 }}>{revision}</text>}
+
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 10,
+            flexWrap: 'wrap',
+            padding: 10,
+            paddingLeft: 12,
+            paddingRight: 12,
+            borderWidth: 1,
+            borderColor: t.border,
+            borderRadius: 12,
+            backgroundColor: t.bg,
+            marginBottom: 14,
+          }}
+        >
+          <Avatar name={taxpayer?.name ?? '?'} size={20} />
+          <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 600 }}>{taxpayer?.name ?? ''}</text>
+          <text style={{ color: t.fg2, fontSize: F_META, ...NUM_STYLE }}>
+            {selectedProfile ? formatTin(selectedProfile.tin9, selectedProfile.branch) : ''}
+          </text>
+          {branch && <text style={{ color: t.fg2, fontSize: F_META, ...NUM_STYLE }}>{branch.name}</text>}
+          {periodText && <text style={{ color: t.fg3, fontSize: F_META }}>·</text>}
+          {periodText && <text style={{ color: t.fg2, fontSize: F_META }}>For {periodText}</text>}
+          <div style={{ flexGrow: 1 }} />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <text style={{ color: t.fg2, fontSize: F_META }}>Guided mode</text>
+            <Switch on={false} onToggle={() => showToast('Templates arrive with the guided-mode phase.')} />
+          </div>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, padding: 12, borderBottomWidth: 1, borderColor: t.border }}>
+
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, paddingBottom: 12 }}>
           {stages.map((stage, index) => (
             <div key={stage} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <div testId={`stage-${stage}`} onClick={() => updateDraftStatus(stage)} style={{
-                width: 28, height: 28, display: 'flex', alignItems: 'center', justifyContent: 'center',
-                position: 'relative',
-                borderWidth: index > currentIndex ? 0 : 2,
-                borderColor: index < currentIndex ? t.good : index === currentIndex ? t.primary : t.border,
-                borderRadius: 18, backgroundColor: index < currentIndex ? t.good : index === currentIndex ? t.primary : t.bg,
-              }}>
+              <div
+                testId={`stage-${stage}`}
+                onClick={() => updateDraftStatus(stage)}
+                style={{
+                  width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  position: 'relative', cursor: 'pointer',
+                  borderWidth: index > currentIndex ? 0 : 2,
+                  borderColor: index < currentIndex ? t.success : index === currentIndex ? t.fg : t.border,
+                  borderRadius: 13,
+                  backgroundColor: index < currentIndex ? t.success : index === currentIndex ? t.primary : t.hover,
+                }}
+              >
                 {index > currentIndex && trackerDots.map((dot, dotIndex) => (
-                  <div key={dotIndex} style={{ position: 'absolute', left: dot.left, top: dot.top, width: 4, height: 4, borderRadius: 2, backgroundColor: t.border }} />
+                  <div key={dotIndex} style={{ position: 'absolute', left: dot.left, top: dot.top, width: 4, height: 4, borderRadius: 2, backgroundColor: t.borderStrong }} />
                 ))}
-                <text style={{ color: index < currentIndex ? '#ffffff' : index === currentIndex ? t.primaryFg : t.mutedFg, fontSize: 12, fontWeight: 700 }}>{index < currentIndex ? '✓' : String(index + 1)}</text>
+                <text style={{ color: index < currentIndex ? '#ffffff' : index === currentIndex ? t.primaryFg : t.fg3, fontSize: 11, fontWeight: 700 }}>
+                  {index < currentIndex ? '✓' : String(index + 1)}
+                </text>
               </div>
-              <text style={{ color: index <= currentIndex ? t.fg : t.mutedFg, fontSize: 11 }}>{stage[0].toUpperCase() + stage.slice(1)}</text>
-              {index < stages.length - 1 && <div style={{ width: 28, height: 2, backgroundColor: index < currentIndex ? t.good : t.border }} />}
+              <text style={{ color: index <= currentIndex ? t.fg : t.fg3, fontSize: F_CAP }}>{stage[0].toUpperCase() + stage.slice(1)}</text>
+              {index < stages.length - 1 && <div style={{ width: 26, height: 2, backgroundColor: index < currentIndex ? t.success : t.border }} />}
             </div>
           ))}
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', flexGrow: 1, minHeight: 0, overflow: 'scroll', padding: 16 }}>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 14, width: 720, maxWidth: '100%' }}>
-            {draft && (
-              <Panel title="TAXPAYER PROFILE">
-                {(() => {
-                  const [yearPart, periodPart] = draft.period.split('-')
-                  const isMonth = /^\d{2}$/.test(periodPart ?? '')
-                  const isQuarter = /^Q\d$/.test(periodPart ?? '')
-                  return (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                      <text style={{ color: t.mutedFg, fontSize: 11 }}>
-                        {isMonth
-                          ? `1 For the Month (MM): ${periodPart}   For the Year (YYYY): ${yearPart}`
-                          : isQuarter
-                            ? `1 For the Quarter: ${periodPart}   For the Year (YYYY): ${yearPart}`
-                            : `1 For the Year (YYYY): ${yearPart}`}
-                      </text>
-                      <text style={{ color: t.fg, fontSize: 15, fontWeight: 700 }}>{(taxpayer?.name ?? selectedProfile?.registeredName ?? '').toUpperCase()}</text>
-                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16 }}>
-                        <text style={{ color: t.mutedFg, fontSize: 11 }}>TIN: {formatTin(selectedProfile?.tin9 ?? '', selectedProfile?.branch)}</text>
-                        <text style={{ color: t.mutedFg, fontSize: 11 }}>RDO Code: {branch?.facts.rdo ?? '-'}</text>
-                        <text style={{ color: t.mutedFg, fontSize: 11 }}>Address: {branch?.facts.address ?? '-'}</text>
-                        <text style={{ color: t.mutedFg, fontSize: 9, padding: 3, borderRadius: 10, backgroundColor: t.muted }}>AUTO</text>
-                      </div>
-                    </div>
-                  )
-                })()}
-              </Panel>
-            )}
-            {editorModel.bannerErrorText && (
-              <Panel title="Review required"><text style={{ color: t.danger, fontSize: 12 }}>{editorModel.bannerErrorText}</text></Panel>
-            )}
-            {formLoading && <text style={{ color: t.mutedFg }}>Opening official form.</text>}
+
+        {editorModel.bannerErrorText && (
+          <div style={{ padding: 10, paddingLeft: 14, borderRadius: 10, backgroundColor: t.dangerSoft, marginBottom: 12 }}>
+            <text style={{ color: t.danger, fontSize: F_META }}>{editorModel.bannerErrorText}</text>
+          </div>
+        )}
+        {formLoading && <text style={{ color: t.fg3, paddingBottom: 8 }}>Opening official form…</text>}
+
+        <div style={{ display: 'flex', flexGrow: 1, minHeight: 0, gap: 16 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', width: 208, minWidth: 208, gap: 2 }}>
+            <text style={{ color: t.fg3, fontSize: F_META, fontWeight: 500, paddingLeft: 8, paddingBottom: 6 }}>On this form</text>
             {editorModel.sections.map((section, index) => {
+              const key = section.section ?? 'other'
+              const open = !(collapsedPartSet?.has(key))
+              return (
+                <div
+                  key={key}
+                  onClick={() => togglePart(key)}
+                  style={{
+                    display: 'flex', alignItems: 'flex-start', gap: 8, padding: 6, paddingLeft: 8, paddingRight: 8,
+                    borderRadius: 8, cursor: 'pointer', minHeight: 32,
+                    backgroundColor: open ? t.selected : 'rgba(0,0,0,0)',
+                    hover: { backgroundColor: open ? t.selected : t.hover },
+                  }}
+                >
+                  <text style={{ color: t.fg, fontSize: F_META, flexGrow: 1, minWidth: 0 }}>{section.section ?? `Part ${index + 1}`}</text>
+                  <text style={{ color: t.fg3, fontSize: F_CAP }}>{section.rows.length}</text>
+                </div>
+              )
+            })}
+          </div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0, minHeight: 0, overflow: 'scroll', gap: 16, paddingBottom: 20 }}>
+            {editorModel.sections.map((section, index) => {
+              const key = section.section ?? `part-${index}`
+              const open = !collapsedPartSet?.has(key)
               const filled = section.rows.filter((row) =>
                 row.fields.some((field) => {
                   const value = editorValues[field.id]
@@ -1350,325 +3075,401 @@ function App() {
                 }),
               ).length
               return (
-              <Panel key={`${section.section ?? 'other'}-${index}`} title={section.section ?? 'Part I - Background Information'} aside={`${filled} of ${section.rows.length} rows`}>
-                {section.rows.map((row) => {
-                  const fields = row.fields
-                  const radios = row.kind === 'radio' || (row.kind === 'period' && fields.some((field) => field.type === 'radio'))
-                  const renderRowControls = () => {
-                    if (row.kind === 'tin') {
-                      return <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>{fields.map((field, fieldIndex) => control(field, fieldIndex === 3 ? 82 : 60))}</div>
-                    }
-                    if (row.kind === 'period') {
-                      return <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>{fields.map((field) => field.type === 'radio' ? (
-                        <div key={field.id} onClick={() => editField(field, true)} style={{ padding: 8, borderWidth: 1, borderColor: editorValues[field.id] ? t.primary : t.border, borderRadius: 6, backgroundColor: editorValues[field.id] ? t.secondary : t.bg }}>
-                          <text style={{ color: t.fg, fontSize: 11 }}>{field.optionLabel || 'Option'}</text>
+                <div
+                  key={key}
+                  testId={`part-${key}`}
+                  style={{ borderWidth: 1, borderColor: t.border, borderRadius: 12, backgroundColor: t.surface, overflow: 'hidden', flexShrink: 0 }}
+                >
+                  <div
+                    onClick={() => togglePart(key)}
+                    style={{ display: 'flex', alignItems: 'center', gap: 8, minHeight: 48, paddingLeft: 12, paddingRight: 16, cursor: 'pointer' }}
+                  >
+                    <Icon name={open ? 'chevDown' : 'chevRight'} size={16} color={t.fg3} />
+                    <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 600, flexGrow: 1, minWidth: 0 }}>{section.section ?? `Part ${index + 1}`}</text>
+                    <text style={{ color: t.fg3, fontSize: F_META }}>{section.rows.length} items · {filled} filled</text>
+                  </div>
+                  {open && (
+                    <div style={{ borderTopWidth: 1, borderColor: t.border, display: 'flex', flexDirection: 'column' }}>
+                      {section.rows.map((row, rowIndex) => (
+                        <div
+                          key={row.id}
+                          style={{
+                            display: 'flex',
+                            gap: 12,
+                            paddingTop: 14, paddingRight: 20, paddingBottom: 16, paddingLeft: 12,
+                            borderTopWidth: rowIndex > 0 ? 1 : 0,
+                            borderColor: t.border,
+                          }}
+                        >
+                          <div
+                            style={{
+                              minWidth: 30,
+                              height: 22,
+                              paddingLeft: 6,
+                              paddingRight: 6,
+                              borderRadius: 6,
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              backgroundColor: row.item ? t.hover : 'rgba(0,0,0,0)',
+                            }}
+                          >
+                            {row.item && <text style={{ color: t.fg2, fontSize: F_META, ...NUM_STYLE }}>{row.item}</text>}
+                          </div>
+                          <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0, gap: 10 }}>
+                            <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, flexWrap: 'wrap', minHeight: 22 }}>
+                              <text style={{ color: t.fg, fontSize: F_BODY, fontWeight: 500, flexGrow: 1, minWidth: 0 }}>{row.label || 'Return field'}</text>
+                              {row.locked && <Chip tone="muted" icon="user">From tax profile</Chip>}
+                            </div>
+                            {rowControls(row)}
+                            {row.errorText !== '' && (
+                              <text style={{ color: t.danger, fontSize: F_META }}>{row.errorText}</text>
+                            )}
+                          </div>
                         </div>
-                      ) : <div key={field.id} style={{ display: 'flex', alignItems: 'center', gap: 8 }}><text style={{ color: t.mutedFg, fontSize: 10 }}>{field.label}</text>{control(field, field.type === 'select-one' ? 150 : 100)}</div>)}</div>
-                    }
-                    if (radios) {
-                      return <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>{fields.map((field) => (
-                        <div key={field.id} onClick={() => editField(field, true)} style={{ padding: 8, borderWidth: 1, borderColor: editorValues[field.id] ? t.primary : t.border, borderRadius: 6, backgroundColor: editorValues[field.id] ? t.secondary : t.bg }}>
-                          <text style={{ color: t.fg, fontSize: 11 }}>{field.optionLabel || 'Option'}</text>
-                        </div>
-                      ))}</div>
-                    }
-                    if (fields.length > 1) {
-                      return <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>{fields.map((field) => <div key={field.id}>{control(field, 110)}</div>)}</div>
-                    }
-                    return control(fields[0])
-                  }
-                  return (
-                    <div key={row.id} style={{ display: 'flex', flexDirection: 'column', gap: 4, padding: 7, borderBottomWidth: 1, borderColor: t.border }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 9, minHeight: 40 }}>
-                        {row.item && <text style={{ color: t.mutedFg, fontSize: 10, width: 34, height: 24, padding: 4, borderRadius: 6, backgroundColor: t.secondary }}>{row.item}</text>}
-                        <text style={{ color: t.fg, fontSize: 12, flexGrow: 1, minWidth: 0 }}>{row.label || 'Return field'}</text>
-                        {row.locked && <text style={{ color: t.mutedFg, fontSize: 9, padding: 3, borderRadius: 10, backgroundColor: t.muted }}>AUTO</text>}
-                        {renderRowControls()}
-                      </div>
-                      <div style={{ minHeight: 18, height: 18 }}>
-                        <text style={{ color: row.errorText ? t.danger : t.mutedFg, fontSize: 10 }}>{row.errorText}</text>
-                      </div>
+                      ))}
                     </div>
-                  )
-                })}
-              </Panel>
+                  )}
+                </div>
               )
             })}
           </div>
         </div>
-        <div style={{ display: 'flex', justifyContent: 'flex-end', width: 720, maxWidth: '100%', alignSelf: 'center', gap: 8, padding: 12, borderTopWidth: 1, borderColor: t.border, backgroundColor: t.chrome }}>
-          <Button quiet testId="validate-return" onClick={() => formInstance && refreshEditor(formInstance)}>Validate</Button>
-          <Button testId="save-return" onClick={saveDraft}>Save draft</Button>
+
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, paddingTop: 10, borderTopWidth: 1, borderColor: t.border }}>
+          <Btn kind="secondary" testId="validate-return" onClick={() => formInstance && refreshEditor(formInstance)}>Validate</Btn>
+          <Btn testId="save-return" onClick={saveDraft}>Save draft</Btn>
         </div>
       </div>
     )
   }
 
-  function titleBar() {
-    const iconButton = (
-      key: string,
-      content: ReactNode,
-      action: () => void,
-      options: { disabled?: boolean; danger?: boolean } = {},
-    ) => (
+  // -- Overlays (search palette, start-a-return) ------------------------------
+
+  function scrim(content: ReactNode, testId: string) {
+    return (
       <div
-        key={key}
-        testId={`tb-${key}`}
-        onClick={() => !options.disabled && action()}
+        testId={testId}
+        onMouseDown={() => setOverlay(null)}
         style={{
+          position: 'absolute',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          backgroundColor: 'rgba(10,10,12,0.32)',
           display: 'flex',
-          alignItems: 'center',
+          alignItems: 'flex-start',
           justifyContent: 'center',
-          width: 38,
-          height: 42,
-          cursor: options.disabled ? 'default' : 'pointer',
-          opacity: options.disabled ? 0.35 : 1,
-          hover: options.disabled
-            ? {}
-            : { backgroundColor: options.danger ? '#e81123' : t.muted, color: options.danger ? '#ffffff' : t.fg },
+          paddingTop: 110,
         }}
       >
-        {content}
-      </div>
-    )
-    const glyph = (label: string, color?: string, weight = 500, size = 15) => (
-      <text style={{ color: color ?? t.fg, fontSize: size, fontWeight: weight }}>{label}</text>
-    )
-    const sidePanelGlyph = (side: 'left' | 'right', active: boolean) => (
-      <div style={{ width: 17, height: 14, display: 'flex', borderWidth: 1, borderColor: active ? t.primary : t.mutedFg, borderRadius: 3, overflow: 'hidden' }}>
-        {side === 'left' && <div style={{ width: 5, backgroundColor: active ? t.primary : t.mutedFg }} />}
-        <div style={{ flexGrow: 1 }} />
-        {side === 'right' && <div style={{ width: 5, backgroundColor: active ? t.primary : t.mutedFg }} />}
-      </div>
-    )
-    const separator = <div style={{ width: 1, height: 20, marginLeft: 6, marginRight: 6, backgroundColor: t.border }} />
-    return (
-      <div style={{ display: 'flex', alignItems: 'center', height: 42, minHeight: 42, paddingLeft: isMac ? 78 : 0, backgroundColor: t.chrome, borderBottomWidth: 1, borderColor: t.border }}>
-        {isWin && (
-          <>
-            {iconButton('close', glyph('✕'), () => closeWindow(WINDOW_TITLE), { danger: true })}
-            {iconButton('min', glyph('─'), () => gpuix.minimizeWindow?.())}
-            {iconButton('max', glyph('▢'), () => { if (!toggleMaximizeWindow(WINDOW_TITLE)) gpuix.zoomWindow?.() })}
-            {separator}
-          </>
-        )}
-        {iconButton('nav-back', glyph('←', canNavBack ? t.fg : t.mutedFg), () => navJump(-1), { disabled: !canNavBack })}
-        {iconButton('nav-fwd', glyph('→', canNavFwd ? t.fg : t.mutedFg), () => navJump(1), { disabled: !canNavFwd })}
-        {separator}
-        {iconButton('sidebar-left', sidePanelGlyph('left', !sidebarCollapsed), () => setSidebarCollapsed((value) => !value))}
-        {iconButton('search', glyph('⌕'), focusSidebarSearch)}
-        {iconButton('new-taxpayer', glyph('+', undefined, 600, 17), openNewTaxpayer)}
-        <div
-          testId="tb-drag"
-          onMouseDown={() => {
-            dragAnchor.current = beginWindowDrag(WINDOW_TITLE)
-          }}
-          onMouseMove={() => {
-            if (dragAnchor.current) dragWindowTo(WINDOW_TITLE, dragAnchor.current)
-          }}
-          onMouseUp={() => {
-            dragAnchor.current = null
-          }}
-          style={{ flexGrow: 1, height: '100%' }}
-        />
-        {iconButton('sidebar-right', sidePanelGlyph('right', rightSidebar), () => setRightSidebar((value) => !value))}
+        <div onMouseDownOutside={() => setOverlay(null)} style={{ display: 'flex' }}>
+          {content}
+        </div>
       </div>
     )
   }
 
-  function notificationsPanel() {
-    const rank = (level: LogLevel) => (level === 'error' ? 0 : level === 'warn' ? 1 : level === 'info' ? 2 : 3)
-    const entries = [...logs]
-      .sort((a, b) => rank(a.level) - rank(b.level) || b.ts.localeCompare(a.ts))
-      .slice(0, 80)
-    const alerts = logs.filter((entry) => entry.level === 'error' || entry.level === 'warn').length
-    return (
-      <div style={{ display: 'flex', flexDirection: 'column', width: 300, minWidth: 300, backgroundColor: t.chrome, borderLeftWidth: 1, borderColor: t.border }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: 10, borderBottomWidth: 1, borderColor: t.border }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <text style={{ color: t.fg, fontSize: 13, fontWeight: 700 }}>Notifications</text>
-            {alerts > 0 && <text style={{ color: '#ffffff', fontSize: 10, padding: 4, borderRadius: 9, backgroundColor: t.danger }}>{alerts}</text>}
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-            <div testId="theme-quick-toggle" onClick={() => setThemeMode((mode) => (mode === 'light' ? 'dark' : 'light'))} style={{ padding: 6, cursor: 'pointer' }}>
-              <text style={{ color: t.mutedFg, fontSize: 14 }}>{themeMode === 'light' ? '☾' : '☀'}</text>
-            </div>
-            <div testId="notifications-close" onClick={() => setRightSidebar(false)} style={{ padding: 6, cursor: 'pointer' }}>
-              <text style={{ color: t.mutedFg, fontSize: 14 }}>✕</text>
-            </div>
-          </div>
+  function startReturnOverlay() {
+    const profile = selectedProfile
+    const forms = profile ? store.listLibrary(profile.id) : []
+    const chosen = forms.find((entry) => entry.formCode === startFormCode) ?? forms[0]
+    const periods = chosen && profile
+      ? periodsForYear(profile.year, catalogByCode.get(chosen.formCode)?.frequency ?? 'annual')
+      : []
+    const defaultPeriod = chosen && profile
+      ? dueByKey.get(`${profile.id}:${chosen.formCode}`)?.period ?? periods[0] ?? ''
+      : ''
+    const activePeriod = startPeriod || defaultPeriod
+    return scrim(
+      <div
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          width: 520,
+          borderRadius: 12,
+          borderWidth: 1,
+          borderColor: t.border,
+          backgroundColor: t.surface,
+        }}
+      >
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 2, padding: 16, borderBottomWidth: 1, borderColor: t.border }}>
+          <text style={{ color: t.fg, fontSize: F_TITLE, fontWeight: 700 }}>Start a return</text>
+          <text style={{ color: t.fg3, fontSize: F_META }}>
+            {taxpayer && branch ? `${taxpayer.name} · ${formatTin(taxpayer.tin9, branch.code)} · ${branch.name}` : 'Pick a form below.'}
+          </text>
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: 10, flexGrow: 1, minHeight: 0, overflow: 'scroll' }}>
-          {entries.length === 0 && <text style={{ color: t.mutedFg, fontSize: 12 }}>No notifications yet.</text>}
-          {entries.map((entry, index) => (
-            <div key={`${entry.ts}-${index}`} style={{ display: 'flex', flexDirection: 'column', gap: 3, padding: 9, borderWidth: 1, borderColor: t.border, borderRadius: 7, backgroundColor: t.bg }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <text style={{ color: entry.level === 'error' ? t.danger : entry.level === 'warn' ? t.warning : t.mutedFg, fontSize: 10, fontWeight: 700 }}>{entry.level.toUpperCase()}</text>
-                <text style={{ color: t.mutedFg, fontSize: 10 }}>{entry.scope}</text>
-                <div style={{ flexGrow: 1 }} />
-                <text style={{ color: t.mutedFg, fontSize: 9 }}>{new Date(entry.ts).toLocaleTimeString()}</text>
+        <div style={{ display: 'flex', flexDirection: 'column', maxHeight: 320, overflow: 'scroll', padding: 8 }}>
+          {forms.length === 0 && (
+            <text style={{ color: t.fg3, fontSize: F_META, padding: 14 }}>No forms in this library yet — add them under Forms.</text>
+          )}
+          {forms.map((entry) => {
+            const item = catalogByCode.get(entry.formCode)
+            const active = chosen?.formCode === entry.formCode
+            return (
+              <div
+                key={entry.formCode}
+                testId={`start-${entry.formCode}`}
+                onClick={() => {
+                  setStartFormCode(entry.formCode)
+                  setStartPeriod('')
+                }}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 10,
+                  height: 36,
+                  paddingLeft: 10,
+                  paddingRight: 10,
+                  borderRadius: 7,
+                  cursor: 'pointer',
+                  backgroundColor: active ? t.selected : 'rgba(0,0,0,0)',
+                  hover: { backgroundColor: active ? t.selected : t.hover },
+                }}
+              >
+                <text style={{ color: t.fg3, fontSize: F_META, ...NUM_STYLE, width: 72, minWidth: 72 }}>{displayFormCode(entry.formCode)}</text>
+                <text style={{ color: t.fg, fontSize: F_BODY, flexGrow: 1, minWidth: 0, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{cleanFormTitle(item?.label ?? '')}</text>
+                <text style={{ color: t.fg3, fontSize: F_META }}>{freqLabel(item?.frequency ?? 'annual')}</text>
               </div>
-              <text style={{ color: t.fg, fontSize: 11 }}>{entry.msg}</text>
-            </div>
-          ))}
+            )
+          })}
         </div>
-        <div style={{ padding: 8, borderTopWidth: 1, borderColor: t.border }}>
-          <div testId="notifications-open-logs" onClick={() => navTo({ ...navNow, page: 'logs', formCode: undefined, period: undefined })} style={{ padding: 6, cursor: 'pointer' }}>
-            <text style={{ color: t.primary, fontSize: 11 }}>Open full logs</text>
-          </div>
-        </div>
-      </div>
-    )
-  }
-
-  function sidebar() {
-    const navItems: Array<[NavPage, string, string]> = [
-      ['import', 'Import Data', '⇩'],
-      ['tasks', 'Background Tasks', '▤'],
-      ['calendar', 'Tax Calendars', '▦'],
-      ['settings', 'Settings', '⚙'],
-    ]
-    return (
-      <div style={{ display: 'flex', flexDirection: 'column', width: sidebarCollapsed ? 64 : 250, minWidth: sidebarCollapsed ? 64 : 250, padding: 12, gap: 10, backgroundColor: t.chrome, borderRightWidth: 1, borderColor: t.border }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: 7 }}>
-          {!sidebarCollapsed && <text style={{ color: t.fg, fontSize: 18, fontWeight: 800 }}>eBIRForms</text>}
-          <div testId="sidebar-toggle" onClick={() => setSidebarCollapsed((value) => !value)}><text style={{ color: t.mutedFg }}>{sidebarCollapsed ? '›' : '‹'}</text></div>
-        </div>
-        {!sidebarCollapsed && (
-          <>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: 6 }}>
-              <text style={{ color: t.mutedFg, fontSize: 10, fontWeight: 700 }}>TAXPAYERS</text>
-              <div testId="add-taxpayer" onClick={openNewTaxpayer} style={{ width: 24, height: 24, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 6, backgroundColor: t.secondary }}>
-                <text style={{ color: t.fg, fontSize: 17 }}>+</text>
-              </div>
-            </div>
-            <input ref={searchInputRef} testId="taxpayer-search" value={taxpayerSearch} onChange={(event) => setTaxpayerSearch(event.value ?? '')} placeholder="Search TIN or name" style={{ height: 36, minHeight: 36, padding: 9, color: t.fg, backgroundColor: t.bg, borderWidth: 1, borderColor: t.input, borderRadius: 6 }} />
-            <div testId="taxpayer-tree" style={{ display: 'flex', flexDirection: 'column', gap: 8, flexGrow: 1, overflow: 'scroll' }}>
-              {filteredTaxpayers.map((item) => (
-                <div key={item.tin9} style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-                  <div onClick={() => item.branches[0] && chooseBranch(item.tin9, item.branches[0].code)} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: 7, borderRadius: 7, backgroundColor: selectedTin === item.tin9 ? t.secondary : t.chrome }}>
-                    <text style={{ color: t.mutedFg, fontSize: 12 }}>⌄</text>
-                    <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-                      <text style={{ color: t.fg, fontSize: 12, fontWeight: 700, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{item.name || formatTin(item.tin9)}</text>
-                      <text style={{ color: t.mutedFg, fontSize: 10, whiteSpace: 'nowrap' }}>
-                        TIN: {formatTin(item.tin9).split('-').slice(0, 3).join('-')}
-                      </text>
-                    </div>
-                  </div>
-                  {item.branches.map((branchItem) => (
-                    <div key={branchItem.code} testId={`branch-${item.tin9}-${branchItem.code}`} onClick={() => chooseBranch(item.tin9, branchItem.code)} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginLeft: 15, padding: 7, borderRadius: 6, backgroundColor: selectedBranchId === branchId(item.tin9, branchItem.code) ? t.accent : t.chrome }}>
-                      <text style={{ color: t.fg, fontSize: 11, flexGrow: 1, minWidth: 0, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{branchItem.name}</text>
-                      <text style={{ color: t.mutedFg, fontSize: 10, fontFamily: 'Consolas, monospace', padding: 3, borderRadius: 5, backgroundColor: t.secondary }}>{branchItem.code}</text>
-                    </div>
-                  ))}
-                  <div testId={`add-branch-${item.tin9}`} onClick={() => {
-                    setShowNewBranch(true)
-                    navTo({
-                      ...navNow,
-                      page: 'taxpayer',
-                      tab: 'details',
-                      tin: item.tin9,
-                      branchId: item.branches[0] ? branchId(item.tin9, item.branches[0].code) : undefined,
-                      profileId: undefined,
-                      formCode: undefined,
-                      period: undefined,
-                    })
-                  }} style={{ marginLeft: 15, padding: 6, borderRadius: 6 }}>
-                    <text style={{ color: t.mutedFg, fontSize: 10 }}>+ Add branch</text>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </>
-        )}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 4, borderTopWidth: 1, borderColor: t.border, paddingTop: 8 }}>
-          {navItems.map(([id, label, icon]) => (
-            <div key={id} testId={`nav-${id}`} onClick={() => navTo({ ...navNow, page: id, formCode: undefined, period: undefined })} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: 10, borderRadius: 8, backgroundColor: page === id ? t.secondary : t.chrome }}>
-              <text style={{ color: t.mutedFg, fontSize: 15, width: 18 }}>{icon}</text>
-                {!sidebarCollapsed && <text style={{ color: page === id ? t.fg : t.mutedFg, fontSize: 12 }}>{label}</text>}
-            </div>
-          ))}
-          <div style={{ display: 'flex', justifyContent: 'flex-end', paddingTop: 4 }}>
-            <text style={{ color: t.mutedFg, fontSize: 9, padding: 4, borderRadius: 8, backgroundColor: t.secondary }}>Dev</text>
-          </div>
-        </div>
-      </div>
-    )
-  }
-
-  function taskPage() {
-    return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-        <text style={{ color: t.fg, fontSize: 24, fontWeight: 700 }}>Background tasks</text>
-        {queueJobs.map((job) => (
-          <Panel key={job.id} title={`${job.kind} · ${job.state}`} subtitle={`Attempts ${job.attempts}/${job.maxAttempts}`}>
-            <text style={{ color: job.lastError ? t.danger : t.mutedFg, fontSize: 12 }}>{job.lastError ?? JSON.stringify(job.payload)}</text>
-          </Panel>
-        ))}
-      </div>
-    )
-  }
-
-  function logsPage() {
-    return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 12, flexGrow: 1, minHeight: 0 }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <text style={{ color: t.fg, fontSize: 24, fontWeight: 700 }}>Logs</text>
-          <Select value={logFilter} onValueChange={(value) => setLogFilter(value as LogFilter)}>
-            <SelectTrigger style={{ width: 140, height: 34 }}><SelectValue /></SelectTrigger>
-            <SelectContent>{(['all', 'debug', 'info', 'warn', 'error'] as LogFilter[]).map((level) => <SelectItem key={level} value={level}>{level}</SelectItem>)}</SelectContent>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: 12, borderTopWidth: 1, borderColor: t.border }}>
+          <text style={{ color: t.fg3, fontSize: F_META }}>Period</text>
+          <Select value={activePeriod} onValueChange={setStartPeriod}>
+            <SelectTrigger style={{ width: 150, height: 30 }}><SelectValue placeholder="Period" /></SelectTrigger>
+            <SelectContent>
+              {periods.map((period) => <SelectItem key={period} value={period}>{periodLabel(period)}</SelectItem>)}
+            </SelectContent>
           </Select>
+          <div style={{ flexGrow: 1 }} />
+          <Btn kind="ghost" onClick={() => setOverlay(null)}>Cancel</Btn>
+          <Btn
+            testId="start-open"
+            disabled={!chosen || !activePeriod}
+            onClick={() => {
+              if (!chosen || !activePeriod) return
+              setOverlay(null)
+              setStartFormCode(null)
+              setStartPeriod('')
+              navOpenForm(chosen, activePeriod)
+            }}
+          >
+            Open form
+          </Btn>
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 4, overflow: 'scroll' }}>
-          {shownLogs.map((entry, index) => (
-            <div key={`${entry.ts}-${index}`} style={{ display: 'flex', gap: 10, padding: 9, backgroundColor: t.chrome, borderWidth: 1, borderColor: t.border, borderRadius: 6 }}>
-              <text style={{ color: t.mutedFg, fontSize: 10 }}>{new Date(entry.ts).toLocaleTimeString()}</text>
-              <text style={{ color: entry.level === 'error' ? t.danger : entry.level === 'warn' ? t.warning : t.fg, fontSize: 10, width: 48 }}>{entry.level}</text>
-              <text style={{ color: t.mutedFg, fontSize: 10, width: 72 }}>{entry.scope}</text>
-              <text style={{ color: t.fg, fontSize: 11, flexGrow: 1 }}>{entry.msg}</text>
+      </div>,
+      'overlay-start-return',
+    )
+  }
+
+  function searchOverlay() {
+    const query = paletteQuery.trim().toLowerCase()
+    type Item = { id: string; group: string; title: string; sub: string; icon: IconName; run: () => void }
+    const items: Item[] = []
+    for (const item of tree) {
+      if (query && !item.name.toLowerCase().includes(query) && !formatTin(item.tin9).includes(query)) continue
+      items.push({
+        id: `tp-${item.tin9}`,
+        group: 'Taxpayers',
+        title: item.name || formatTin(item.tin9),
+        sub: formatTin(item.tin9),
+        icon: 'user',
+        run: () => chooseTaxpayer(item.tin9),
+      })
+    }
+    const gos: Array<[Page | string, string, IconName]> = [
+      ['home', 'Home', 'home'],
+      ['calendar', 'Calendar', 'calendar'],
+      ['filings', 'Filings', 'file'],
+      ['taxpayer', 'Tax profile', 'user'],
+      ['settings', 'Settings', 'settings'],
+      ['logs', 'Logs', 'list'],
+      ['jobs', 'Jobs', 'box'],
+    ]
+    for (const [target, label, icon] of gos) {
+      if (query && !label.toLowerCase().includes(query)) continue
+      items.push({ id: `go-${target}`, group: 'Go to', title: label, sub: '', icon, run: () => goto(target as Page) })
+    }
+    for (const entry of selectedLibrary) {
+      const item = catalogByCode.get(entry.formCode)
+      const label = `${displayFormCode(entry.formCode)} ${cleanFormTitle(item?.label ?? '')}`
+      if (query && !label.toLowerCase().includes(query)) continue
+      items.push({
+        id: `form-${entry.formCode}`,
+        group: 'Forms',
+        title: displayFormCode(entry.formCode),
+        sub: cleanFormTitle(item?.label ?? ''),
+        icon: 'file',
+        run: () => {
+          setStartFormCode(entry.formCode)
+          setOverlay({ kind: 'startReturn' })
+        },
+      })
+    }
+    const actions: Array<[string, string, IconName, () => void]> = [
+      ['new-taxpayer', 'New taxpayer', 'plus', () => { setShowNewTaxpayer(true); goto('taxpayer', { tab: 'profile' }) }],
+      ['backup', 'Back up database', 'database', backupNow],
+      ['theme', 'Cycle theme', themeIcon(), cycleTheme],
+    ]
+    for (const [id, label, icon, run] of actions) {
+      if (query && !label.toLowerCase().includes(query)) continue
+      items.push({ id: `act-${id}`, group: 'Actions', title: label, sub: '', icon, run })
+    }
+    const clampedIdx = Math.min(paletteIdx, items.length - 1)
+    const groups = [...new Set(items.map((item) => item.group))]
+    let itemIdx = -1
+    return scrim(
+      <div
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          width: 540,
+          maxHeight: 420,
+          borderRadius: 12,
+          borderWidth: 1,
+          borderColor: t.border,
+          backgroundColor: t.surface,
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 9, padding: 12, borderBottomWidth: 1, borderColor: t.border }}>
+          <Icon name="search" size={15} color={t.fg3} />
+          <input
+            testId="palette-input"
+            value={paletteQuery}
+            placeholder="Search taxpayers, forms and pages"
+            autoFocus
+            onChange={(event) => {
+              setPaletteQuery(event.value ?? '')
+              setPaletteIdx(0)
+            }}
+            onKeyDown={(event) => {
+              if (event.key === 'ArrowDown') setPaletteIdx((value) => Math.min(value + 1, items.length - 1))
+              if (event.key === 'ArrowUp') setPaletteIdx((value) => Math.max(value - 1, 0))
+              if (event.key === 'Enter' && items[clampedIdx]) {
+                const run = items[clampedIdx].run
+                setOverlay(null)
+                run()
+              }
+            }}
+            style={{ flexGrow: 1, height: 30, color: t.fg, fontSize: F_BODY, backgroundColor: 'rgba(0,0,0,0)', borderWidth: 0 }}
+          />
+          <Kbd>Esc</Kbd>
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', overflow: 'scroll', padding: 6 }}>
+          {items.length === 0 && <text style={{ color: t.fg3, fontSize: F_META, padding: 14 }}>No results.</text>}
+          {groups.map((group) => (
+            <div key={group}>
+              <text style={{ color: t.fg3, fontSize: F_CAP, fontWeight: 600, paddingLeft: 8, paddingTop: 6, paddingBottom: 2 }}>{group.toUpperCase()}</text>
+              {items.filter((item) => item.group === group).map((item) => {
+                itemIdx += 1
+                const idx = itemIdx
+                const active = idx === clampedIdx
+                return (
+                  <div
+                    key={item.id}
+                    onClick={() => {
+                      setOverlay(null)
+                      item.run()
+                    }}
+                    onMouseEnter={() => setPaletteIdx(idx)}
+                    style={{ display: 'flex', alignItems: 'center', gap: 9, height: 34, paddingLeft: 8, paddingRight: 8, borderRadius: 7, cursor: 'pointer', backgroundColor: active ? t.selected : 'rgba(0,0,0,0)' }}
+                  >
+                    <Icon name={item.icon} size={15} color={t.fg2} />
+                    <text style={{ color: t.fg, fontSize: F_BODY, flexGrow: 1, minWidth: 0, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden' }}>{item.title}</text>
+                    {item.sub !== '' && <text style={{ color: t.fg3, fontSize: F_META, ...NUM_STYLE }}>{item.sub}</text>}
+                  </div>
+                )
+              })}
             </div>
           ))}
         </div>
-      </div>
+      </div>,
+      'overlay-search',
     )
   }
+
+  // -- Root ------------------------------------------------------------------
+
+  const editorModel = buildEditorModel(fieldSnapshot, issues, formEntry ? autoFieldIds(formEntry.formCode as PrefillFormCode) : new Set())
+  const sftpMode = describeSftpConfig(loadSftpConfig())
 
   function mainContent() {
     if (page === 'form') return formPage()
+    if (page === 'home') return homePage()
+    if (page === 'calendar') return calendarPage()
+    if (page === 'filings') return filingsPage()
     if (page === 'taxpayer') return taxpayerPage()
-    if (page === 'tasks') return taskPage()
+    if (page === 'jobs') return jobsPage()
     if (page === 'logs') return logsPage()
-    if (page === 'calendar') return <Panel title="Tax calendars" subtitle="Coming in a future release." />
-    if (page === 'import') return <Panel title="Import data" subtitle="Coming in P5."><text style={{ color: t.mutedFg, fontSize: 13 }}>eBIR package and official-app data import land with the filing pipeline.</text></Panel>
-    return (
-      <Panel title="Settings">
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          <text style={{ color: t.fg, fontSize: 13 }}>Appearance</text>
-          <Button testId="theme-toggle" quiet onClick={() => setThemeMode((mode) => mode === 'light' ? 'dark' : 'light')}>{themeMode === 'light' ? 'Switch to dark' : 'Switch to light'}</Button>
-        </div>
-        <text style={{ color: t.mutedFg, fontSize: 12 }}>Theme preference is saved on this device.</text>
-      </Panel>
-    )
+    return settingsPage()
   }
 
-  const sftpMode = describeSftpConfig(loadSftpConfig())
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', backgroundColor: t.bg, fontFamily: 'Bricolage Grotesque, sans-serif' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', backgroundColor: t.bg, fontFamily: FONT, position: 'relative' }}>
       {titleBar()}
       <div style={{ display: 'flex', flexGrow: 1, minHeight: 0 }}>
         {sidebar()}
-        <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0, minHeight: 0 }}>
-          <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minHeight: 0, padding: 20 }}>
-            {mainContent()}
+        <div
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            flexGrow: 1,
+            minWidth: 0,
+            minHeight: 0,
+            backgroundColor: t.surface,
+            borderRadius: 12,
+            marginTop: 0,
+            marginBottom: 8,
+            marginLeft: sidebarCollapsed ? 8 : 0,
+            marginRight: 8,
+            borderWidth: 1,
+            borderColor: t.border,
+          }}
+        >
+          <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1, minHeight: 0, padding: 28, paddingLeft: 32, paddingRight: 32, overflow: 'scroll' }}>
+            <div style={{ width: '100%', maxWidth: 880 }}>
+              {mainContent()}
+            </div>
           </div>
         </div>
-        {rightSidebar && notificationsPanel()}
+        {rightPanel()}
       </div>
-      <div style={{ display: 'flex', justifyContent: 'flex-end', padding: 7, borderTopWidth: 1, borderColor: t.border, backgroundColor: t.chrome }}>
-        <text style={{ color: t.mutedFg, fontSize: 10 }}>{sftpMode}</text>
-      </div>
+      {overlay?.kind === 'search' && searchOverlay()}
+      {overlay?.kind === 'startReturn' && startReturnOverlay()}
+      {toast && (
+        <div
+          key={toast.seq}
+          style={{
+            position: 'absolute',
+            bottom: 18,
+            left: 0,
+            right: 0,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}
+        >
+          <div style={{ padding: 9, paddingLeft: 16, paddingRight: 16, borderRadius: 18, backgroundColor: t.primary }}>
+            <text style={{ color: t.primaryFg, fontSize: F_META }}>{toast.text}</text>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
 
-render(<><FontRegistration /><App /></>, { title: WINDOW_TITLE, width: 1440, height: 940, titlebarTransparent: true })
+render(
+  <>
+    <FontRegistration />
+    <App />
+  </>,
+  {
+    title: WINDOW_TITLE,
+    width: 1440,
+    height: 940,
+    titlebarTransparent: true,
+    onKeyDown: (event) => rootKeyHandler?.(event as KeyEvent),
+  },
+)

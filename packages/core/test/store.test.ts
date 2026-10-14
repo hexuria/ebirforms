@@ -32,7 +32,7 @@ describe('SQLite profile and form library store', () => {
     try {
       expect(store.db.query('PRAGMA foreign_keys').get()).toEqual({ foreign_keys: 1 })
       expect(store.db.query('PRAGMA journal_mode').get()).toEqual({ journal_mode: 'wal' })
-      expect(store.db.query('PRAGMA user_version').get()).toEqual({ user_version: 3 })
+      expect(store.db.query('PRAGMA user_version').get()).toEqual({ user_version: 4 })
 
       const main2025 = store.createProfile({
         tin: '123-456-788',
@@ -244,7 +244,7 @@ describe('SQLite profile and form library store', () => {
       expect(store.getDraft('missing')).toBeNull()
       expect(() => store.saveDraft('missing', {})).toThrow('Draft not found')
       expect(() => store.setDraftStatus('missing', 'paid')).toThrow('Draft not found')
-      expect(store.db.query('PRAGMA user_version').get()).toEqual({ user_version: 3 })
+      expect(store.db.query('PRAGMA user_version').get()).toEqual({ user_version: 4 })
     } finally {
       store.close()
       rmSync(root, { recursive: true, force: true })
@@ -322,7 +322,7 @@ describe('SQLite profile and form library store', () => {
 
     const store = openStore(path, new Logger(root))
     try {
-      expect(store.db.query('PRAGMA user_version').get()).toEqual({ user_version: 3 })
+      expect(store.db.query('PRAGMA user_version').get()).toEqual({ user_version: 4 })
       expect(store.db.query('SELECT id, state FROM jobs').get()).toEqual({
         id: 'legacy-job',
         state: 'queued',
